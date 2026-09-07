@@ -847,9 +847,9 @@ impl SatDocument {
         let index = self.records.len() as i32;
         let mut record = SatRecord::new(index, "shell");
         record.attribute = SatPointer::NULL;
+        record.tokens.push(SatToken::Pointer(SatPointer::NULL)); // pattern
         record.tokens.push(SatToken::Pointer(SatPointer::NULL)); // next_shell
         record.tokens.push(SatToken::Pointer(SatPointer::NULL)); // subshell
-        record.tokens.push(SatToken::Pointer(SatPointer::NULL)); // unknown (always $-1)
         record.tokens.push(SatToken::Pointer(first_face));
         record.tokens.push(SatToken::Pointer(SatPointer::NULL)); // wire
         record.tokens.push(SatToken::Pointer(lump));
@@ -863,8 +863,8 @@ impl SatDocument {
         let index = self.records.len() as i32;
         let mut record = SatRecord::new(index, "lump");
         record.attribute = SatPointer::NULL;
+        record.tokens.push(SatToken::Pointer(SatPointer::NULL)); // pattern
         record.tokens.push(SatToken::Pointer(SatPointer::NULL)); // next_lump
-        record.tokens.push(SatToken::Pointer(SatPointer::NULL)); // unknown (always $-1)
         record.tokens.push(SatToken::Pointer(shell));
         record.tokens.push(SatToken::Pointer(body));
         self.records.push(record);
