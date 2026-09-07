@@ -1098,8 +1098,8 @@ mod tests {
             .next()
             .expect("spline-surface present after re-parse");
         // deg_u, deg_v tokens.
-        assert!(matches!(sp.tokens.get(5), Some(SatToken::Integer(1))));
         assert!(matches!(sp.tokens.get(6), Some(SatToken::Integer(1))));
+        assert!(matches!(sp.tokens.get(7), Some(SatToken::Integer(1))));
         assert!(
             re.validate().is_empty(),
             "spline-surface failed validation: {:?}",

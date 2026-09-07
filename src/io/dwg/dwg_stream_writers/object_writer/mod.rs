@@ -2041,32 +2041,19 @@ impl<'a> DwgObjectWriter<'a> {
 
     /// Write BLOCK entity (block begin).
     fn write_block_begin(&mut self, record: &BlockRecord) {
+        // New documents reserve marker handles in BlockRecord without storing
+        // BLOCK entities. Synthesize those markers; imported ones retain metadata.
         let block = if !record.block_entity_handle.is_null() {
-            let result = self
-                .document
+            self.document
                 .entity_index
                 .get(&record.block_entity_handle)
                 .and_then(|&idx| {
                     if let EntityType::Block(b) = self.document.entities[idx].as_ref() {
                         Some(b.clone())
                     } else {
-                        eprintln!("  BLOCK entity at idx {} is NOT Block type", idx);
                         None
                     }
-                });
-            if result.is_none()
-                && self
-                    .document
-                    .entity_index
-                    .get(&record.block_entity_handle)
-                    .is_none()
-            {
-                eprintln!(
-                    "  BLOCK handle {:?} NOT in entity_index for block '{}'",
-                    record.block_entity_handle, record.name
-                );
-            }
-            result
+                })
         } else {
             None
         };
