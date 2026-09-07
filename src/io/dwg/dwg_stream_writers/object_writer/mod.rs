@@ -2203,13 +2203,16 @@ impl<'a> DwgObjectWriter<'a> {
             self.visited_objects.insert(Handle::from(handle_val));
         }
 
-        let remaining: Vec<(Handle, crate::objects::ObjectType)> = self
+        let mut remaining: Vec<(Handle, crate::objects::ObjectType)> = self
             .document
             .objects
             .iter()
             .filter(|(h, _)| !self.visited_objects.contains(h))
             .map(|(h, o)| (*h, o.clone()))
             .collect();
+        // `objects` is a HashMap: iterate in handle order so the same
+        // document writes the same bytes on every call.
+        remaining.sort_by_key(|(h, _)| h.value());
 
         for (handle, obj) in remaining {
             self.visited_objects.insert(handle);

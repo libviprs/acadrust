@@ -343,15 +343,17 @@ fn prepare_header(
                 }
             });
         if !mls_valid {
-            h.current_multiline_style_handle = Handle::NULL;
-            for (_, obj) in &document.objects {
-                if let crate::objects::ObjectType::MLineStyle(mls) = obj {
-                    if mls.name == "Standard" {
-                        h.current_multiline_style_handle = mls.handle;
-                        break;
-                    }
-                }
-            }
+            // Lowest handle wins: `objects` is a HashMap, and a first-match
+            // scan would pick a different "Standard" style on each call.
+            h.current_multiline_style_handle = document
+                .objects
+                .values()
+                .filter_map(|obj| match obj {
+                    crate::objects::ObjectType::MLineStyle(mls) if mls.name == "Standard" => Some(mls.handle),
+                    _ => None,
+                })
+                .min_by_key(|handle| handle.value())
+                .unwrap_or(Handle::NULL);
         }
     }
 

@@ -5025,8 +5025,12 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             self.write_dictionary(root_dict, &document.objects)?;
         }
 
-        // Write remaining objects (skip the root dictionary already written)
-        for (handle, object) in document.objects.iter() {
+        // Write remaining objects (skip the root dictionary already written).
+        // `objects` is a HashMap: iterate in handle order so the same
+        // document writes the same bytes on every call.
+        let mut remaining: Vec<(&Handle, &ObjectType)> = document.objects.iter().collect();
+        remaining.sort_by_key(|(handle, _)| handle.value());
+        for (handle, object) in remaining {
             if *handle == root_handle {
                 continue;
             }
