@@ -1556,6 +1556,15 @@ impl<'a> SatPCurve<'a> {
         }
     }
 
+    /// Direction of an explicit pcurve relative to its underlying UV spline.
+    pub fn sense(&self) -> Sense {
+        match self.record.tokens.get(2) {
+            Some(SatToken::False | SatToken::Sab { tag: 0x0A, .. }) => Sense::Reversed,
+            Some(SatToken::True | SatToken::Sab { tag: 0x0B, .. }) => Sense::Forward,
+            _ => self.record.token_sense(2),
+        }
+    }
+
     fn bspline_at(tokens: &[SatToken], start: usize) -> Option<(usize, Vec<f64>, Vec<[f64; 4]>)> {
         let rational = tokens.get(start)?.as_ident() == Some("nurbs");
         let degree = tokens.get(start + 1)?.as_integer()?.max(0) as usize;
