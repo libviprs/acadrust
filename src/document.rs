@@ -1648,6 +1648,13 @@ impl CadDocument {
         layer_transparency.set_handle(self.allocate_handle());
         self.app_ids.add(layer_transparency).ok();
 
+        // ... and a layer description as AcAecLayerStandard XDATA/EED. On DWG
+        // an EED block is keyed by the application's handle, so the entry has
+        // to exist before a description can be written at all.
+        let mut layer_description = AppId::new(crate::tables::layer::LAYER_DESCRIPTION_APP);
+        layer_description.set_handle(self.allocate_handle());
+        self.app_ids.add(layer_description).ok();
+
         // Add standard viewport
         let mut active_vport = VPort::active();
         active_vport.set_handle(self.allocate_handle());
