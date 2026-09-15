@@ -632,7 +632,7 @@ impl<'a> DwgObjectWriter<'a> {
             owner_handle,
             reactors,
             xdictionary_handle,
-            None,
+            Vec::new(),
         );
     }
 
@@ -660,7 +660,7 @@ impl<'a> DwgObjectWriter<'a> {
         owner_handle: Handle,
         reactors: &[Handle],
         xdictionary_handle: &Option<Handle>,
-        extra_eed: Option<(u64, Vec<u8>)>,
+        extra_eed: Vec<(u64, Vec<u8>)>,
     ) {
         self.write_common_non_entity_data_eed_internal(
             type_code,
@@ -687,7 +687,7 @@ impl<'a> DwgObjectWriter<'a> {
             owner_handle,
             reactors,
             xdictionary_handle,
-            None,
+            Vec::new(),
             true,
         );
     }
@@ -699,7 +699,7 @@ impl<'a> DwgObjectWriter<'a> {
         owner_handle: Handle,
         reactors: &[Handle],
         xdictionary_handle: &Option<Handle>,
-        extra_eed: Option<(u64, Vec<u8>)>,
+        extra_eed: Vec<(u64, Vec<u8>)>,
         relative_owner: bool,
     ) {
         // ── writeCommonData portion ──
@@ -725,7 +725,7 @@ impl<'a> DwgObjectWriter<'a> {
         if let Some(raw) = self.document.eed_by_handle.get(&handle) {
             eed.raw_dwg_eed = raw.clone();
         }
-        if let Some((app, bytes)) = extra_eed {
+        for (app, bytes) in extra_eed {
             eed.raw_dwg_eed.retain(|(a, _)| *a != app);
             eed.raw_dwg_eed.push((app, bytes));
         }
