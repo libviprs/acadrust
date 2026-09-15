@@ -307,6 +307,27 @@ impl<'a> DwgObjectWriter<'a> {
         self.write_extended_data(xdata);
     }
 
+    /// Resolve an entity's layer name to the handle to write.
+    ///
+    /// An entity's layer is a *required* hard pointer: AutoCAD reports a NULL
+    /// one as a damaged drawing and offers recovery (issue #80). A name can
+    /// fail to resolve when the caller set `common.layer` to a layer that was
+    /// never added, or renamed a layer in place so the entities still carry the
+    /// old name. Fall back to layer "0", which every drawing has and which
+    /// cannot be renamed or deleted, so the reference stays resolvable.
+    fn entity_layer_handle(&self, layer: &str) -> Handle {
+        if let Some(entry) = self.document.layers.get(layer) {
+            if !entry.handle.is_null() {
+                return entry.handle;
+            }
+        }
+        self.document
+            .layers
+            .get("0")
+            .map(|entry| entry.handle)
+            .unwrap_or(Handle::NULL)
+    }
+
     // ── write_common_entity_data ────────────────────────────────────
     /// Full preamble for an entity: type code, handle, xdata, graphic
     /// flag, entity mode, reactors/xdic, layer/linetype, colour,
@@ -428,12 +449,7 @@ impl<'a> DwgObjectWriter<'a> {
         // ── R13-R14 only: layer + linetype ──
         if self.version.r13_14_only() {
             // Layer handle (HANDLE: hard pointer)
-            let layer_h = self
-                .document
-                .layers
-                .get(layer)
-                .map(|l| l.handle)
-                .unwrap_or(Handle::NULL);
+            let layer_h = self.entity_layer_handle(layer);
             self.writer
                 .write_handle(DwgReferenceType::HardPointer, layer_h.value());
 
@@ -513,12 +529,7 @@ impl<'a> DwgObjectWriter<'a> {
         }
 
         // ── R2000+: Layer handle (HANDLE: hard pointer) ──
-        let layer_h = self
-            .document
-            .layers
-            .get(layer)
-            .map(|l| l.handle)
-            .unwrap_or(Handle::NULL);
+        let layer_h = self.entity_layer_handle(layer);
         self.writer
             .write_handle(DwgReferenceType::HardPointer, layer_h.value());
 
