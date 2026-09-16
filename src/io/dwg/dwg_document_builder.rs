@@ -253,6 +253,8 @@ struct Pass2Chunk {
     pending: PendingPolylines,
     pending_attributes: HashMap<u64, Vec<AttributeEntity>>,
     failures: Vec<RecordFailure>,
+    /// (handle, type code, merged bytes, handle bits) — only with ACADRUST_RAW_ALL.
+    raw_records: Vec<(u64, i16, Vec<u8>, i64)>,
 }
 
 struct RecordFailure {
@@ -280,6 +282,7 @@ impl Pass2Chunk {
             pending: PendingPolylines::default(),
             pending_attributes: HashMap::new(),
             failures: Vec::new(),
+            raw_records: Vec::new(),
         }
     }
 }
@@ -660,6 +663,7 @@ impl DwgDocumentBuilder {
         }
         self.report_progress(110);
         let pass1_started = web_time::Instant::now();
+        let capture_raw_pass1 = std::env::var_os("ACADRUST_RAW_ALL").is_some();
 
         for &(handle, offset, _, type_code) in &record_catalog {
             if is_table_type(type_code) {
@@ -687,6 +691,19 @@ impl DwgDocumentBuilder {
                         continue;
                     }
                 };
+                if capture_raw_pass1 {
+                    document.raw_records.insert(
+                        handle,
+                        (
+                            type_code,
+                            std::sync::Arc::new(crate::entities::RawRecord {
+                                data: reader.raw_merged_data(),
+                                handle_bits: reader.get_handle_bits(),
+                                version: self.obj_reader.dxf_version(),
+                            }),
+                        ),
+                    );
+                }
                 // Wrap in catch_unwind to survive corrupt/misaligned records
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let non_entity = self
@@ -1642,6 +1659,7 @@ impl DwgDocumentBuilder {
 
         let pass2_total = pass2_records.len().max(1);
         let mut pass2_done = 0usize;
+        let capture_raw = std::env::var_os("ACADRUST_RAW_ALL").is_some();
         for batch in pass2_records.chunks(batch_size) {
             let decode_started = web_time::Instant::now();
             let chunks: Vec<Pass2Chunk> = map_chunks(batch, chunk_size, |records| {
@@ -1667,6 +1685,14 @@ impl DwgDocumentBuilder {
                             continue;
                         }
                     };
+                    if capture_raw {
+                        chunk.raw_records.push((
+                            handle,
+                            raw_type_code,
+                            reader.raw_merged_data(),
+                            reader.get_handle_bits(),
+                        ));
+                    }
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         self.process_pass2_record(
                             handle,
@@ -1700,6 +1726,19 @@ impl DwgDocumentBuilder {
 
             let commit_started = web_time::Instant::now();
             for mut chunk in chunks {
+                for (handle, type_code, data, handle_bits) in chunk.raw_records.drain(..) {
+                    document.raw_records.insert(
+                        handle,
+                        (
+                            type_code,
+                            std::sync::Arc::new(crate::entities::RawRecord {
+                                data,
+                                handle_bits,
+                                version: self.obj_reader.dxf_version(),
+                            }),
+                        ),
+                    );
+                }
                 decoded_pass2 = decoded_pass2
                     .saturating_add(chunk.output.entities.len())
                     .saturating_add(chunk.output.objects.len());

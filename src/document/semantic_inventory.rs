@@ -200,6 +200,7 @@ impl<'a> SemanticInventoryV1<'a> {
             acis_sab_handles: _,
             raw_acds_data: _,
             raw_acds_fingerprint: _,
+            raw_records: _,
             dwg_data_store_handles: _,
             section_view_style: _,
             view_rep_refs: _,

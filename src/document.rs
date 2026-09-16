@@ -1196,6 +1196,13 @@ pub struct CadDocument {
     /// Shared so document snapshots do not duplicate large modeler data.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) raw_acds_data: Option<Arc<Vec<u8>>>,
+    /// Debug aid: every record of the source DWG, verbatim, keyed by handle
+    /// (type code, bytes). Only filled when `ACADRUST_RAW_ALL` is set in the
+    /// environment; the writer then re-emits these instead of re-serialising
+    /// so that a writer defect can be bisected by object type
+    /// (`ACADRUST_RAW_EXCLUDE`).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) raw_records: HashMap<u64, (i16, Arc<crate::entities::RawRecord>)>,
 
     /// `(handle, byte length, hash)` of SAB bodies when `raw_acds_data` was
     /// captured. Used to reject stale section passthrough after geometry edits.
@@ -1378,6 +1385,7 @@ impl CadDocument {
             preview: None,
             acis_sab_handles: Vec::new(),
             raw_acds_data: None,
+            raw_records: HashMap::new(),
             raw_acds_fingerprint: Vec::new(),
             dwg_data_store_handles: HashSet::new(),
             section_view_style: None,

@@ -350,6 +350,9 @@ impl<'a> DwgObjectWriter<'a> {
             self.output.extend_from_slice(&0x0DCAi32.to_le_bytes());
         }
 
+        // Debug bisection aid (ACADRUST_RAW_ALL): re-emit source records verbatim.
+        self.preregister_raw_records();
+
         // Enqueue root dictionary for later.
         // If the header handle is NULL (e.g., after a DWG read where the
         // header reader failed to parse handles), scan document.objects to
@@ -2305,6 +2308,71 @@ impl<'a> DwgObjectWriter<'a> {
     // ── Object queue draining ───────────────────────────────────────
 
     /// Drain the object queue, writing each non-graphical object.
+    /// Debug bisection aid. When `ACADRUST_RAW_ALL` is set, every record the
+    /// reader captured from the source file (see `CadDocument::raw_records`)
+    /// is registered verbatim up front, so the normal serialisers are only
+    /// used for record types listed in `ACADRUST_RAW_EXCLUDE` (comma-separated
+    /// numeric DWG type codes or class DXF names, case-insensitive). The
+    /// duplicate-handle guards in `register_object` / `register_raw_object`
+    /// and the early return in `write_entity` keep the normal path from
+    /// emitting a second copy. Only meaningful for an unmodified document
+    /// written back to its own version.
+    fn preregister_raw_records(&mut self) {
+        if std::env::var_os("ACADRUST_RAW_ALL").is_none() || self.document.raw_records.is_empty() {
+            return;
+        }
+        let exclude: Vec<String> = std::env::var("ACADRUST_RAW_EXCLUDE")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_ascii_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut handles: Vec<u64> = self.document.raw_records.keys().copied().collect();
+        handles.sort_unstable();
+        let (mut registered, mut excluded, mut skipped) = (0usize, 0usize, 0usize);
+        for h in handles {
+            let (type_code, raw) = &self.document.raw_records[&h];
+            if raw.version != self.dxf_version {
+                skipped += 1;
+                continue;
+            }
+            let class_name = if *type_code >= 500 {
+                self.document
+                    .classes
+                    .iter()
+                    .find(|c| c.class_number == *type_code)
+                    .map(|c| c.dxf_name.to_ascii_uppercase())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let code_str = type_code.to_string();
+            // Category tokens: TABLES (symbol tables + controls + block headers),
+            // ENTITIES, OBJECTS (everything else).
+            let is_table = crate::io::dwg::dwg_stream_readers::object_reader::common::is_table_type(*type_code);
+            let is_entity = if *type_code >= 500 {
+                self.document
+                    .classes
+                    .iter()
+                    .find(|c| c.class_number == *type_code)
+                    .map(|c| c.is_an_entity)
+                    .unwrap_or(false)
+            } else {
+                crate::io::dwg::dwg_stream_readers::object_reader::common::is_entity_type(*type_code)
+            };
+            let category = if is_table { "TABLES" } else if is_entity { "ENTITIES" } else { "OBJECTS" };
+            if exclude.iter().any(|e| *e == code_str || *e == category || (!class_name.is_empty() && *e == class_name)) {
+                excluded += 1;
+                continue;
+            }
+            self.register_raw_object(Handle::from(h), &raw.data, raw.handle_bits);
+            registered += 1;
+        }
+        eprintln!(
+            "[acadrust raw-all] registered={registered} excluded={excluded} version-skipped={skipped} exclude={exclude:?}"
+        );
+    }
+
     fn write_objects(&mut self) {
         // Phase 1: drain the queue (root dict entries + xdict handles)
         while let Some(handle) = self.object_queue.pop_front() {

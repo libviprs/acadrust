@@ -43,6 +43,11 @@ impl<'a> DwgObjectWriter<'a> {
 
     /// Write a single entity record.
     pub(super) fn write_entity(&mut self, entity: &EntityType) {
+        // Already emitted verbatim (ACADRUST_RAW_ALL bisection aid): skip, so a
+        // compound entity does not re-allocate handles for its children.
+        if self.registered_handles.contains(&entity.common().handle.value()) {
+            return;
+        }
         // Verbatim passthrough: the entity still carries the exact bytes it was read
         // from, the target is the same version, and nothing the writer would
         // rewrite differs. Skipped for pre-R2004 (records embed prev/next entity
