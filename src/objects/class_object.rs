@@ -1049,9 +1049,16 @@ pub struct SunStudy {
 #[derive(Debug, Clone, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DataTableValue {
+    /// Column type 1.
     pub integer: i32,
+    /// Column type 2.
     pub real: f64,
+    /// Column type 3.
     pub text: String,
+    /// Column types 4 (2D, z unused) and 5 (3D).
+    pub point: Vector3,
+    /// Column type 6 (object id).
+    pub handle: Handle,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

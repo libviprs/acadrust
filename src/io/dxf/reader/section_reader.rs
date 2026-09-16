@@ -5585,11 +5585,25 @@ impl<'a> SectionReader<'a> {
                     let name = fields.string(section, 2);
                     let mut rows = Vec::new();
                     for _ in 0..row_count.max(0).min(100_000) {
-                        rows.push(DataTableValue {
-                            integer: fields.i32(section, 93),
-                            real: fields.f64(section, 40),
-                            text: fields.string(section, 3),
-                        });
+                        // One group per cell, by column type (AcDbDataTable).
+                        let mut value = DataTableValue::default();
+                        match value_type {
+                            1 => value.integer = fields.i32(section, 93),
+                            2 => value.real = fields.f64(section, 40),
+                            3 => value.text = fields.string(section, 3),
+                            4 => {
+                                value.point.x = fields.f64(section, 10);
+                                value.point.y = fields.f64(section, 20);
+                            }
+                            5 => {
+                                value.point.x = fields.f64(section, 11);
+                                value.point.y = fields.f64(section, 21);
+                                value.point.z = fields.f64(section, 31);
+                            }
+                            6 => value.handle = fields.handle(section, 331),
+                            _ => {}
+                        }
+                        rows.push(value);
                     }
                     columns.push(DataTableColumn {
                         value_type,

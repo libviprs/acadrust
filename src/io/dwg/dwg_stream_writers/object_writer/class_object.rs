@@ -36,7 +36,15 @@ impl<'a> DwgObjectWriter<'a> {
         self.register_object(object.handle);
     }
 
-    fn write_render_settings_data(&mut self, value: &RenderSettings, rapid_rt: bool) {
+    /// `write_predefined_bit`: see `read_render_settings` in the reader; only
+    /// plain RENDERSETTINGS carries the R2013+ flag right after
+    /// `display_index`.
+    fn write_render_settings_data(
+        &mut self,
+        value: &RenderSettings,
+        rapid_rt: bool,
+        write_predefined_bit: bool,
+    ) {
         let class_version = if rapid_rt && self.dxf_version == crate::types::DxfVersion::AC1027 {
             value.class_version - 1
         } else if !rapid_rt && self.version.r2013_plus(self.dxf_version) {
@@ -54,7 +62,7 @@ impl<'a> DwgObjectWriter<'a> {
             .write_variable_text(&value.environment_image_filename);
         self.writer.write_variable_text(&value.description);
         self.writer.write_bit_long(value.display_index);
-        if !rapid_rt && self.version.r2013_plus(self.dxf_version) {
+        if write_predefined_bit {
             self.writer.write_bit(value.has_predefined);
         }
     }
@@ -428,10 +436,11 @@ impl<'a> DwgObjectWriter<'a> {
                 self.writer.write_byte(value.shadow_softness);
             }
             ClassObjectData::RenderSettings(value) => {
-                self.write_render_settings_data(value, false);
+                let predefined = self.version.r2013_plus(self.dxf_version);
+                self.write_render_settings_data(value, false, predefined);
             }
             ClassObjectData::MentalRayRenderSettings(value) => {
-                self.write_render_settings_data(&value.base, false);
+                self.write_render_settings_data(&value.base, false, false);
                 self.writer.write_bit_long(value.version);
                 self.writer.write_bit_long(value.sampling_min);
                 self.writer.write_bit_long(value.sampling_max);
@@ -481,7 +490,7 @@ impl<'a> DwgObjectWriter<'a> {
                 self.writer.write_bit_double(value.energy_multiplier);
             }
             ClassObjectData::RapidRtRenderSettings(value) => {
-                self.write_render_settings_data(&value.base, true);
+                self.write_render_settings_data(&value.base, true, false);
                 self.writer.write_bit_long(value.version);
                 self.writer.write_bit_long(value.render_target);
                 self.writer.write_bit_long(value.render_level);
@@ -723,9 +732,21 @@ impl<'a> DwgObjectWriter<'a> {
                     self.writer.write_bit_long(column.value_type);
                     self.writer.write_variable_text(&column.name);
                     for row in &column.rows {
-                        self.writer.write_bit_long(row.integer);
-                        self.writer.write_bit_double(row.real);
-                        self.writer.write_variable_text(&row.text);
+                        // One value per cell, by column type (see the reader).
+                        match column.value_type {
+                            1 => self.writer.write_bit_long(row.integer),
+                            2 => self.writer.write_bit_double(row.real),
+                            3 => self.writer.write_variable_text(&row.text),
+                            4 => self.writer.write_2raw_double(crate::types::Vector2 {
+                                x: row.point.x,
+                                y: row.point.y,
+                            }),
+                            5 => self.writer.write_3raw_double(row.point),
+                            6 => self
+                                .writer
+                                .write_handle(DwgReferenceType::HardPointer, row.handle.value()),
+                            _ => {}
+                        }
                     }
                 }
             }
