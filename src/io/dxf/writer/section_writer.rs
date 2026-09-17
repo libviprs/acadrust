@@ -5803,7 +5803,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
     }
 
     fn write_class_object_dxf(&mut self, object: &crate::objects::ClassObject) -> Result<()> {
-        use crate::objects::ClassObjectData as Data;
+        use crate::objects::{ClassObjectData as Data, DataTableCellType};
         match &object.data {
             Data::Empty => self.write_class_object_header(object, ""),
             Data::ViewRepModelSpaceSource(value) => {
@@ -6280,6 +6280,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 Ok(())
             }
             Data::DataTable(value) => {
+                value.validate()?;
                 self.write_class_object_header(object, "AcDbDataTable")?;
                 self.writer.write_i16(70, value.flags)?;
                 self.writer.write_i32(90, value.columns.len() as i32)?;
@@ -6288,23 +6289,19 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 for column in &value.columns {
                     self.writer.write_i32(92, column.value_type)?;
                     self.writer.write_string(2, &column.name)?;
+                    let cell_type = column.cell_type().expect("DATATABLE validated above");
                     for row in &column.rows {
-                        // One group per cell, by column type (AcDbDataTable).
-                        match column.value_type {
-                            1 => self.writer.write_i32(93, row.integer)?,
-                            2 => self.writer.write_double(40, row.real)?,
-                            3 => self.writer.write_string(3, &row.text)?,
-                            4 => {
+                        match cell_type {
+                            DataTableCellType::Integer => self.writer.write_i32(93, row.integer)?,
+                            DataTableCellType::Double => self.writer.write_double(40, row.real)?,
+                            DataTableCellType::Text => self.writer.write_string(3, &row.text)?,
+                            DataTableCellType::Point => {
                                 self.writer.write_double(10, row.point.x)?;
                                 self.writer.write_double(20, row.point.y)?;
+                                self.writer.write_double(30, row.point.z)?;
                             }
-                            5 => {
-                                self.writer.write_double(11, row.point.x)?;
-                                self.writer.write_double(21, row.point.y)?;
-                                self.writer.write_double(31, row.point.z)?;
-                            }
-                            6 => self.writer.write_handle(331, row.handle)?,
-                            _ => {}
+                            DataTableCellType::ObjectId => self.writer.write_handle(331, row.handle)?,
+                            _ => unreachable!("DATATABLE validated above"),
                         }
                     }
                 }

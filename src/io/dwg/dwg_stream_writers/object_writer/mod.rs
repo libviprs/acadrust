@@ -32,6 +32,7 @@ use crate::entities::{EntityCommon, EntityType};
 use crate::io::dwg::dwg_reference_type::DwgReferenceType;
 use crate::io::dwg::dwg_stream_writers::DwgMergedWriter;
 use crate::io::dwg::dwg_version::DwgVersion;
+use crate::objects::{ClassObject, ClassObjectData, ObjectType};
 use crate::tables::{BlockRecord, TableEntry};
 use crate::types::{BoundingBox3D, DxfVersion, Handle};
 
@@ -167,7 +168,14 @@ impl<'a> DwgObjectWriter<'a> {
                 max_h = h;
             }
         }
-        for (handle, _) in &document.objects {
+        for (handle, object) in &document.objects {
+            if let ObjectType::ClassObject(ClassObject {
+                data: ClassObjectData::DataTable(table),
+                ..
+            }) = object
+            {
+                table.validate()?;
+            }
             let h = handle.value() + 1;
             if h > max_h {
                 max_h = h;

@@ -731,21 +731,19 @@ impl<'a> DwgObjectWriter<'a> {
                 for column in &value.columns {
                     self.writer.write_bit_long(column.value_type);
                     self.writer.write_variable_text(&column.name);
+                    let cell_type = column
+                        .cell_type()
+                        .expect("DATATABLE validated by object writer");
                     for row in &column.rows {
-                        // One value per cell, by column type (see the reader).
-                        match column.value_type {
-                            1 => self.writer.write_bit_long(row.integer),
-                            2 => self.writer.write_bit_double(row.real),
-                            3 => self.writer.write_variable_text(&row.text),
-                            4 => self.writer.write_2raw_double(crate::types::Vector2 {
-                                x: row.point.x,
-                                y: row.point.y,
-                            }),
-                            5 => self.writer.write_3raw_double(row.point),
-                            6 => self
+                        match cell_type {
+                            DataTableCellType::Integer => self.writer.write_bit_long(row.integer),
+                            DataTableCellType::Double => self.writer.write_bit_double(row.real),
+                            DataTableCellType::Text => self.writer.write_variable_text(&row.text),
+                            DataTableCellType::Point => self.writer.write_3bit_double(row.point),
+                            DataTableCellType::ObjectId => self
                                 .writer
-                                .write_handle(DwgReferenceType::HardPointer, row.handle.value()),
-                            _ => {}
+                                .write_handle(DwgReferenceType::SoftPointer, row.handle.value()),
+                            _ => unreachable!("DATATABLE validated by object writer"),
                         }
                     }
                 }

@@ -859,32 +859,34 @@ pub fn read_class_object_data(
         }
         "DATATABLE" => {
             let flags = reader.read_bit_short();
-            let column_count = count(reader.read_bit_long());
+            let column_count = reader.read_bit_long();
             let row_count = reader.read_bit_long();
+            if !(0..=MAX_ITEMS).contains(&column_count) || !(0..=MAX_ITEMS).contains(&row_count) {
+                return None;
+            }
             let name = reader.read_variable_text();
-            let mut columns = Vec::with_capacity(column_count);
+            let mut columns = Vec::with_capacity(column_count as usize);
             for _ in 0..column_count {
                 let value_type = reader.read_bit_long();
+                // Unknown schemas must keep the complete raw record: skipping
+                // a cell would desynchronize all subsequent columns.
+                let cell_type = DataTableCellType::from_code(value_type)?;
+                if !cell_type.has_native_codec() {
+                    return None;
+                }
                 let column_name = reader.read_variable_text();
                 let mut rows = Vec::new();
                 for _ in 0..count(row_count) {
-                    // One value per cell, encoded according to the column type
-                    // (AcDbDataTable: 1 = BL, 2 = BD, 3 = T, 4 = 2RD, 5 = 3RD,
-                    // 6 = object id). Reading every representation for every
-                    // cell desynchronised the stream and AutoCAD rejected the
-                    // re-written object (issue #80).
                     let mut value = DataTableValue::default();
-                    match value_type {
-                        1 => value.integer = reader.read_bit_long(),
-                        2 => value.real = reader.read_bit_double(),
-                        3 => value.text = reader.read_variable_text(),
-                        4 => {
-                            let p = reader.read_2raw_double();
-                            value.point = Vector3::new(p.x, p.y, 0.0);
+                    match cell_type {
+                        DataTableCellType::Integer => value.integer = reader.read_bit_long(),
+                        DataTableCellType::Double => value.real = reader.read_bit_double(),
+                        DataTableCellType::Text => value.text = reader.read_variable_text(),
+                        DataTableCellType::Point => value.point = reader.read_3bit_double(),
+                        DataTableCellType::ObjectId => {
+                            value.handle = Handle::from(reader.read_handle());
                         }
-                        5 => value.point = reader.read_3raw_double(),
-                        6 => value.handle = Handle::from(reader.read_handle()),
-                        _ => {}
+                        _ => return None,
                     }
                     rows.push(value);
                 }

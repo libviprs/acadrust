@@ -5582,26 +5582,24 @@ impl<'a> SectionReader<'a> {
                 let mut columns = Vec::new();
                 for _ in 0..column_count {
                     let value_type = fields.i32(section, 92);
+                    let cell_type = DataTableCellType::from_code(value_type)
+                        .filter(|kind| kind.has_native_codec())
+                        .ok_or_else(|| {
+                            crate::error::DxfError::NotImplemented(format!(
+                                "DATATABLE cell type {value_type}"
+                            ))
+                        })?;
                     let name = fields.string(section, 2);
                     let mut rows = Vec::new();
                     for _ in 0..row_count.max(0).min(100_000) {
-                        // One group per cell, by column type (AcDbDataTable).
                         let mut value = DataTableValue::default();
-                        match value_type {
-                            1 => value.integer = fields.i32(section, 93),
-                            2 => value.real = fields.f64(section, 40),
-                            3 => value.text = fields.string(section, 3),
-                            4 => {
-                                value.point.x = fields.f64(section, 10);
-                                value.point.y = fields.f64(section, 20);
-                            }
-                            5 => {
-                                value.point.x = fields.f64(section, 11);
-                                value.point.y = fields.f64(section, 21);
-                                value.point.z = fields.f64(section, 31);
-                            }
-                            6 => value.handle = fields.handle(section, 331),
-                            _ => {}
+                        match cell_type {
+                            DataTableCellType::Integer => value.integer = fields.i32(section, 93),
+                            DataTableCellType::Double => value.real = fields.f64(section, 40),
+                            DataTableCellType::Text => value.text = fields.string(section, 3),
+                            DataTableCellType::Point => value.point = fields.point3(section, 10),
+                            DataTableCellType::ObjectId => value.handle = fields.handle(section, 331),
+                            _ => unreachable!("cell type checked above"),
                         }
                         rows.push(value);
                     }
