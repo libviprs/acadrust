@@ -1203,6 +1203,10 @@ pub struct CadDocument {
     /// (`ACADRUST_RAW_EXCLUDE`).
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) raw_records: HashMap<u64, (i16, Arc<crate::entities::RawRecord>)>,
+    /// Child record -> compound entity handle, captured with `raw_records`.
+    /// Exclusions must serialize each compound entity and its children together.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) raw_record_owners: HashMap<u64, u64>,
 
     /// `(handle, byte length, hash)` of SAB bodies when `raw_acds_data` was
     /// captured. Used to reject stale section passthrough after geometry edits.
@@ -1386,6 +1390,7 @@ impl CadDocument {
             acis_sab_handles: Vec::new(),
             raw_acds_data: None,
             raw_records: HashMap::new(),
+            raw_record_owners: HashMap::new(),
             raw_acds_fingerprint: Vec::new(),
             dwg_data_store_handles: HashSet::new(),
             section_view_style: None,

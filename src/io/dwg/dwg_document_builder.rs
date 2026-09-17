@@ -1726,6 +1726,28 @@ impl DwgDocumentBuilder {
 
             let commit_started = web_time::Instant::now();
             for mut chunk in chunks {
+                if capture_raw {
+                    for (&owner, vertices) in &chunk.pending.vertices {
+                        for vertex in vertices {
+                            let handle = match vertex {
+                                PendingVertex::V2D(data) => data.handle,
+                                PendingVertex::V3D(data, _) => data.handle,
+                                PendingVertex::PfaceFace(data, _) => data.handle,
+                            };
+                            document.raw_record_owners.insert(handle.value(), owner);
+                        }
+                    }
+                    for (&owner, handle) in &chunk.pending.seqends {
+                        document.raw_record_owners.insert(handle.value(), owner);
+                    }
+                    for (&owner, attributes) in &chunk.pending_attributes {
+                        for attribute in attributes {
+                            document
+                                .raw_record_owners
+                                .insert(attribute.common.handle.value(), owner);
+                        }
+                    }
+                }
                 for (handle, type_code, data, handle_bits) in chunk.raw_records.drain(..) {
                     document.raw_records.insert(
                         handle,
