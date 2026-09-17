@@ -32,6 +32,7 @@ use crate::entities::{EntityCommon, EntityType};
 use crate::io::dwg::dwg_reference_type::DwgReferenceType;
 use crate::io::dwg::dwg_stream_writers::DwgMergedWriter;
 use crate::io::dwg::dwg_version::DwgVersion;
+use crate::objects::{ClassObject, ClassObjectData, ObjectType};
 use crate::tables::{BlockRecord, TableEntry};
 use crate::types::{BoundingBox3D, DxfVersion, Handle};
 
@@ -167,7 +168,14 @@ impl<'a> DwgObjectWriter<'a> {
                 max_h = h;
             }
         }
-        for (handle, _) in &document.objects {
+        for (handle, object) in &document.objects {
+            if let ObjectType::ClassObject(ClassObject {
+                data: ClassObjectData::DataTable(table),
+                ..
+            }) = object
+            {
+                table.validate()?;
+            }
             let h = handle.value() + 1;
             if h > max_h {
                 max_h = h;
@@ -344,6 +352,7 @@ impl<'a> DwgObjectWriter<'a> {
     ) {
         // Compute model space extents for VPort view adjustment
         self.model_space_extents = self.compute_model_space_extents();
+
 
         // R2004+: 0x0DCA marker at the start
         if self.version.r2004_plus() {
@@ -898,8 +907,8 @@ impl<'a> DwgObjectWriter<'a> {
         // Entry name
         self.writer.write_variable_text(&style.name);
 
-        // Xref-dependant
-        self.write_xref_dependant_bit();
+        // Xref-dependent flag
+        self.write_xref_dependant_bit_value(style.xref_dependent);
 
         // Shape file flag
         self.writer.write_bit(style.is_shape_file);
@@ -912,8 +921,9 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_bit_double(style.width_factor);
         // Oblique angle
         self.writer.write_bit_double(style.oblique_angle);
-        // Generation (mirror flags)
-        self.writer.write_byte(0);
+        // Generation (mirror flags: 2 = backward, 4 = upside down)
+        let generation = (if style.flags.backward { 2u8 } else { 0 }) | (if style.flags.upside_down { 4u8 } else { 0 });
+        self.writer.write_byte(generation);
         // Last height (must be > 0; use effective_last_height)
         self.writer.write_bit_double(style.effective_last_height());
         // Font name
@@ -922,8 +932,10 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_variable_text(&style.big_font_file);
 
         // External reference block handle (hard pointer)
-        // Null for non-xref-dependent styles
-        self.writer.write_handle(DwgReferenceType::HardPointer, 0);
+        self.writer.write_handle(
+            DwgReferenceType::HardPointer,
+            style.xref_block_record_handle.value(),
+        );
 
         self.register_object(style.handle);
     }
@@ -951,8 +963,9 @@ impl<'a> DwgObjectWriter<'a> {
 
         // Entry name
         self.writer.write_variable_text(&ltype.name);
-        // Xref
-        self.write_xref_dependant_bit();
+        // Xref-dependent flag (linetypes that came in through an xref keep it,
+        // otherwise AUDIT renames every "xref|name" record).
+        self.write_xref_dependant_bit_value(ltype.xref_dependent);
         // Description
         self.writer.write_variable_text(&ltype.description);
         // Pattern length
@@ -1047,7 +1060,10 @@ impl<'a> DwgObjectWriter<'a> {
         }
 
         // External reference block handle
-        self.writer.write_handle(DwgReferenceType::HardPointer, 0);
+        self.writer.write_handle(
+            DwgReferenceType::HardPointer,
+            ltype.xref_block_record_handle.value(),
+        );
 
         // Shape file handles for each segment
         for seg in &ltype.elements {
@@ -2054,9 +2070,9 @@ impl<'a> DwgObjectWriter<'a> {
         // Is xref overlay
         self.writer.write_bit(record.flags.is_xref_overlay);
 
-        // R2000+: loaded bit
+        // R2000+: "loaded" bit, 1 = xref currently unloaded (0 = loaded)
         if self.version.r2000_plus() {
-            self.writer.write_bit(false); // is loaded
+            self.writer.write_bit(record.flags.is_xref_unloaded);
         }
 
         // R2004+: owned object count (non-xref)

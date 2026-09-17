@@ -1162,6 +1162,7 @@ impl DwgDocumentBuilder {
                     br.flags.has_attributes = data.has_attributes;
                     br.flags.is_xref = data.is_xref;
                     br.flags.is_xref_overlay = data.is_xref_overlay;
+                    br.flags.is_xref_unloaded = data.is_loaded.unwrap_or(false);
                     br.block_entity_handle = Handle::from(data.block_entity_handle);
                     br.block_end_handle = Handle::from(data.endblk_handle);
                     br.units = data.units.unwrap_or(0);
@@ -1208,6 +1209,7 @@ impl DwgDocumentBuilder {
                     style.flags.upside_down = (data.generation & 4) != 0;
                     // Only mark xref-dependent if the xref block record handle is valid
                     style.xref_dependent = data.xref_dependent && data.xref_handle != 0;
+                    style.xref_block_record_handle = Handle::from(data.xref_handle);
                     // Use add_allow_duplicate for shape-file-only styles (empty name)
                     // so multiple empty-named styles are preserved. Named styles use
                     // add_or_replace to avoid duplicates (e.g. "Standard").
@@ -1223,6 +1225,7 @@ impl DwgDocumentBuilder {
                     lt.description = data.description.clone();
                     lt.pattern_length = data.pattern_length;
                     lt.xref_dependent = data.xref_dependent;
+                    lt.xref_block_record_handle = Handle::from(data.xref_handle);
                     lt.elements = data
                         .segments
                         .iter()

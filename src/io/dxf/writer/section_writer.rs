@@ -994,18 +994,32 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
 
                 self.writer.write_i16(74, flags)?;
                 self.writer.write_i16(75, c.shape_number().unwrap_or(0))?;
+                // AutoCAD's DXF reader is order-sensitive here: the STYLE
+                // pointer (340) must follow 75 directly and must be present
+                // for every complex element, otherwise the whole file is
+                // rejected with "Missing group code 340 in complex linetype".
+                // Order per the DXF reference: 49, 74, 75, 340, 46, 50, 44, 45, 9.
+                let style_handle = if c.style_handle.is_null() {
+                    document
+                        .text_styles
+                        .get("Standard")
+                        .map(|s| s.handle)
+                        .filter(|h| !h.is_null())
+                        .or_else(|| document.text_styles.iter().map(|s| s.handle).find(|h| !h.is_null()))
+                        .unwrap_or(Handle::NULL)
+                } else {
+                    c.style_handle
+                };
+                self.writer.write_handle(340, style_handle)?;
+                self.writer.write_double(46, c.scale)?;
+                // `rotation` is stored in radians; DXF code 50 is in degrees.
+                self.writer.write_double(50, c.rotation.to_degrees())?;
+                self.writer.write_double(44, c.offset[0])?;
+                self.writer.write_double(45, c.offset[1])?;
                 if let Some(t) = c.text() {
                     if !t.is_empty() {
                         self.writer.write_string(9, t)?;
                     }
-                }
-                self.writer.write_double(44, c.offset[0])?;
-                self.writer.write_double(45, c.offset[1])?;
-                self.writer.write_double(46, c.scale)?;
-                // `rotation` is stored in radians; DXF code 50 is in degrees.
-                self.writer.write_double(50, c.rotation.to_degrees())?;
-                if !c.style_handle.is_null() {
-                    self.writer.write_handle(340, c.style_handle)?;
                 }
             } else {
                 // Plain dash element — AutoCAD emits the zero flag word.
@@ -5789,7 +5803,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
     }
 
     fn write_class_object_dxf(&mut self, object: &crate::objects::ClassObject) -> Result<()> {
-        use crate::objects::ClassObjectData as Data;
+        use crate::objects::{ClassObjectData as Data, DataTableCellType};
         match &object.data {
             Data::Empty => self.write_class_object_header(object, ""),
             Data::ViewRepModelSpaceSource(value) => {
@@ -6266,6 +6280,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 Ok(())
             }
             Data::DataTable(value) => {
+                value.validate()?;
                 self.write_class_object_header(object, "AcDbDataTable")?;
                 self.writer.write_i16(70, value.flags)?;
                 self.writer.write_i32(90, value.columns.len() as i32)?;
@@ -6274,10 +6289,20 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 for column in &value.columns {
                     self.writer.write_i32(92, column.value_type)?;
                     self.writer.write_string(2, &column.name)?;
+                    let cell_type = column.cell_type().expect("DATATABLE validated above");
                     for row in &column.rows {
-                        self.writer.write_i32(93, row.integer)?;
-                        self.writer.write_double(40, row.real)?;
-                        self.writer.write_string(3, &row.text)?;
+                        match cell_type {
+                            DataTableCellType::Integer => self.writer.write_i32(93, row.integer)?,
+                            DataTableCellType::Double => self.writer.write_double(40, row.real)?,
+                            DataTableCellType::Text => self.writer.write_string(3, &row.text)?,
+                            DataTableCellType::Point => {
+                                self.writer.write_double(10, row.point.x)?;
+                                self.writer.write_double(20, row.point.y)?;
+                                self.writer.write_double(30, row.point.z)?;
+                            }
+                            DataTableCellType::ObjectId => self.writer.write_handle(331, row.handle)?,
+                            _ => unreachable!("DATATABLE validated above"),
+                        }
                     }
                 }
                 Ok(())
