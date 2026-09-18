@@ -1,0 +1,55 @@
+# Per-fixture verdict of acadrust against the recorded ACadSharp dump.
+# Written by `cargo test --test acadsharp_conformance -- --ignored record_baseline`.
+#
+# MATCH        every geometry record agreed, to 1e-6
+# DIFF:n       same record count, n records disagreed
+# COUNT:a/b    acadrust produced a records, ACadSharp b
+# OPEN_FAILED  acadrust refused or failed to read the file
+# UNCOMPARED   the fixture needs flattening this harness does not do
+#              (block expansion, hatch boundaries, dimension blocks)
+
+g11_codepage	MATCH
+g11_shapes	MATCH
+g13_arc	MATCH
+g13_bad_extents	MATCH
+g13_circle	MATCH
+g13_deep_blocks	MATCH
+g13_dimension	MATCH
+g13_dimension_shallow	MATCH
+g13_ellipse	MATCH
+g13_empty_view	MATCH
+g13_face3d	MATCH
+g13_hatch	UNCOMPARED
+g13_insert	MATCH
+g13_leader	MATCH
+g13_line	MATCH
+g13_long_text	MATCH
+g13_mesh	MATCH
+g13_mesh_bad_faces	MATCH
+g13_mirrored_bulge	MATCH
+g13_mline	MATCH
+g13_nan_bulge	MATCH
+g13_nonuniform	MATCH
+g13_ocs_mirror	MATCH
+g13_ocs_plane	MATCH
+g13_ocs_rotated	MATCH
+g13_ocs_skew	MATCH
+g13_point	MATCH
+g13_polyface_mesh	MATCH
+g13_polygon_mesh	MATCH
+g13_polyline	MATCH
+g13_ray_xline	MATCH
+g13_scale_1x	MATCH
+g13_slot	MATCH
+g13_slot_block	MATCH
+g13_solid	MATCH
+g13_spline	MATCH
+g13_text	MATCH
+g13_tolerance	MATCH
+g13_two_entities	MATCH
+g13_unsupported	MATCH
+g13_wide_polyline	MATCH
+g13_wipeout	MATCH
+g13_xref	MATCH
+real_AC1018	DIFF:1
+real_AC1032	DIFF:1

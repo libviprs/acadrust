@@ -17,7 +17,7 @@ use acadrust::entities::hatch::{
     PolylineEdge, SplineEdge,
 };
 use acadrust::entities::mesh::Mesh;
-use acadrust::entities::mline::MLine;
+use acadrust::entities::mline::{MLine, MLineFlags};
 use acadrust::entities::multileader::MultiLeader;
 use acadrust::entities::polyface_mesh::PolyfaceMesh;
 use acadrust::entities::*;
@@ -622,6 +622,13 @@ fn normalize_entity_common(common: &mut acadrust::entities::EntityCommon) {
     // entity_mode is DWG-internal and not set for programmatic documents;
     // normalize to None to avoid false differences in DWG roundtrip tests.
     common.entity_mode = None;
+    // raw_record caches the entity's source bytes as read from the file; it is
+    // provenance, not drawing content — the reader populates it and the writer
+    // may pass it through, and it carries no semantics a drawing can express.
+    // Programmatically built documents have None while read-back documents have
+    // Some(..), so leaving it in place makes every DWG roundtrip test fail on a
+    // field the comparator is not there to compare.
+    common.raw_record = None;
 }
 
 /// Comprehensive normalization for roundtrip comparison.
@@ -2868,4 +2875,171 @@ fn xdata_record_survives_dwg_roundtrip_r2018() {
 #[test]
 fn xdata_record_survives_dwg_roundtrip_r2004() {
     xdata_record_survives_dwg_roundtrip(DxfVersion::AC1018);
+}
+
+// ── DWG: MLINE open/closed flag ────────────────────────────────────────
+//
+// `Openclosed BS` (open 1 / closed 3) is DXF group 71 narrowed to
+// `HAS_VERTICES = 1` and `CLOSED = 2`. The DWG reader parsed it but never
+// copied it onto the entity, so a multiline came back with `MLine::new()`'s
+// default `HAS_VERTICES` and every closed multiline silently opened
+// (libviprs/acadrust#2). The open direction is already exercised by the MLINE
+// in `build_rich_document`, which the deep roundtrip tests compare field by
+// field; this locks in both directions explicitly, because the bug was
+// invisible for an open multiline.
+
+/// Round-trip `mline` through DWG and return the recovered MLINE.
+fn dwg_roundtrip_mline(version: DxfVersion, mline: MLine) -> MLine {
+    let doc = build_minimal_document(version, EntityType::MLine(mline));
+    let rt = dwg_roundtrip(&doc);
+    let found = rt.entities().find_map(|e| match e {
+        EntityType::MLine(m) => Some(m.clone()),
+        _ => None,
+    });
+    found.expect("MLINE missing after DWG roundtrip")
+}
+
+#[test]
+fn dwg_mline_closed_flag_roundtrips() {
+    let corners = [
+        Vector3::new(0.0, 0.0, 0.0),
+        Vector3::new(40.0, 0.0, 0.0),
+        Vector3::new(40.0, 40.0, 0.0),
+        Vector3::new(0.0, 40.0, 0.0),
+    ];
+
+    let closed = MLine::closed_from_points(&corners);
+    assert_eq!(
+        closed.flags.bits(),
+        3,
+        "a closed MLINE must be HAS_VERTICES | CLOSED before writing"
+    );
+    let rt = dwg_roundtrip_mline(DxfVersion::AC1032, closed);
+    assert!(
+        rt.flags.contains(MLineFlags::CLOSED),
+        "closed MLINE came back open: flags = {:?}",
+        rt.flags
+    );
+    assert!(
+        rt.flags.contains(MLineFlags::HAS_VERTICES),
+        "closed MLINE lost HAS_VERTICES: flags = {:?}",
+        rt.flags
+    );
+
+    // The mirror case: reading the flag must not invent a closure either.
+    let open = MLine::from_points(&corners);
+    assert_eq!(open.flags.bits(), 1, "an open MLINE must be HAS_VERTICES");
+    let rt = dwg_roundtrip_mline(DxfVersion::AC1032, open);
+    assert!(
+        !rt.flags.contains(MLineFlags::CLOSED),
+        "open MLINE came back closed: flags = {:?}",
+        rt.flags
+    );
+}
+
+#[test]
+fn dwg_mline_cap_suppression_bits_roundtrip() {
+    let corners = [
+        Vector3::new(0.0, 0.0, 0.0),
+        Vector3::new(40.0, 0.0, 0.0),
+        Vector3::new(40.0, 40.0, 0.0),
+        Vector3::new(0.0, 40.0, 0.0),
+    ];
+    for version in [DxfVersion::AC1018, DxfVersion::AC1032] {
+        let mut open = MLine::from_points(&corners);
+        open.suppress_start_caps();
+        open.suppress_end_caps();
+        assert_eq!(open.flags.bits(), 13, "authored flags");
+        let rt = dwg_roundtrip_mline(version, open);
+        assert_eq!(
+            rt.flags.bits(),
+            13,
+            "{version:?}: cap suppression lost on a DWG write"
+        );
+
+        let mut closed = MLine::closed_from_points(&corners);
+        closed.suppress_start_caps();
+        assert_eq!(closed.flags.bits(), 7, "authored flags");
+        let rt = dwg_roundtrip_mline(version, closed);
+        assert_eq!(
+            rt.flags.bits(),
+            7,
+            "{version:?}: closed MLINE lost its suppressed start cap"
+        );
+    }
+}
+
+#[test]
+fn a_dwg_save_as_another_release_keeps_the_mline_cap_bits() {
+    // `write_entity` replays an entity's verbatim `raw_record` only while the
+    // target version matches the one it was read from (object_writer/entities.rs:
+    // `raw.version == self.dxf_version`). A save-as to a different release
+    // therefore reaches `write_mline` with the entity untouched — the route a
+    // real AutoCAD drawing loses its cap bits through, and the one an in-memory
+    // round trip at a single version cannot reach.
+    let corners = [
+        Vector3::new(0.0, 0.0, 0.0),
+        Vector3::new(40.0, 0.0, 0.0),
+        Vector3::new(40.0, 40.0, 0.0),
+    ];
+    let mut m = MLine::from_points(&corners);
+    m.suppress_start_caps();
+    let doc = build_minimal_document(DxfVersion::AC1018, EntityType::MLine(m));
+    let mut read_back = read_dwg_bytes(acadrust::DwgWriter::write_to_vec(&doc).unwrap());
+    assert!(
+        read_back
+            .entities()
+            .any(|e| e.common().raw_record.is_some()),
+        "precondition: a read-back entity carries its source bytes"
+    );
+    read_back.version = DxfVersion::AC1032;
+    let converted = read_dwg_bytes(acadrust::DwgWriter::write_to_vec(&read_back).unwrap());
+    let bits = converted
+        .entities()
+        .find_map(|e| match e {
+            EntityType::MLine(m) => Some(m.flags.bits()),
+            _ => None,
+        })
+        .expect("MLINE after the version conversion");
+    assert_eq!(bits, 5, "save-as AC1032 dropped NO_START_CAPS");
+}
+
+fn read_dwg_bytes(bytes: Vec<u8>) -> acadrust::CadDocument {
+    acadrust::DwgReader::from_stream(std::io::Cursor::new(bytes))
+        .read()
+        .expect("dwg read")
+}
+
+/// The reader attaches an entity's source bytes as `EntityCommon::raw_record`
+/// and the writer may copy them verbatim instead of re-encoding
+/// (object_writer/entities.rs). Every mutable path drops that cache
+/// (document.rs:2827, :3189); if one stopped, a user's edit would be discarded
+/// on save with no error and nothing else in the suite would notice.
+#[test]
+fn an_edit_to_a_read_back_entity_survives_the_next_write() {
+    let mut doc = CadDocument::with_version(DxfVersion::AC1032);
+    doc.add_entity(EntityType::Line(Line::from_coords(0., 0., 0., 10., 0., 0.)))
+        .unwrap();
+    let mut rt1 = dwg_roundtrip(&doc);
+    let h = rt1
+        .entities()
+        .find_map(|e| matches!(e, EntityType::Line(_)).then(|| e.common().handle))
+        .expect("line after the first round trip");
+    assert!(
+        rt1.get_entity(h).unwrap().common().raw_record.is_some(),
+        "precondition: a read-back entity carries its source bytes"
+    );
+    match rt1.get_entity_mut(h).unwrap() {
+        EntityType::Line(l) => l.end.x = 999.0,
+        _ => unreachable!(),
+    }
+    let rt2 = dwg_roundtrip(&rt1);
+    let end_x = rt2
+        .entities()
+        .find_map(|e| match e {
+            EntityType::Line(l) => Some(l.end.x),
+            _ => None,
+        })
+        .expect("line after the second round trip");
+    assert_eq!(end_x, 999.0, "the write emitted the stale source record");
 }
