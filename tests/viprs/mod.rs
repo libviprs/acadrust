@@ -149,21 +149,27 @@ impl Record {
         if kind == "Warning" {
             return None; // a claim about the adapter, not about the drawing
         }
+        // Positionally, not by searching for the tokens: the dump's shape is
+        // fixed and every record type writes "<seq> <Kind> handle=<HEX>
+        // flags=<N>" before any kind-specific field
+        // (tests/fixtures/gen/CanonicalDump.cs:139-141), so the remainder is
+        // the body and is kept byte for byte.
+        //
+        // Splitting the remainder on whitespace and rejoining it, which is the
+        // obvious way to drop the two tokens, collapses every internal
+        // whitespace run in the line. It ran on the expectation only -- this
+        // side's records are built field by field -- so it manufactured a
+        // difference: handle 576 of both real drawings holds an eleven-space
+        // run inside its text and both sides agree on it.
         let rest = it.next()?;
-        let handle = rest
-            .split_whitespace()
-            .find_map(|t| t.strip_prefix("handle="))?
-            .to_string();
-        let flags = rest
-            .split_whitespace()
-            .find_map(|t| t.strip_prefix("flags="))
-            .and_then(|v| v.parse::<u32>().ok())
+        let mut tok = rest.splitn(3, ' ');
+        let handle = tok.next()?.strip_prefix("handle=")?.to_string();
+        let flags = tok
+            .next()?
+            .strip_prefix("flags=")?
+            .parse::<u32>()
             .unwrap_or(0);
-        let body = rest
-            .split_whitespace()
-            .filter(|t| !t.starts_with("handle=") && !t.starts_with("flags="))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let body = tok.next().unwrap_or("").to_string();
         Some(Record {
             kind,
             handle,
