@@ -2929,3 +2929,35 @@ fn dwg_mline_closed_flag_roundtrips() {
         rt.flags
     );
 }
+
+#[test]
+fn dwg_mline_cap_suppression_bits_roundtrip() {
+    let corners = [
+        Vector3::new(0.0, 0.0, 0.0),
+        Vector3::new(40.0, 0.0, 0.0),
+        Vector3::new(40.0, 40.0, 0.0),
+        Vector3::new(0.0, 40.0, 0.0),
+    ];
+    for version in [DxfVersion::AC1018, DxfVersion::AC1032] {
+        let mut open = MLine::from_points(&corners);
+        open.suppress_start_caps();
+        open.suppress_end_caps();
+        assert_eq!(open.flags.bits(), 13, "authored flags");
+        let rt = dwg_roundtrip_mline(version, open);
+        assert_eq!(
+            rt.flags.bits(),
+            13,
+            "{version:?}: cap suppression lost on a DWG write"
+        );
+
+        let mut closed = MLine::closed_from_points(&corners);
+        closed.suppress_start_caps();
+        assert_eq!(closed.flags.bits(), 7, "authored flags");
+        let rt = dwg_roundtrip_mline(version, closed);
+        assert_eq!(
+            rt.flags.bits(),
+            7,
+            "{version:?}: closed MLINE lost its suppressed start cap"
+        );
+    }
+}
