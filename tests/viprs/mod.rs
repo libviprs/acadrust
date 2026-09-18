@@ -264,13 +264,33 @@ fn quad_record(
     } else {
         vec![lift(c1), lift(c2), lift(c3), lift(c4)]
     };
+    // Record 9's normal slot is the plane the polygon is measured in, and the
+    // reference emits it as a unit vector: a SOLID's DXF 210 is only a
+    // direction, so the file is free to store any length and g13_solid's
+    // third solid deliberately stores (1,2,2). Neither reader normalises it,
+    // so the unit vector is the flattener's emit-time convention
+    // (native/Adapter/Flattener.cs:234, Flatten.Faces.cs:134) and has to be
+    // applied here.
+    //
+    // `normal` has two jobs and only the emitted one is renormalised. With
+    // lift_ocs the argument is the entity's own extrusion, and the lift above
+    // needs it exactly as stored. Without it the caller has already crossed
+    // two world-space edges of a placed 3DFACE, so the direction is both
+    // placed and unit and carrying it through the transform again would move
+    // it.
+    let emitted = if lift_ocs {
+        let n = p.at.direction((normal.x, normal.y, normal.z));
+        p3(n.0, n.1, n.2)
+    } else {
+        v3(normal)
+    };
     let mut body = String::new();
     write!(
         body,
         "n={} closed=1 pts=[{}] bulges=[] normal=[{}]",
         pts.len(),
         pts.join(";"),
-        v3(normal)
+        emitted
     )
     .ok()?;
     Some(Record {
@@ -1000,6 +1020,12 @@ fn render_one(p: &Placed) -> Option<Record> {
                 .collect();
             let bulges: Vec<String> = p2.vertices.iter().map(|v| f6(v.bulge)).collect();
             let any = bulges.iter().any(|b| b != "0.000000");
+            // Same unit-vector convention as record 9's: the slot is a
+            // direction, the file may store any length, and `direction`
+            // renormalises as it carries it across. No corpus fixture stores a
+            // POLYLINE extrusion that is not already +/-Z, so this is closing
+            // the hole rather than fixing an observed difference.
+            let n = at.direction((p2.normal.x, p2.normal.y, p2.normal.z));
             write!(
                 body,
                 "n={} closed={} pts=[{}] bulges=[{}] normal=[{}]",
@@ -1007,7 +1033,7 @@ fn render_one(p: &Placed) -> Option<Record> {
                 p2.flags.is_closed() as u8,
                 pts.join(";"),
                 if any { bulges.join(",") } else { String::new() },
-                v3(&p2.normal)
+                p3(n.0, n.1, n.2)
             )
             .ok()?;
             "Polyline"
@@ -1016,13 +1042,14 @@ fn render_one(p: &Placed) -> Option<Record> {
         // no arbitrary-axis transform applies and it carries no bulges.
         EntityType::Polyline3D(p3d) => {
             let pts: Vec<String> = p3d.vertices.iter().map(|v| v3(&v.position)).collect();
+            let n = at.direction((p3d.normal.x, p3d.normal.y, p3d.normal.z));
             write!(
                 body,
                 "n={} closed={} pts=[{}] bulges=[] normal=[{}]",
                 pts.len(),
                 p3d.flags.closed as u8,
                 pts.join(";"),
-                v3(&p3d.normal)
+                p3(n.0, n.1, n.2)
             )
             .ok()?;
             "Polyline"
