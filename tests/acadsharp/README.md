@@ -83,12 +83,13 @@ extrusion, its record spells it `(0.333333,0.666667,0.666667)`, and the fixture 
 One arm of one harness normalised and another did not.
 
 **The harness emitted values that are not finite.** `g13_nan_bulge` holds a NaN bulge and
-an infinity and the harness put both on the wire. libviprs-dep's `docs/WIRE.md:386` forbids
-a producer from emitting either in a geometry record: the entity is not emitted at all and
-a `NON_FINITE_GEOMETRY` warning naming its handle goes out instead, which is why the
-recording holds no record for handles `49` and `4A` and the verdict was `COUNT:2/0`. The
-empty recording was right and the difference in count was the harness's. Warnings are not
-part of the comparison, so the fixture now agrees on two empty record sets.
+an infinity and the harness put both on the wire. libviprs-dep's
+`acadsharp/docs/WIRE.md:386` forbids a producer from emitting either in a geometry record:
+the entity is not emitted at all and a `NON_FINITE_GEOMETRY` warning naming its handle
+goes out instead, which is why the recording holds no record for handles `49` and `4A` and
+the verdict was `COUNT:2/0`. The empty recording was right and the difference in count was
+the harness's. Warnings are not part of the comparison, so the fixture now agrees on two
+empty record sets.
 
 **`Record::parse` collapsed whitespace inside a recorded value.** It tokenised the
 recording's line on whitespace and rejoined it with single spaces, which is harmless for
@@ -104,9 +105,9 @@ its three element polylines. The DWG reader took the `Openclosed` short off the 
 then dropped it, so the entity came back carrying `HAS_VERTICES` alone and
 `MLine::is_closed()` answered false after a DWG load. Every coordinate on all 21 records
 agreed, which is what made it a flag that is not read rather than a path that is wrong. The
-DXF reader and the DWG writer were both already right, and the round-trip tests missed it
-for a plain reason: none of them closes an MLINE, so the flag was zero on both sides of
-every comparison they make.
+DXF reader and the DWG writer were both already right about that flag, and the round-trip
+tests missed it for a plain reason: none of them closes an MLINE, so the flag was zero on
+both sides of every comparison they make.
 
 **MIF `\U+XXXX` escapes were decoded without asking the code page.** `real_AC1018` is an
 ANSI_1252 drawing, and in it `94\U+00B0` is eight characters of MTEXT content rather than a
@@ -121,9 +122,17 @@ what that condition could have written.
 One lowering is the adapter's product decision rather than the format's semantics, and this
 harness does not reimplement it:
 
-- **A hatch loop carrying a curve** (`g13_hatch`). ACadSharp emits a warning and then the
-  loop's edges as records of their own. Which curve becomes which record is a choice, not a
-  fact about the file. Straight-edged loops ARE compared, and match.
+- **A hatch loop carrying a curve** (`g13_hatch`). ACadSharp warns about such a loop and
+  emits its edges as records of their own, and which curve becomes which record is a
+  choice, not a fact about the file. `dump_fixture` (`tests/viprs/mod.rs:1471-1487`)
+  answers `UNCOMPARED` for the whole drawing as soon as one loop carries an edge that is
+  not a `Line` or a `Polyline`, so nothing in `g13_hatch` is compared. The four geometry
+  records at `00004`, `00005`, `00006` and `00008` of `expectations/g13_hatch.txt` are what
+  that costs: an all-straight loop on handle `49`, two loops whose circular arc the
+  recording does lower — to a bulge in the polygon, not to edge records — and only then the
+  spline loop the warning and the separate `Spline` record belong to. Comparing the part
+  this side can express would report its own omission as a short count against acadrust,
+  which is why the gate stops at the fixture rather than at the loop.
 
 That line is the whole reason this report is worth reading. Past it the harness would be a
 second implementation of the thing it is measuring, and every difference it found could be
@@ -139,18 +148,25 @@ read `g13_mline` agrees on all 21 records.
 
 ## Where acadrust is ahead of the recording
 
-Two records are left, and in both of them the recording is the side that is wrong. Each is
-worth reading before it is touched, because each has an obvious change that turns the
-verdict green by throwing data away.
+Two records are left, and both have the same shape: acadrust reads what the file holds, the
+producer of the recording does not, and each gap is filed against that producer
+(`libviprs/libviprs-dep#111` and `#112`). Each is worth reading before it is touched,
+because each has an obvious change that turns the verdict green by throwing data away.
 
 **`real_AC1018` handle `64B`: a MIF escape that is genuine transport.** The drawing stores
 `\U+220545,6` and acadrust returns `∅45,6`. `U+2205` is not representable in the drawing's
 ANSI_1252 code page, so the escape is the only way that character crosses and decoding it
 is the correct read — the same condition as the section above, on the other side of it.
 ACadSharp implements no MIF decoding at all: `ReadVariableText` in
-`DwgStreamReaderBase.cs:880-891` reads the string, strips NULs and hands it back. And the
-recording refutes itself. `real_AC1032` is the R2018 save of the same drawing, and there the
-same reference implementation returns the literal `∅45,6` for this same handle `64B`. Any
+`DwgStreamReaderBase.cs:880-891` reads the string, strips NULs and hands it back, and
+handles `634` and `63E` show that from the recording alone — both saves return the literal
+`94\U+00B0` (`expectations/real_AC1018.txt:225`, `:235` and `real_AC1032.txt:232`, `:242`).
+So the `∅` at `real_AC1032.txt:263` is not the reference answering the escape recorded at
+`real_AC1018.txt:256`: it is the character AutoCAD itself stored when it converted the
+drawing to R2018. That is the stronger fact, because it is a ground truth neither reader
+produced — converting the file, AutoCAD resolved `\U+2205`, which ANSI_1252 cannot hold,
+and left `\U+00B0`, which it can, and that partition is the one this decoder computes. The
+layer the recording's side does not have is filed as `libviprs/libviprs-dep#111`. Any
 change that makes this record match is a regression. The trap is that the change is a
 one-liner: deleting the decode flips this record and, from the state this report used to
 describe, the two `\U+00B0` records with it — three records green at once, which reads as a
@@ -158,14 +174,22 @@ win and is one correct fix beside a silent loss of a character the drawing canno
 other way.
 
 **`real_AC1032` handle `79D`: a multiline ATTRIB's text.** An R2018 multiline attribute
-carries its real value in an embedded MTEXT and the single-line field ahead of it holds only
-the first line, so acadrust lifts the text out of the embedded MTEXT — in
+carries its real value in an embedded MTEXT rather than in the single-line field ahead of
+it, so acadrust lifts the text out of the embedded MTEXT — in
 `src/io/dwg/dwg_stream_readers/object_reader/entities.rs:4364-4387`, gated on `att_type > 1`
 and overriding only when the embedded value is non-empty — and returns `my multi line text
-for the attrrib`. ACadSharp returns `""`, and is contradicted by its own `real_AC1018`
-recording, which carries that string for this same handle. acadrust's writer is symmetric:
-`src/io/dwg/dwg_stream_writers/object_writer/entities.rs:1286-1298` writes the embedded
-MTEXT back under the same `att_type > 1` gate. And `dwg_document_builder.rs` derives
+for the attrrib`. The recording answers `""` there (`expectations/real_AC1032.txt:347`) and
+carries the whole string for the same handle in the R2004 save (`real_AC1018.txt:340`), and
+that is not the reference implementation contradicting itself. ACadSharp does read the
+embedded MTEXT on R2018 and up, into `AttributeBase.MText` (`DwgObjectReader.cs:5911-5931`,
+the string assigned in `readMText` at `:3717`); the flattener that produced the recording
+never consults it, because its `case TextEntity text:` arm matches an `AttributeEntity` —
+its own comment says so — and emits `text.Value` (`Flattener.cs:1106-1132`). On the R2004
+save the attribute stays single-line, so the legacy field that arm does read is where the
+text is. Two field layouts and one arm, filed as `libviprs/libviprs-dep#112`. acadrust's
+writer is symmetric: `write_attribute_entity_child` in
+`src/io/dwg/dwg_stream_writers/object_writer/entities.rs:1317-1336` writes the embedded
+MTEXT back under the same `att_type > 1` gate. And `dwg_document_builder.rs:4309` derives
 `e.line_count` from `e.value` in the ATTRIB arm, so an empty value would also report the
 wrong line count. Matching the recording here would be a data-loss regression.
 
@@ -184,8 +208,10 @@ Two matching decisions are worth naming because they look like omissions here:
   `_ArchTick` twice inside `*D4` — which this harness used to emit and the recording never
   had.
 - **A TABLE is expanded as an insertion**, because `TableEntity` derives from `Insert`
-  upstream and the flattener dispatches on that base type. That block is 56 of each real
-  drawing's records: 31 cell borders, 24 cell texts and one background polygon.
+  upstream and the flattener dispatches on that base type. That block is 55 of each real
+  drawing's 380 records: 31 cell-border lines, 20 cell texts, the one background polygon
+  and three circles, from the `my_block` insertions the cache block reaches. Dropping the
+  arm turns both real fixtures into `COUNT:325/380`, which is where that number comes from.
 
 ## Why a baseline instead of asserting equality
 
