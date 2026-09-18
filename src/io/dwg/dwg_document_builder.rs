@@ -1060,6 +1060,12 @@ impl DwgDocumentBuilder {
         });
         let eed_is_wide = self.obj_reader.version().r2007_plus();
         let mut cleared_default_vports = false;
+        if parsed_entries
+            .iter()
+            .any(|entry| matches!(entry, ParsedEntry::Layer(..)))
+        {
+            let _ = document.layers.remove("0");
+        }
         for entry in &parsed_entries {
             match entry {
                 ParsedEntry::Layer(h, data) => {
@@ -1146,9 +1152,9 @@ impl DwgDocumentBuilder {
                     if data.xref_handle != 0 {
                         layer.xref_block_record_handle = Handle::from(data.xref_handle);
                     }
-                    // Remove default entry if it exists, then add
-                    let _ = document.layers.remove(&data.name);
-                    let _ = document.layers.add(layer);
+                    // Real drawings can contain several distinct records with an
+                    // empty name. Preserve each handle, including its properties.
+                    document.layers.add_allow_duplicate(layer);
                 }
                 ParsedEntry::Block(h, data) => {
                     let mut br = crate::tables::BlockRecord::new(&data.name);
