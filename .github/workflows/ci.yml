@@ -2,25 +2,37 @@
 #
 # Two jobs and no allow-list of failures. A red check here means a test is red,
 # and the fix belongs in the test or in the code, never in a skip added to this
-# file. The defect this exists to catch has already happened once in twelve
-# commits: a test that was green upstream went red in a PR and no machine said
-# so.
+# file. The defect this exists to catch has already happened once in the
+# nineteen commits this fork carries above upstream 61280e0: issue55's
+# mif_escapes_in_dwg_strings_are_decoded was green upstream, went red under the
+# MIF code-page gate, and no machine said so. It is green again only because the
+# gate's own commit rewrote it.
 #
-# There is deliberately no format job. `cargo fmt --check` is red on seven
-# upstream files that have never been rustfmt-clean (current_transparency.rs,
-# nested_copy.rs, entities/acis/types.rs, entities/translate.rs,
-# io/dxf/reader/section_reader.rs, io/dxf/writer/section_writer.rs, lib.rs -
-# all seven measured dirty, see tests/acadsharp/README.md:31-40), and a path
-# argument does not scope it: cargo fmt ignores the argument and reformats the
-# whole crate. Scoping a job to the files a PR touches does not help either,
-# because lib.rs is one of the seven and any new module has to touch it, which
-# would leave a contributor red for a reason the README forbids them to fix.
-# The remaining option - a list of seven files to skip - is the allow-list this
-# workflow refuses to have. Formatting stays a per-file local step:
-# `rustfmt --edition 2021 <file>`.
+# There is deliberately no format job. `cargo fmt --check` is red on fourteen
+# upstream files that have never been rustfmt-clean - the same fourteen at this
+# commit and at upstream 61280e0. Twelve under src/: current_transparency.rs,
+# document.rs, entities/acis/types.rs, entities/translate.rs,
+# io/dwg/dwg_reader.rs, io/dwg/dwg_stream_writers/object_writer/entities.rs,
+# io/dwg/dwg_stream_writers/object_writer/mod.rs,
+# io/dxf/reader/section_reader.rs, io/dxf/writer/section_writer.rs, lib.rs,
+# nested_copy.rs, objects/mod.rs; and two under tests/:
+# dxf_autocad_conformance.rs, read_visiting.rs (see tests/acadsharp/README.md:31-45).
+# A path argument does not scope it: cargo fmt ignores the argument and
+# reformats the whole crate. Scoping a job to the files a PR touches does not
+# help either, because lib.rs is one of the fourteen and any new module has to
+# touch it, which would leave a contributor red for a reason the README forbids
+# them to fix. The remaining option - a list of fourteen files to skip - is the
+# allow-list this workflow refuses to have. Formatting stays a per-file local
+# step: `rustfmt --edition 2021 <file>`.
 #
-# Actions are disabled on a newly forked repository: until Settings -> Actions
-# allows them on libviprs/acadrust, this file runs on zero machines.
+# This file has never executed. `gh api repos/libviprs/acadrust/actions/workflows`
+# and `.../actions/runs` both report total_count 0, because the workflow is not
+# on the default branch yet. Repository Actions are enabled
+# (`gh api repos/libviprs/acadrust/actions/permissions` -> "enabled": true), but
+# a forked repository also needs the one-time "I understand my workflows, go
+# ahead and enable them" confirmation on the Actions tab, and no REST field
+# reports that state - so check the tab after the first push to main rather
+# than trusting this comment.
 name: CI
 
 on:
@@ -103,7 +115,7 @@ jobs:
         # "test result: ok. 1 passed" with no corpus at all. Counting the corpus
         # BEFORE cargo is what stops a silent skip from reading as a pass.
         # The pinned commit holds 45 record dumps and 52 fixtures
-        # (tests/acadsharp/README.md:44); the dumps are the geometry oracle and
+        # (tests/acadsharp/README.md:49); the dumps are the geometry oracle and
         # the harness looks each one up by fixture stem (:92).
         run: |
           for d in expectations fixtures; do
@@ -119,7 +131,7 @@ jobs:
           [ "$dwgs" -ge 52 ] || { echo "::error::only $dwgs fixtures under fixtures/, want >= 52"; exit 1; }
       # Asserts every fixture's verdict against tests/acadsharp/BASELINE.tsv in
       # both directions: a fixture that got worse fails, and one that got better
-      # fails too and asks to be re-recorded (tests/acadsharp/README.md:190-198).
+      # fails too and asks to be re-recorded (tests/acadsharp/README.md:221-229).
       # The two recorded DIFFs are deliberate and are argued in that README
       # under "Where acadrust is ahead of the recording"; re-recording is a
       # local step, never a CI one.

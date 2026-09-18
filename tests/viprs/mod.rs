@@ -1448,9 +1448,10 @@ pub fn expand(doc: &acadrust::document::CadDocument) -> Result<Vec<Placed<'_>>, 
             }
             // A TABLE caches what it draws in an anonymous block, and over
             // there it is expanded because `TableEntity` derives from
-            // `Insert`. Reaching that block is 56 of real_AC1018's 380
-            // records: 31 cell-border lines, 24 cell texts and the one
-            // background polygon, none of which exist on this side otherwise.
+            // `Insert`. Reaching that block is 55 of each real drawing's 380
+            // records: 31 cell-border lines, 20 cell texts, the one background
+            // polygon and three circles, none of which exist on this side
+            // otherwise.
             // The rows and cells the entity itself carries are the table's
             // data rather than its picture, so nothing is synthesised from
             // them here: the picture is the block.
