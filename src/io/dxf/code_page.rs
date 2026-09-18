@@ -242,8 +242,11 @@ impl From<&'static Encoding> for LegacyCodePage {
 /// character?". The rest are approximations, and asking them yields an answer
 /// about a different character set: CP437 has no Cyrillic at all where its
 /// stand-in IBM866 is almost nothing but Cyrillic; CP932 maps neither `U+00A5`
-/// nor `U+203E`, where WHATWG Shift_JIS does; the WHATWG `Big5` and `EUC-KR`
-/// rows are supersets of the code pages they stand in for (`Big5` is HKSCS);
+/// nor `U+203E`, where WHATWG Shift_JIS does; the WHATWG `Big5` row is a
+/// superset of the code page it stands in for (`Big5` is HKSCS, CP950 is
+/// not), while the `EUC-KR` row *is* CP949 — which is why `ANSI_949` and
+/// `KOREAN` are candidates for the faithful list rather than permanent
+/// stand-ins (`#9`);
 /// `MAC-ROMAN` has no arm at all and lands on the windows-1252 default. An
 /// unrecognised name reaches that same default and is a stand-in for whatever
 /// the drawing really declared.
@@ -255,13 +258,16 @@ impl From<&'static Encoding> for LegacyCodePage {
 pub fn code_page_is_faithful(code_page: &str) -> bool {
     matches!(
         code_page.to_ascii_lowercase().as_str(),
-        // Windows/ANSI rows: WHATWG windows-125x is CP125x.
+        // Windows/ANSI rows: WHATWG windows-125x is CP125x except in the
+        // unassigned C1 slots U+0081..U+009F, which WHATWG maps to C1
+        // controls and Microsoft leaves undefined; no glyph, no drawing
+        // content. ANSI_1255 is the one real exception and is not on this
+        // list: WHATWG maps U+05BA at 0xCA where CP1255 leaves it undefined.
         "ansi_1250"
             | "ansi_1251"
             | "ansi_1252"
             | "ansi_1253"
             | "ansi_1254"
-            | "ansi_1255"
             | "ansi_1256"
             | "ansi_1257"
             | "ansi_1258"
@@ -283,6 +289,11 @@ pub fn code_page_is_faithful(code_page: &str) -> bool {
             | "iso_8859-7"
             | "iso8859-8"
             | "iso_8859-8"
+            // KOI8-R and ISO8859-10/13/14/15 are faithful rows that a DWG
+            // write cannot reach: `dwg_code_page_index` has no arm for them
+            // (nor for KOI8-U, which left this list above) and falls to 30,
+            // so the file declares ANSI_1252 while the bytes are in this row.
+            // Tracked in `hakanaktt/acadrust#102`.
             | "iso8859-10"
             | "iso_8859-10"
             | "iso8859-13"
@@ -292,8 +303,12 @@ pub fn code_page_is_faithful(code_page: &str) -> bool {
             | "iso8859-15"
             | "iso_8859-15"
             | "koi8-r"
-            | "koi8-u"
-            // GBK is CP936 with the same repertoire.
+            // GBK is CP936's row here, and the two agree on 23907 of GBK's
+            // 24085 BMP scalars. The 178 GBK-only ones — U+1E3F,
+            // U+9FB4..U+9FBB, U+FE10..U+FE19 and 159 PUA — are confirmed
+            // absent from CP936 by unicode.org's CP936.TXT and by
+            // per-character iconv, so an escape naming one of those is
+            // transport this gate calls content. Tracked in `#9`.
             | "gb2312"
             | "ansi_936"
     )
@@ -314,15 +329,19 @@ pub fn legacy_code_page(code_page: &str) -> Option<LegacyCodePage> {
 /// Resolve the compact DWG metadata index to the code page its strings are
 /// stored in.
 ///
-/// The return value derefs to the `encoding_rs` row, so callers that only
-/// transcode bytes read it as the encoding it names; callers that decode MIF
-/// escapes also get the answer to whether that row is trustworthy for the
-/// declared code page.
+/// Callers that only transcode bytes take [`LegacyCodePage::encoding`] or
+/// [`LegacyCodePage::decode`]; callers that decode MIF escapes also get the
+/// answer to whether that row is trustworthy for the declared code page via
+/// [`LegacyCodePage::is_faithful`]. There is deliberately no `Deref` — see
+/// [`LegacyCodePage::decode`] for why.
 pub fn encoding_from_dwg_code_page(index: u16) -> LegacyCodePage {
     let name = dwg_code_page_name(index);
     LegacyCodePage {
         encoding: encoding_from_code_page(name).unwrap_or(encoding_rs::WINDOWS_1252),
-        faithful: code_page_is_faithful(name),
+        // An index outside the table lands on the `ANSI_1252` default name,
+        // which is faithful for the code page that really is ANSI_1252 and a
+        // stand-in for whatever this drawing actually declared.
+        faithful: (1..=44).contains(&index) && code_page_is_faithful(name),
     }
 }
 
@@ -627,6 +646,12 @@ mod tests {
 
         let mac_roman = legacy_code_page("MAC-ROMAN").unwrap();
         assert_eq!(decode_mif_escapes("\\U+00DE", mac_roman), "Þ");
+
+        // WHATWG windows-1255 maps U+05BA (HEBREW POINT HOLAM HASER FOR VAV)
+        // at 0xCA; Microsoft's CP1255 leaves 0xCA undefined, so a real CP1255
+        // writer had to escape it and the escape is transport.
+        let ansi_1255 = legacy_code_page("ANSI_1255").unwrap();
+        assert_eq!(decode_mif_escapes("\\U+05BA", ansi_1255), "\u{05BA}");
     }
 
     #[test]
@@ -665,7 +690,6 @@ mod tests {
             "ISO8859-2",
             "ISO8859-15",
             "KOI8-R",
-            "KOI8-U",
             "GB2312",
             "ANSI_936",
         ] {
@@ -682,6 +706,11 @@ mod tests {
             "KOREAN",
             "ISO8859-1",
             "ISO8859-9",
+            // WHATWG windows-1255 holds U+05BA where CP1255 does not, and
+            // `encoding_rs`' `koi8-u` row is KOI8-RU, which differs from
+            // KOI8-U in both directions.
+            "ANSI_1255",
+            "KOI8-U",
             "SOMETHING_UNKNOWN",
             // A spelling the table does not match reaches the windows-1252
             // default, so its encoder was not chosen for it.
@@ -689,6 +718,35 @@ mod tests {
         ] {
             assert!(!code_page_is_faithful(name), "{name} is a stand-in");
         }
+    }
+
+    #[test]
+    fn an_unrecognised_dwg_code_page_index_is_a_stand_in() {
+        // `dwg_code_page_name` collapses every index outside the table onto the
+        // recognised name `ANSI_1252`, so deriving faithfulness from the name
+        // alone arms the gate on a drawing whose code page we never identified.
+        // Index 0 is what the reader initialises the field to.
+        for index in [0u16, 45, 99, 65535] {
+            assert!(
+                !encoding_from_dwg_code_page(index).is_faithful(),
+                "index {index} is not in the table and must be a stand-in"
+            );
+        }
+        // And the consequence the flag exists for: an escape a windows-1252
+        // drawing would keep as content decodes on an unidentified code page,
+        // because nothing established that the drawing could have held it.
+        assert_eq!(
+            decode_mif_escapes("94\\U+00B0", encoding_from_dwg_code_page(0)),
+            "94°"
+        );
+        assert!(
+            encoding_from_dwg_code_page(30).is_faithful(),
+            "30 is ANSI_1252"
+        );
+        assert!(
+            !encoding_from_dwg_code_page(23).is_faithful(),
+            "23 is MAC-ROMAN, a stand-in"
+        );
     }
 
     #[test]
@@ -713,14 +771,15 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_round_trip_is_identity_where_no_escape_names_an_unrepresentable_character() {
+    fn test_legacy_round_trip_is_identity_where_no_literal_escape_names_an_unrepresentable_character(
+    ) {
         // The claim has to be scoped, because the encoding is not injective
         // and no decoder can repair that: the character `∅` and the seven
         // literal characters `\U+2205` encode to the same bytes under
         // ANSI_1252, so whatever the decoder does, one of the two comes back
         // as the other. It resolves the collision towards transport, which is
         // the reading a conforming writer produces — and identity therefore
-        // holds exactly for strings containing no escape that names a
+        // holds exactly for strings containing no literal escape that names a
         // character the code page cannot represent.
         let code_page = legacy_code_page("ANSI_1252").unwrap();
         let enc = code_page.encoding();
