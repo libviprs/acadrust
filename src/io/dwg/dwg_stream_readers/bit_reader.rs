@@ -35,8 +35,11 @@ pub struct DwgBitReader {
     version: DwgVersion,
     /// Exact DXF version (for R2013+/R2018+ sub-version checks).
     dxf_version: DxfVersion,
-    /// Text encoding for non-Unicode strings.
-    encoding: &'static encoding_rs::Encoding,
+    /// Code page for non-Unicode strings: the encoding to transcode with,
+    /// plus whether it is the drawing's declared code page or a stand-in.
+    /// The MIF gate in `decode_legacy_text` needs both; see
+    /// [`crate::io::dxf::code_page::LegacyCodePage`].
+    encoding: crate::io::dxf::code_page::LegacyCodePage,
     /// Whether the text stream is empty (R2007+ flag).
     pub is_empty: bool,
     /// Text stream bit position for R2007+ three-stream merge.
@@ -63,7 +66,9 @@ impl DwgBitReader {
             last_byte: 0,
             version,
             dxf_version,
-            encoding: encoding_rs::WINDOWS_1252,
+            // No code page was named, so no escape is presumed to be
+            // content. `from_shared_with_encoding` supplies the real one.
+            encoding: encoding_rs::WINDOWS_1252.into(),
             is_empty: false,
             text_stream_pos: -1,
             text_stream_end_pos: -1,
@@ -74,10 +79,10 @@ impl DwgBitReader {
         data: Arc<[u8]>,
         version: DwgVersion,
         dxf_version: DxfVersion,
-        encoding: &'static encoding_rs::Encoding,
+        encoding: impl Into<crate::io::dxf::code_page::LegacyCodePage>,
     ) -> Self {
         let mut reader = Self::from_shared(data, version, dxf_version);
-        reader.encoding = encoding;
+        reader.encoding = encoding.into();
         reader
     }
 
@@ -86,10 +91,10 @@ impl DwgBitReader {
         data: Vec<u8>,
         version: DwgVersion,
         dxf_version: DxfVersion,
-        encoding: &'static encoding_rs::Encoding,
+        encoding: impl Into<crate::io::dxf::code_page::LegacyCodePage>,
     ) -> Self {
         let mut r = Self::new(data, version, dxf_version);
-        r.encoding = encoding;
+        r.encoding = encoding.into();
         r
     }
 

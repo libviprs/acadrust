@@ -139,11 +139,28 @@ fn gbk_codepage_text_roundtrip() {
 
 #[test]
 fn mif_escapes_in_dwg_strings_are_decoded() {
-    // A file whose strings contain literal MIF \U+XXXX sequences (ASCII-safe
-    // for any code page) must decode them into the actual characters.
-    let doc = text_document("ANSI_936", "\\U+4E2D\\U+6587");
+    // Issue #55's secondary symptom, from the Kanyu project's 143 real-world
+    // R2000 files: "Non-ASCII strings are returned with GBK bytes expanded as
+    // Latin-1 chars and MIF \U+XXXX escapes undecoded (the header codepage,
+    // e.g. ANSI_936, is not applied)". The escapes that carry his non-GBK
+    // characters are the ones GBK cannot hold, and those must decode.
+    //
+    // This test used to author `\U+4E2D\U+6587` under ANSI_936 and demand
+    // `中文`. No conforming writer can produce that input: a writer escapes
+    // only what the code page cannot represent, and GBK represents 中文
+    // directly — including acadrust's own writer, which is why
+    // `gbk_codepage_text_roundtrip` covers that path instead. An escape
+    // naming a representable character is literal content, which is what
+    // AutoCAD does with it too: `real_AC1032` is the R2018 (UTF-16, no MIF)
+    // save of the same drawing as `real_AC1018` and stores its `94\U+00B0` as
+    // nine literal characters while resolving its `\U+2205` to `∅` — see
+    // handles 634/63E against 64B in tests/acadsharp/expectations.
+    //
+    // So the GBK mirror of that real case: ∅ is outside GBK and decodes, 中
+    // is inside it and stays literal.
+    let doc = text_document("ANSI_936", "\\U+2205 \\U+4E2D");
     let rt = read_dwg(DwgWriter::write_to_vec(&doc).unwrap());
-    assert_eq!(first_text_value(&rt), "中文");
+    assert_eq!(first_text_value(&rt), "∅ \\U+4E2D");
 }
 
 #[test]
