@@ -209,3 +209,32 @@ fn gbk_layer_names_roundtrip() {
         }
     }
 }
+
+/// One drawing, one code page. `From<&Encoding> for LegacyCodePage` reads a
+/// bare encoding as "code page unknown" and decodes unconditionally
+/// (`code_page.rs`), so a reader path that takes the encoding instead of the
+/// code page silently answers a different question on the header stream than
+/// on the object stream.
+#[test]
+fn a_header_string_reads_the_same_code_page_as_an_entity() {
+    for (value, want) in [("94\\U+00B0", "94\\U+00B0"), ("\\U+2205 x", "∅ x")] {
+        let mut doc = CadDocument::with_version(DxfVersion::AC1015);
+        doc.header.code_page = "ANSI_1252".to_string();
+        doc.header.dim_post = value.to_string();
+        doc.add_entity(EntityType::Text(Text::with_value(
+            value,
+            Vector3::new(0., 0., 0.),
+        )))
+        .unwrap();
+        let rt = read_dwg(DwgWriter::write_to_vec(&doc).unwrap());
+        assert_eq!(
+            rt.header.dim_post, want,
+            "header stream disagreed on {value:?}"
+        );
+        assert_eq!(
+            first_text_value(&rt),
+            want,
+            "object stream disagreed on {value:?}"
+        );
+    }
+}
