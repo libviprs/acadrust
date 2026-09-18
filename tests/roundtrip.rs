@@ -2936,3 +2936,110 @@ fn dwg_mline_closed_flag_roundtrips() {
         rt.flags
     );
 }
+
+#[test]
+fn dwg_mline_cap_suppression_bits_roundtrip() {
+    let corners = [
+        Vector3::new(0.0, 0.0, 0.0),
+        Vector3::new(40.0, 0.0, 0.0),
+        Vector3::new(40.0, 40.0, 0.0),
+        Vector3::new(0.0, 40.0, 0.0),
+    ];
+    for version in [DxfVersion::AC1018, DxfVersion::AC1032] {
+        let mut open = MLine::from_points(&corners);
+        open.suppress_start_caps();
+        open.suppress_end_caps();
+        assert_eq!(open.flags.bits(), 13, "authored flags");
+        let rt = dwg_roundtrip_mline(version, open);
+        assert_eq!(
+            rt.flags.bits(),
+            13,
+            "{version:?}: cap suppression lost on a DWG write"
+        );
+
+        let mut closed = MLine::closed_from_points(&corners);
+        closed.suppress_start_caps();
+        assert_eq!(closed.flags.bits(), 7, "authored flags");
+        let rt = dwg_roundtrip_mline(version, closed);
+        assert_eq!(
+            rt.flags.bits(),
+            7,
+            "{version:?}: closed MLINE lost its suppressed start cap"
+        );
+    }
+}
+
+#[test]
+fn a_dwg_save_as_another_release_keeps_the_mline_cap_bits() {
+    // `write_entity` replays an entity's verbatim `raw_record` only while the
+    // target version matches the one it was read from (object_writer/entities.rs:
+    // `raw.version == self.dxf_version`). A save-as to a different release
+    // therefore reaches `write_mline` with the entity untouched — the route a
+    // real AutoCAD drawing loses its cap bits through, and the one an in-memory
+    // round trip at a single version cannot reach.
+    let corners = [
+        Vector3::new(0.0, 0.0, 0.0),
+        Vector3::new(40.0, 0.0, 0.0),
+        Vector3::new(40.0, 40.0, 0.0),
+    ];
+    let mut m = MLine::from_points(&corners);
+    m.suppress_start_caps();
+    let doc = build_minimal_document(DxfVersion::AC1018, EntityType::MLine(m));
+    let mut read_back = read_dwg_bytes(acadrust::DwgWriter::write_to_vec(&doc).unwrap());
+    assert!(
+        read_back
+            .entities()
+            .any(|e| e.common().raw_record.is_some()),
+        "precondition: a read-back entity carries its source bytes"
+    );
+    read_back.version = DxfVersion::AC1032;
+    let converted = read_dwg_bytes(acadrust::DwgWriter::write_to_vec(&read_back).unwrap());
+    let bits = converted
+        .entities()
+        .find_map(|e| match e {
+            EntityType::MLine(m) => Some(m.flags.bits()),
+            _ => None,
+        })
+        .expect("MLINE after the version conversion");
+    assert_eq!(bits, 5, "save-as AC1032 dropped NO_START_CAPS");
+}
+
+fn read_dwg_bytes(bytes: Vec<u8>) -> acadrust::CadDocument {
+    acadrust::DwgReader::from_stream(std::io::Cursor::new(bytes))
+        .read()
+        .expect("dwg read")
+}
+
+/// The reader attaches an entity's source bytes as `EntityCommon::raw_record`
+/// and the writer may copy them verbatim instead of re-encoding
+/// (object_writer/entities.rs). Every mutable path drops that cache
+/// (document.rs:2827, :3189); if one stopped, a user's edit would be discarded
+/// on save with no error and nothing else in the suite would notice.
+#[test]
+fn an_edit_to_a_read_back_entity_survives_the_next_write() {
+    let mut doc = CadDocument::with_version(DxfVersion::AC1032);
+    doc.add_entity(EntityType::Line(Line::from_coords(0., 0., 0., 10., 0., 0.)))
+        .unwrap();
+    let mut rt1 = dwg_roundtrip(&doc);
+    let h = rt1
+        .entities()
+        .find_map(|e| matches!(e, EntityType::Line(_)).then(|| e.common().handle))
+        .expect("line after the first round trip");
+    assert!(
+        rt1.get_entity(h).unwrap().common().raw_record.is_some(),
+        "precondition: a read-back entity carries its source bytes"
+    );
+    match rt1.get_entity_mut(h).unwrap() {
+        EntityType::Line(l) => l.end.x = 999.0,
+        _ => unreachable!(),
+    }
+    let rt2 = dwg_roundtrip(&rt1);
+    let end_x = rt2
+        .entities()
+        .find_map(|e| match e {
+            EntityType::Line(l) => Some(l.end.x),
+            _ => None,
+        })
+        .expect("line after the second round trip");
+    assert_eq!(end_x, 999.0, "the write emitted the stale source record");
+}
