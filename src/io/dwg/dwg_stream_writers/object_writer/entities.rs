@@ -3127,13 +3127,40 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_3bit_double(e.start_point);
         self.writer.write_3bit_double(e.normal);
 
-        // Openclosed BS: open (1), closed (3) — always has HAS_VERTICES flag
-        let flag_value: i16 = if e.flags.contains(MLineFlags::CLOSED) {
+        // `Openclosed BS`, DXF group 71. The ODA specification documents two
+        // values for this field, open (1) and closed (3), and those are not
+        // enum tags: they are group 71's two low bits, `HAS_VERTICES` (1) and
+        // `HAS_VERTICES | CLOSED` (1 | 2). The short *is* group 71, so the
+        // cap-suppression bits `NO_START_CAPS` (4) and `NO_END_CAPS` (8) ride
+        // in it as well, and the entity's own object stream is the only place
+        // they can: MLINESTYLE's flag word has bits 4 and 8 unassigned, and
+        // its cap bits (16/32/64 start, 256/512/1024 end) pick a cap *shape*
+        // for every entity sharing the style, which cannot express one
+        // multiline suppressing its own caps. libredwg decodes this same field
+        // as `FIELD_BS (flags, 71)` with `MLINE_FLAGS_SUPPRESS_START_CAPS` /
+        // `_SUPPRESS_END_CAPS` and a validity mask of 15 (`src/dwg.spec`
+        // entity MLINE (47), `include/dwg.h`), and writes that raw short
+        // straight back out at group 71.
+        //
+        // Deliberately not `e.flags.bits()` — which is what the DXF writer
+        // emits at `src/io/dxf/writer/section_writer.rs:9373` — because the
+        // in-memory flags can hold combinations the documented contract
+        // excludes: `MLineFlags::empty()`, or `CLOSED` without `HAS_VERTICES`
+        // from a DXF file whose group 71 said 2. A `0` or `2` on this short is
+        // a value no AutoCAD drawing contains, and ACadSharp's reader resolves
+        // it as open by `== 3` (`DwgObjectReader.cs:3374`). So the open/closed
+        // pair is always rebuilt from `CLOSED` into one of the two documented
+        // patterns, and only the cap bits are carried across verbatim. That
+        // makes a DWG write lossless for the bits the DWG reader keeps
+        // (`dwg_document_builder.rs`: `MLineFlags::from_bits_truncate`) and
+        // agrees with the DXF writer on every flag set either format can hold.
+        let caps = e.flags & (MLineFlags::NO_START_CAPS | MLineFlags::NO_END_CAPS);
+        let open_closed: i16 = if e.flags.contains(MLineFlags::CLOSED) {
             3
         } else {
             1
         };
-        self.writer.write_bit_short(flag_value);
+        self.writer.write_bit_short(open_closed | caps.bits());
 
         // Linesinstyle RC 73 — number of segments from first vertex
         let nlines: u8 = if let Some(first_v) = e.vertices.first() {
