@@ -29,15 +29,20 @@ rustfmt --edition 2021 tests/viprs/mod.rs
 ```
 
 `cargo fmt` is the wrong tool here and a path argument does not save you: it ignores the
-argument and formats the whole crate, which rewrites seven `src/` files that have never
-been rustfmt-clean — `current_transparency.rs`, `nested_copy.rs`, `entities/acis/types.rs`,
-`entities/translate.rs`, `io/dxf/reader/section_reader.rs`, `io/dxf/writer/section_writer.rs`
-and `lib.rs`, whose `mod` order it also sorts. All seven are upstream's files at commits
-this fork has in common with it, so reformatting them buys nothing here and costs a
-conflict on every future rebase. That is why they are left alone rather than fixed.
+argument and formats the whole crate, which rewrites fourteen files that have never been
+rustfmt-clean. `cargo fmt --check` names them — twelve under `src/`:
+`current_transparency.rs`, `document.rs`, `entities/acis/types.rs`,
+`entities/translate.rs`, `io/dwg/dwg_reader.rs`,
+`io/dwg/dwg_stream_writers/object_writer/entities.rs`,
+`io/dwg/dwg_stream_writers/object_writer/mod.rs`, `io/dxf/reader/section_reader.rs`,
+`io/dxf/writer/section_writer.rs`, `lib.rs`, whose `mod` order it also sorts,
+`nested_copy.rs` and `objects/mod.rs`; and two under `tests/`:
+`dxf_autocad_conformance.rs` and `read_visiting.rs`. All fourteen are upstream's files at
+commits this fork has in common with it, so reformatting them buys nothing here and costs
+a conflict on every future rebase. That is why they are left alone rather than fixed.
 
-`cargo fmt --check` is safe and is red on those same seven files. `rustfmt --check` on one
-file is the version worth believing.
+`cargo fmt --check` is safe and is red on those same fourteen files. `rustfmt --check` on
+one file is the version worth believing.
 
 ## Where it stands
 
@@ -124,7 +129,7 @@ harness does not reimplement it:
 
 - **A hatch loop carrying a curve** (`g13_hatch`). ACadSharp warns about such a loop and
   emits its edges as records of their own, and which curve becomes which record is a
-  choice, not a fact about the file. `dump_fixture` (`tests/viprs/mod.rs:1471-1487`)
+  choice, not a fact about the file. `dump_fixture` (`tests/viprs/mod.rs:1514-1534`)
   answers `UNCOMPARED` for the whole drawing as soon as one loop carries an edge that is
   not a `Line` or a `Polyline`, so nothing in `g13_hatch` is compared. The four geometry
   records at `00004`, `00005`, `00006` and `00008` of `expectations/g13_hatch.txt` are what
