@@ -1000,7 +1000,26 @@ fn render_one(p: &Placed) -> Option<Record> {
         }
         EntityType::Spline(s) => {
             let knots: Vec<String> = s.knots.iter().map(|k| f6(*k)).collect();
-            let ctrl: Vec<String> = s.control_points.iter().map(v3).collect();
+            // A spline's control points are world coordinates, so a placed
+            // instance has to carry them through the transform like every
+            // other point. Without it the record would hold the block's own
+            // authoring coordinates: a SPLINE inside a scaled or offset block
+            // would be recorded at the origin, at authoring size, while the
+            // LINEs and CIRCLEs beside it moved.
+            //
+            // The knots and the weights deliberately stay put. The knot vector
+            // is a parameterisation of the curve, not a position, and an
+            // affine map of a rational B-spline's control points with the
+            // weights unchanged is exactly the transform of the curve -- so
+            // touching either would distort it.
+            let ctrl: Vec<String> = s
+                .control_points
+                .iter()
+                .map(|c| {
+                    let (x, y, z) = at.point(c.x, c.y, c.z);
+                    p3(x, y, z)
+                })
+                .collect();
             let weights: Vec<String> = s.weights.iter().map(|w| f6(*w)).collect();
             // acadrust holds these as five bools; the recording prints the DXF
             // bitmask (70), so rebuild it rather than invent a spelling.
@@ -1050,10 +1069,24 @@ fn render_one(p: &Placed) -> Option<Record> {
                     // 2: the LwPolyline's points land at z -2 and this one's
                     // at 0, so the two fields are not interchangeable.
                     let (x, y, z) = o.to_world(v.location.x, v.location.y, v.location.z);
+                    // The OCS lift puts the vertex in the block's world; the
+                    // placement puts that world into the drawing's. Without
+                    // this the record would hold the un-placed OCS point, so a
+                    // POLYLINE in a scaled or offset block would be recorded at
+                    // the block's coordinates while the LWPOLYLINE beside it --
+                    // which does apply `at.point` -- moved, and the normal on
+                    // this same record would be transformed while its points
+                    // were not.
+                    let (x, y, z) = at.point(x, y, z);
                     p3(x, y, z)
                 })
                 .collect();
-            let bulges: Vec<String> = p2.vertices.iter().map(|v| f6(v.bulge)).collect();
+            // A bulge is a signed tangent measure, so a reflection reverses
+            // what its sign means: placing the points through a mirror without
+            // flipping the bulges would bow every arc the wrong way. Same flip
+            // the LwPolyline arm applies.
+            let flip = if at.mirrored() { -1.0 } else { 1.0 };
+            let bulges: Vec<String> = p2.vertices.iter().map(|v| f6(v.bulge * flip)).collect();
             let any = bulges.iter().any(|b| b != "0.000000");
             // Same unit-vector convention as record 9's: the slot is a
             // direction, the file may store any length, and `direction`
@@ -1076,7 +1109,20 @@ fn render_one(p: &Placed) -> Option<Record> {
         // A true 3D polyline. Its vertices are already world coordinates, so
         // no arbitrary-axis transform applies and it carries no bulges.
         EntityType::Polyline3D(p3d) => {
-            let pts: Vec<String> = p3d.vertices.iter().map(|v| v3(&v.position)).collect();
+            // The vertices take no arbitrary-axis lift, but the world they are
+            // already in is the block's, so the placement still applies.
+            // Without it this arm would transform the record's normal on the
+            // next line and leave its points behind, which would put the curve
+            // at the block's authoring coordinates inside a correctly placed
+            // plane.
+            let pts: Vec<String> = p3d
+                .vertices
+                .iter()
+                .map(|v| {
+                    let (x, y, z) = at.point(v.position.x, v.position.y, v.position.z);
+                    p3(x, y, z)
+                })
+                .collect();
             let n = at.direction((p3d.normal.x, p3d.normal.y, p3d.normal.z));
             write!(
                 body,
