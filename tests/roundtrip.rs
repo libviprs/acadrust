@@ -17,7 +17,7 @@ use acadrust::entities::hatch::{
     PolylineEdge, SplineEdge,
 };
 use acadrust::entities::mesh::Mesh;
-use acadrust::entities::mline::MLine;
+use acadrust::entities::mline::{MLine, MLineFlags};
 use acadrust::entities::multileader::MultiLeader;
 use acadrust::entities::polyface_mesh::PolyfaceMesh;
 use acadrust::entities::*;
@@ -2868,4 +2868,64 @@ fn xdata_record_survives_dwg_roundtrip_r2018() {
 #[test]
 fn xdata_record_survives_dwg_roundtrip_r2004() {
     xdata_record_survives_dwg_roundtrip(DxfVersion::AC1018);
+}
+
+// ── DWG: MLINE open/closed flag ────────────────────────────────────────
+//
+// `Openclosed BS` (open 1 / closed 3) is DXF group 71 narrowed to
+// `HAS_VERTICES = 1` and `CLOSED = 2`. The DWG reader parsed it but never
+// copied it onto the entity, so a multiline came back with `MLine::new()`'s
+// default `HAS_VERTICES` and every closed multiline silently opened
+// (libviprs/acadrust#2). The open direction is already exercised by the MLINE
+// in `build_rich_document`, which the deep roundtrip tests compare field by
+// field; this locks in both directions explicitly, because the bug was
+// invisible for an open multiline.
+
+/// Round-trip `mline` through DWG and return the recovered MLINE.
+fn dwg_roundtrip_mline(version: DxfVersion, mline: MLine) -> MLine {
+    let doc = build_minimal_document(version, EntityType::MLine(mline));
+    let rt = dwg_roundtrip(&doc);
+    let found = rt.entities().find_map(|e| match e {
+        EntityType::MLine(m) => Some(m.clone()),
+        _ => None,
+    });
+    found.expect("MLINE missing after DWG roundtrip")
+}
+
+#[test]
+fn dwg_mline_closed_flag_roundtrips() {
+    let corners = [
+        Vector3::new(0.0, 0.0, 0.0),
+        Vector3::new(40.0, 0.0, 0.0),
+        Vector3::new(40.0, 40.0, 0.0),
+        Vector3::new(0.0, 40.0, 0.0),
+    ];
+
+    let closed = MLine::closed_from_points(&corners);
+    assert_eq!(
+        closed.flags.bits(),
+        3,
+        "a closed MLINE must be HAS_VERTICES | CLOSED before writing"
+    );
+    let rt = dwg_roundtrip_mline(DxfVersion::AC1032, closed);
+    assert!(
+        rt.flags.contains(MLineFlags::CLOSED),
+        "closed MLINE came back open: flags = {:?}",
+        rt.flags
+    );
+    assert!(
+        rt.flags.contains(MLineFlags::HAS_VERTICES),
+        "closed MLINE lost HAS_VERTICES: flags = {:?}",
+        rt.flags
+    );
+
+    // The mirror case: reading the flag must not invent a closure either.
+    let open = MLine::from_points(&corners);
+    assert_eq!(open.flags.bits(), 1, "an open MLINE must be HAS_VERTICES");
+    let rt = dwg_roundtrip_mline(DxfVersion::AC1032, open);
+    assert!(
+        !rt.flags.contains(MLineFlags::CLOSED),
+        "open MLINE came back closed: flags = {:?}",
+        rt.flags
+    );
 }

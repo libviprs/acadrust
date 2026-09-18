@@ -4026,6 +4026,23 @@ impl DwgDocumentBuilder {
                     e.common = entity_common;
                     e.scale_factor = data.scale_factor;
                     e.justification = MLineJustification::from(data.justification as i16);
+                    // `Openclosed BS` — open (1), closed (3). It is DXF group 71
+                    // restricted to the two low bits `HAS_VERTICES = 1` and
+                    // `CLOSED = 2`, so the raw value maps straight onto
+                    // `MLineFlags`. The field is read off the object stream at
+                    // `src/io/dwg/dwg_stream_readers/object_reader/entities.rs:3032`
+                    // into `MLineData.openclosed`, but until this line it was never
+                    // transferred out of `MLineData`, so `e.flags` kept
+                    // `MLine::new()`'s default `HAS_VERTICES` and every DWG
+                    // multiline read back open. The DXF reader applies the same rule
+                    // (`src/io/dxf/reader/section_reader.rs:17508-17510`) and this is
+                    // the exact inverse of our own DWG writer
+                    // (`src/io/dwg/dwg_stream_writers/object_writer/entities.rs:3099-3103`).
+                    // `from_bits_truncate` rather than `== 3`: it also clears
+                    // `HAS_VERTICES` for a degenerate `openclosed == 0` and cannot
+                    // panic on an out-of-spec value. Plain `=`, not `|=`, for the
+                    // same reason — `|=` could never clear `HAS_VERTICES`.
+                    e.flags = MLineFlags::from_bits_truncate(data.openclosed);
                     e.start_point = data.start_point;
                     e.normal = data.normal;
                     e.style_element_count = data.lines_in_style as usize;
