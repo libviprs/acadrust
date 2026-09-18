@@ -569,6 +569,7 @@ impl DwgDocumentBuilder {
         // We collect first and create domain objects after the loop so that
         // cross-references (e.g. layer → linetype name) can be resolved
         // using the fully-populated handle→name maps.
+        let mut block_control_entries = Vec::new();
         enum ParsedEntry {
             Layer(u64, tables::LayerData),
             Block(u64, tables::BlockHeaderData),
@@ -580,10 +581,10 @@ impl DwgDocumentBuilder {
             VPort(u64, tables::VPortData),
             AppId(u64, tables::AppIdData),
             Vx(u64, tables::VxTableRecordData),
-            /// BLOCK_CONTROL hard-owner refs: (model_space_handle, paper_space_handle).
+            /// BLOCK_CONTROL hard-owner refs and regular table order.
             /// These are the authoritative active model/paper space designation —
             /// the file header's block handles are unreliable on some versions.
-            BlockControl(u64, u64),
+            BlockControl(u64, u64, Vec<u64>),
             VxControl(Vec<u64>),
         }
         let mut parsed_entries: Vec<ParsedEntry> = Vec::new();
@@ -843,6 +844,7 @@ impl DwgDocumentBuilder {
                             Some(ParsedEntry::BlockControl(
                                 data.model_space_handle,
                                 data.paper_space_handle,
+                                data.entry_handles,
                             ))
                         }
                         OBJ_STYLE => {
@@ -927,7 +929,8 @@ impl DwgDocumentBuilder {
                             ParsedEntry::VPort(_, _) => {}
                             ParsedEntry::AppId(_, _) => {}
                             ParsedEntry::Vx(_, _) => {}
-                            ParsedEntry::BlockControl(m, p) => {
+                            ParsedEntry::BlockControl(m, p, entries) => {
+                                block_control_entries = entries.clone();
                                 // Seed the authoritative active model/paper space
                                 // handles (used by the block-name dedup below).
                                 if *m != 0 {
@@ -1004,8 +1007,19 @@ impl DwgDocumentBuilder {
                 })
                 .collect();
 
-            let names: Vec<(u64, String)> =
-                block_info.iter().map(|(_, h, name)| (*h, name.clone())).collect();
+            let anonymous_names = anonymous_block_names(&block_control_entries, &maps.blocks);
+            for (idx, h, _) in &block_info {
+                if let Some(name) = anonymous_names.get(h) {
+                    if let ParsedEntry::Block(_, ref mut data) = parsed_entries[*idx] {
+                        data.name = name.clone();
+                    }
+                    maps.blocks.insert(*h, name.clone());
+                }
+            }
+            let names: Vec<(u64, String)> = block_info
+                .iter()
+                .map(|(_, h, _)| (*h, maps.blocks[h].clone()))
+                .collect();
             for (pos, new_name) in dedupe_block_names(&names, active_model, active_paper) {
                 let (idx, h, _) = block_info[pos];
                 if let ParsedEntry::Block(_, ref mut data) = parsed_entries[idx] {
@@ -7238,9 +7252,39 @@ fn dedupe_block_names(
     renames
 }
 
+/// AutoCAD numbers bare anonymous names in BLOCK_CONTROL order. Ordinary
+/// records consume an ordinal too; dangling/erased entries do not. This is
+/// independent of object-handle order and excludes the control's two special
+/// model/paper-space pointers. Preserve names with an explicit stored suffix.
+fn anonymous_block_names(entries: &[u64], names: &HashMap<u64, String>) -> HashMap<u64, String> {
+    entries
+        .iter()
+        .filter_map(|handle| names.get(handle).map(|name| (handle, name)))
+        .enumerate()
+        .filter_map(|(ordinal, (handle, name))| {
+            (name.len() == 2 && name.starts_with('*'))
+                .then(|| (*handle, format!("{name}{ordinal}")))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod dedupe_block_names_tests {
     use super::*;
+
+    #[test]
+    fn anonymous_names_follow_live_control_order_including_named_blocks() {
+        let names = [(30, "*U"), (10, "Named"), (20, "*D"), (40, "*U99")]
+            .into_iter()
+            .map(|(h, n)| (h, n.to_string()))
+            .collect();
+        let result = anonymous_block_names(&[10, 999, 30, 20, 40], &names);
+        assert_eq!(result[&30], "*U1");
+        assert_eq!(result[&20], "*D2");
+        assert!(!result.contains_key(&40));
+        assert!(!result.contains_key(&10));
+        assert!(anonymous_block_names(&[], &names).is_empty());
+    }
 
     fn names(blocks: &[(u64, &str)], model: u64, paper: u64) -> Vec<String> {
         let input: Vec<(u64, String)> = blocks.iter().map(|(h, n)| (*h, n.to_string())).collect();
@@ -7264,7 +7308,16 @@ mod dedupe_block_names_tests {
             0x18,
             0x1291E,
         );
-        assert_eq!(out, ["*MODEL_SPACE", "*PAPER_SPACE0", "*Paper_Space1", "*PAPER_SPACE", "*Paper_Space2"]);
+        assert_eq!(
+            out,
+            [
+                "*MODEL_SPACE",
+                "*PAPER_SPACE0",
+                "*Paper_Space1",
+                "*PAPER_SPACE",
+                "*Paper_Space2"
+            ]
+        );
         let unique: HashSet<String> = out.iter().map(|n| n.to_uppercase()).collect();
         assert_eq!(unique.len(), out.len());
     }
