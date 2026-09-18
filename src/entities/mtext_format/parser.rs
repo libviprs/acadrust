@@ -413,15 +413,42 @@ impl MTextParser {
 
             // Unicode escape: \U+XXXX
             'U' if self.pos + 1 < self.chars.len() && self.chars[self.pos + 1] == '+' => {
-                self.pos += 2; // skip \U+
-                let start = self.pos;
-                while self.pos < self.chars.len() && self.chars[self.pos].is_ascii_hexdigit() {
-                    self.pos += 1;
-                }
-                let hex: String = self.chars[start..self.pos].iter().collect();
-                if let Ok(code_point) = u32::from_str_radix(&hex, 16) {
-                    if let Some(ch) = char::from_u32(code_point) {
+                // AutoCAD's `\U+XXXX` takes exactly four hex digits, which is
+                // what `decode_mif_escapes` enforces at the transport layer
+                // (`src/io/dxf/code_page.rs:392`). Consuming every following
+                // hex digit instead turns `20\U+00B0C` into U+0B0C, and a code
+                // point that is not a scalar must come back out as the text the
+                // file holds rather than disappear.
+                //
+                // The two layers decode `\U+XXXX` on purpose, and they are not
+                // redundant: the transport layer decodes only escapes the
+                // declared code page could not have held, because an escape it
+                // *can* hold is drawing content; this layer is MTEXT content
+                // formatting, where every well-formed escape is a character of
+                // the text. So the rule they must agree on is the shape of the
+                // escape — four digits, malformed stays literal, a lone
+                // surrogate crosses as its seven characters — and that rule is
+                // spelled the same way in both.
+                let start = self.pos + 2;
+                let scalar = self
+                    .chars
+                    .get(start..start + 4)
+                    .filter(|d| d.iter().all(char::is_ascii_hexdigit))
+                    .and_then(|d| {
+                        let hex: String = d.iter().collect();
+                        u32::from_str_radix(&hex, 16).ok()
+                    })
+                    .and_then(char::from_u32);
+                match scalar {
+                    Some(ch) => {
+                        self.pos = start + 4;
                         self.text_buf.push(ch);
+                    }
+                    None => {
+                        // Not a well-formed escape: emit `\U+` verbatim and let
+                        // the rest of the run be ordinary text.
+                        self.text_buf.push_str("\\U+");
+                        self.pos = start;
                     }
                 }
             }
@@ -1768,6 +1795,22 @@ mod tests {
     fn test_parse_unicode_escape() {
         let doc = parse_mtext(r"{\U+00B0}", false);
         assert_eq!(doc.paragraphs[0].to_plain_text(), "°");
+    }
+
+    #[test]
+    fn a_unicode_escape_takes_exactly_four_hex_digits() {
+        // `\U+XXXX` is four digits, so the `C` of `20°C` is text and not a
+        // fifth digit. The transport layer leaves a representable escape in the
+        // value on a faithful code page (`io/dxf/code_page.rs`), which is how
+        // this string reaches the parser from an ANSI_1252 drawing.
+        assert_eq!(parse_mtext(r"20\U+00B0C", false).to_plain_text(), "20°C");
+        assert_eq!(parse_mtext(r"\U+00B12", false).to_plain_text(), "±2");
+        // A run that is not four hex digits is not an escape at all, so the
+        // characters the file holds stay in the text.
+        assert_eq!(parse_mtext(r"\U+00GZ", false).to_plain_text(), r"\U+00GZ");
+        assert_eq!(parse_mtext(r"\U+00B", false).to_plain_text(), r"\U+00B");
+        // A code point that is not a scalar is text the file holds, not text to drop.
+        assert_eq!(parse_mtext(r"\U+D800", false).to_plain_text(), r"\U+D800");
     }
 
     // ========================================================================
