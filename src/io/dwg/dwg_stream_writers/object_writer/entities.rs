@@ -1308,6 +1308,16 @@ impl<'a> DwgObjectWriter<'a> {
             att.vertical_alignment as i16,
         );
 
+        // Common TEXT style precedes embedded MTEXT handles (ODA 20.4.4).
+        let style_handle = self
+            .document
+            .text_styles
+            .get(&att.text_style)
+            .map(|s| s.handle)
+            .unwrap_or(Handle::NULL);
+        self.writer
+            .write_handle(DwgReferenceType::HardPointer, style_handle.value());
+
         // writeCommonAttData: R2010+ version byte
         if self.version.r2010_plus() {
             self.writer.write_byte(0);
@@ -1345,14 +1355,6 @@ impl<'a> DwgObjectWriter<'a> {
         if self.version.r2007_plus() {
             self.writer.write_bit(att.lock_position);
         }
-        let style_handle = self
-            .document
-            .text_styles
-            .get(&att.text_style)
-            .map(|s| s.handle)
-            .unwrap_or(Handle::NULL);
-        self.writer
-            .write_handle(DwgReferenceType::HardPointer, style_handle.value());
 
         self.register_object(handle);
     }
@@ -4593,8 +4595,7 @@ impl<'a> DwgObjectWriter<'a> {
         fallback.style = style.to_string();
         let mtext = embedded.unwrap_or(&fallback);
 
-        // AcDbMTextObjectEmbedded has a reduced common-entity header whose
-        // order differs from a standalone MTEXT entity.
+        // AcDbMTextObjectEmbedded starts at the common entity's Entmode.
         // Embedded MTEXT is a payload, not a model/paper-space entity.  Mode
         // zero still requires its (nullable) owner slot in the handle stream.
         self.writer.write_2bits(0);
@@ -4604,12 +4605,12 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_bit(true);
         self.writer.write_bit(false);
         self.writer
-            .write_bit_short(mtext.common.color.index().unwrap_or(256) as i16);
+            .write_en_color(&mtext.common.color, &mtext.common.transparency);
         self.writer.write_bit_double(mtext.common.linetype_scale);
         self.writer.write_2bits(0);
         self.writer.write_2bits(0);
-        self.writer.write_2bits(0);
         self.writer.write_byte(mtext.common.shadow_flags);
+        self.writer.write_2bits(0);
         self.writer.write_bit(false);
         self.writer.write_bit(false);
         self.writer.write_bit(false);
@@ -4720,6 +4721,16 @@ impl<'a> DwgObjectWriter<'a> {
             e.vertical_alignment as i16,
         );
 
+        // Common TEXT style precedes embedded MTEXT handles (ODA 20.4.4).
+        let style_handle = self
+            .document
+            .text_styles
+            .get(&e.text_style)
+            .map(|s| s.handle)
+            .unwrap_or(Handle::NULL);
+        self.writer
+            .write_handle(DwgReferenceType::HardPointer, style_handle.value());
+
         // writeCommonAttData: R2010+ version byte
         if self.version.r2010_plus() {
             self.writer.write_byte(0); // version
@@ -4768,17 +4779,6 @@ impl<'a> DwgObjectWriter<'a> {
         // Prompt
         self.writer.write_variable_text(&e.prompt);
 
-        // The outer TEXT style is the final ATTDEF handle.  For multiline
-        // attributes the embedded MTEXT layer/style handles precede it.
-        let style_handle = self
-            .document
-            .text_styles
-            .get(&e.text_style)
-            .map(|s| s.handle)
-            .unwrap_or(Handle::NULL);
-        self.writer
-            .write_handle(DwgReferenceType::HardPointer, style_handle.value());
-
         self.register_object(e.common.handle);
     }
 
@@ -4802,6 +4802,16 @@ impl<'a> DwgObjectWriter<'a> {
             e.horizontal_alignment as i16,
             e.vertical_alignment as i16,
         );
+
+        // Common TEXT style precedes embedded MTEXT handles (ODA 20.4.4).
+        let style_handle = self
+            .document
+            .text_styles
+            .get(&e.text_style)
+            .map(|s| s.handle)
+            .unwrap_or(Handle::NULL);
+        self.writer
+            .write_handle(DwgReferenceType::HardPointer, style_handle.value());
 
         // writeCommonAttData: R2010+ version byte
         if self.version.r2010_plus() {
@@ -4840,15 +4850,6 @@ impl<'a> DwgObjectWriter<'a> {
         if self.version.r2007_plus() {
             self.writer.write_bit(e.lock_position);
         }
-        // The outer TEXT style follows the embedded MTEXT handles.
-        let style_handle = self
-            .document
-            .text_styles
-            .get(&e.text_style)
-            .map(|s| s.handle)
-            .unwrap_or(Handle::NULL);
-        self.writer
-            .write_handle(DwgReferenceType::HardPointer, style_handle.value());
 
         self.register_object(e.common.handle);
     }
