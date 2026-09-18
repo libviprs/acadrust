@@ -3151,9 +3151,21 @@ impl<'a> DwgObjectWriter<'a> {
         // it as open by `== 3` (`DwgObjectReader.cs:3374`). So the open/closed
         // pair is always rebuilt from `CLOSED` into one of the two documented
         // patterns, and only the cap bits are carried across verbatim. That
-        // makes a DWG write lossless for the bits the DWG reader keeps
-        // (`dwg_document_builder.rs`: `MLineFlags::from_bits_truncate`) and
-        // agrees with the DXF writer on every flag set either format can hold.
+        // makes a DWG write lossless for every flag set a conforming file can
+        // hold, which is the four-bit space with `HAS_VERTICES` set. It does
+        // not make the two writers byte-identical: for the two excluded sets
+        // the DXF writer emits the raw bits, so an in-memory `0` crosses DXF as
+        // `0` and DWG as `1`, and a `2` crosses as `2` and `3` respectively.
+        //
+        // ACadSharp <= 3.7.1 is the one known reader this costs, and citing its
+        // `== 3` above without saying so would be one-sided: `DwgObjectReader.cs:3374`
+        // resolves the short by equality, so a closed multiline that also
+        // suppresses a cap (7, 11, 15) reads back OPEN there — while 4 and 8
+        // already die on any DWG it reads. That is its own defect: its model
+        // declares `[DxfCodeValue(71)] MLineFlags` with all four bits and its
+        // DXF path carries them. Real AutoCAD drawings settle the question —
+        // `real_AC1018.dwg`/`real_AC1032.dwg` handle `3A6` carries 5, which
+        // libredwg 0.14 decodes as HAS_VERTEX | SUPPRESS_START_CAPS.
         let caps = e.flags & (MLineFlags::NO_START_CAPS | MLineFlags::NO_END_CAPS);
         let open_closed: i16 = if e.flags.contains(MLineFlags::CLOSED) {
             3
