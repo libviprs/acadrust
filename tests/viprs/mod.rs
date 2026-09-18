@@ -171,6 +171,35 @@ impl Record {
             body,
         })
     }
+
+    /// Whether every number this record carries is finite.
+    ///
+    /// Nothing in a drawing has to be finite: a DWG stores a bulge and a
+    /// coordinate as plain doubles and both NaN and the infinities survive the
+    /// round trip. The reference replaces any type 3 to 10 record holding one
+    /// with a NON_FINITE_GEOMETRY warning rather than emitting it
+    /// (native/Adapter/Flattener.cs:588-617), docs/WIRE.md:386-391 makes that
+    /// contractual, and `parse` above drops warnings, so a recording of such a
+    /// drawing holds no record at all where this side held one.
+    ///
+    /// Read off the formatted body because that is where the numbers are, and
+    /// `{:.6}` spells the three cases "NaN", "inf" and "-inf". The body is cut
+    /// at the text payload first: a value reading "information" or "NaNoscale"
+    /// is a legitimate string the reference keeps, because it tests
+    /// `p.Values` and never the string. Subnormals are finite and print as
+    /// "0.000000", and the reference keeps those too.
+    ///
+    /// Judged per record, not per entity: a MESH is one Polygon per face, so
+    /// one NaN vertex has to remove one face and leave the rest of the mesh.
+    /// And the record is dropped, never repaired -- there is no right number
+    /// to substitute and Flattener.cs:577-579 refuses to invent one.
+    fn all_values_finite(&self) -> bool {
+        let numbers = match self.body.find(" value=\"") {
+            Some(i) => &self.body[..i],
+            None => &self.body[..],
+        };
+        !numbers.contains("NaN") && !numbers.contains("inf")
+    }
 }
 
 pub enum Verdict {
@@ -1457,7 +1486,12 @@ pub fn dump_fixture(dwg: &Path, expectation: &Path) -> Verdict {
         if matches!(p.entity, EntityType::Viewport(_)) {
             continue; // the recording carries no viewport record
         }
-        got.extend(render(&doc, p));
+        // The reference's one gate, in the one place it belongs.
+        got.extend(
+            render(&doc, p)
+                .into_iter()
+                .filter(Record::all_values_finite),
+        );
     }
 
     let text = match std::fs::read_to_string(expectation) {
