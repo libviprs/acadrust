@@ -408,6 +408,13 @@ pub fn encode_legacy_string(text: &str, encoding: &'static Encoding) -> Vec<u8> 
 /// left as literal text. A lone surrogate names no scalar, so no encoder
 /// can have escaped one: such an escape is content by the same test as any
 /// other, seven representable ASCII characters that have to cross verbatim.
+///
+/// The name is wrong and kept for now: `\U+XXXX` is AutoCAD's CIF escape.
+/// MIF proper is `\M+nxxyy`, where `n` selects the code page and `xxyy` is a
+/// code-page byte pair rather than a Unicode scalar, and this function does
+/// not handle it — a `\M+` run is left as literal text, which is what a
+/// reader that cannot resolve it must do. The rename and `\M+` support are
+/// tracked in `hakanaktt/acadrust#104`.
 pub fn decode_mif_escapes(text: &str, code_page: impl Into<LegacyCodePage>) -> String {
     decode_mif_escapes_inner(text, code_page.into())
 }
