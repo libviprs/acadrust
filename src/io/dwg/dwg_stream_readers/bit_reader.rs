@@ -96,7 +96,7 @@ impl DwgBitReader {
     /// Decode bytes using the document's legacy text code page.
     pub fn decode_legacy_text(&self, bytes: &[u8]) -> String {
         let (decoded, _, _) = self.encoding.decode(bytes);
-        crate::io::dxf::code_page::decode_mif_escapes(&decoded)
+        crate::io::dxf::code_page::decode_mif_escapes(&decoded, self.encoding)
     }
 
     /// Get the DWG version.
@@ -725,8 +725,10 @@ impl DwgBitReader {
             let bytes = self.read_bytes(text_length as usize);
             // Decode using the reader's encoding; legacy strings may embed
             // MIF \U+XXXX escapes for characters outside the code page.
+            // Escapes naming a representable character are content, not
+            // transport, and stay literal.
             let (decoded, _, _) = self.encoding.decode(&bytes);
-            crate::io::dxf::code_page::decode_mif_escapes(&decoded)
+            crate::io::dxf::code_page::decode_mif_escapes(&decoded, self.encoding)
         }
     }
 
@@ -784,8 +786,8 @@ impl DwgBitReader {
             let bytes = self.read_bytes(length as usize);
             let (decoded, _, _) = self.encoding.decode(&bytes);
             // Legacy strings may embed MIF \U+XXXX escapes for characters
-            // outside the code page — decode them into Unicode chars.
-            crate::io::dxf::code_page::decode_mif_escapes(&decoded.replace('\0', ""))
+            // outside the code page; only those decode back to Unicode.
+            crate::io::dxf::code_page::decode_mif_escapes(&decoded.replace('\0', ""), self.encoding)
         }
     }
 

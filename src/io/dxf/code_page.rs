@@ -199,14 +199,40 @@ pub fn encode_legacy_string(text: &str, encoding: &'static Encoding) -> Vec<u8> 
     out
 }
 
+/// Re-spell UTF-16 units as canonical MIF escapes.
+fn text_of_escapes(units: &[u16]) -> String {
+    let mut out = String::with_capacity(units.len() * 7);
+    for unit in units {
+        out.push_str(&format!("\\U+{:04X}", unit));
+    }
+    out
+}
+
 /// Decode AutoCAD MIF `\U+XXXX` escapes (exactly four hex digits) into
-/// Unicode characters.
+/// Unicode characters, but only where the escape is transport and not
+/// content.
+///
+/// MIF exists solely to carry the characters a code page cannot hold:
+/// [`encode_legacy_string`] escapes a character only when
+/// `encoding.encode(ch)` reports an unmappable character, and emits it
+/// verbatim otherwise. So an escape naming a character `encoding` *can*
+/// represent was never produced by that mechanism — it is literal drawing
+/// content, and is re-emitted as an escape in canonical `\U+XXXX` spelling
+/// rather than decoded. The test is the encoder's own condition, applied to
+/// the combined scalar rather than to each UTF-16 unit, because
+/// [`encode_legacy_string`] escapes an astral character as a surrogate pair.
+///
+/// The asymmetry was observable: `real_AC1018` carries the MTEXT content
+/// `94\U+00B0` in an ANSI_1252 drawing, where `U+00B0` is representable and
+/// nothing escaped it, yet an ungated decode turned those eight characters
+/// into `94°` on the way back in. `real_AC1032` is R2007+, stores text as
+/// UTF-16 and never reaches this path, so it shows the same content intact.
 ///
 /// A high-surrogate escape followed by a low-surrogate escape combines into
 /// a scalar value. Malformed or unterminated escapes are left as literal
 /// text, and invalid code points are dropped — matching the MTEXT
 /// formatter's behavior for the same escapes.
-pub fn decode_mif_escapes(text: &str) -> String {
+pub fn decode_mif_escapes(text: &str, encoding: &'static Encoding) -> String {
     if !text.contains("\\U+") {
         return text.to_string();
     }
@@ -242,9 +268,17 @@ pub fn decode_mif_escapes(text: &str) -> String {
                         }
                     }
                 }
-                if let Some(Ok(ch)) = std::char::decode_utf16(units[..count].iter().copied()).next()
-                {
-                    out.push(ch);
+                let scalar = std::char::decode_utf16(units[..count].iter().copied()).next();
+                if let Some(Ok(ch)) = scalar {
+                    let mut buf = [0u8; 4];
+                    // Every DWG code page is stateless, so per-char encoding
+                    // is safe. `err` is the encoder's unmappable flag.
+                    let (_, _, err) = encoding.encode(ch.encode_utf8(&mut buf));
+                    if err {
+                        out.push(ch);
+                    } else {
+                        out.push_str(&text_of_escapes(&units[..count]));
+                    }
                 }
                 continue;
             }
@@ -302,18 +336,36 @@ mod tests {
 
     #[test]
     fn test_decode_mif_escapes() {
-        assert_eq!(decode_mif_escapes("ab\\U+4E2Dcd"), "ab中cd");
-        assert_eq!(decode_mif_escapes("\\U+0041\\U+0042"), "AB");
+        let w1252 = encoding_rs::WINDOWS_1252;
+        assert_eq!(decode_mif_escapes("ab\\U+4E2Dcd", w1252), "ab中cd");
+        // The gate is the encoder's own condition: an escape naming a
+        // character the code page can represent was never written by MIF, so
+        // it is content and stays literal. Only unrepresentable escapes are
+        // transport and decode.
+        assert_eq!(
+            decode_mif_escapes("\\U+0041\\U+0042", w1252),
+            "\\U+0041\\U+0042"
+        );
+        assert_eq!(decode_mif_escapes("\\U+2205", w1252), "∅");
+        // The same escape flips with the code page: Cyrillic 1251 has no ø.
+        assert_eq!(decode_mif_escapes("\\U+00F8", w1252), "\\U+00F8");
+        assert_eq!(
+            decode_mif_escapes("\\U+00F8", encoding_rs::WINDOWS_1251),
+            "ø"
+        );
         // Exactly four hex digits: a fifth character stays literal.
-        assert_eq!(decode_mif_escapes("\\U+00412"), "A2");
+        assert_eq!(decode_mif_escapes("\\U+22052", w1252), "∅2");
         // Malformed escapes stay literal.
-        assert_eq!(decode_mif_escapes("\\U+GGGG"), "\\U+GGGG");
-        assert_eq!(decode_mif_escapes("\\U+4E"), "\\U+4E");
-        assert_eq!(decode_mif_escapes("no escapes here"), "no escapes here");
+        assert_eq!(decode_mif_escapes("\\U+GGGG", w1252), "\\U+GGGG");
+        assert_eq!(decode_mif_escapes("\\U+4E", w1252), "\\U+4E");
+        assert_eq!(
+            decode_mif_escapes("no escapes here", w1252),
+            "no escapes here"
+        );
         // Invalid code points are dropped.
-        assert_eq!(decode_mif_escapes("\\U+D800"), "");
+        assert_eq!(decode_mif_escapes("\\U+D800", w1252), "");
         // Surrogate pair combines into a scalar.
-        assert_eq!(decode_mif_escapes("\\U+D83D\\U+DE00"), "😀");
+        assert_eq!(decode_mif_escapes("\\U+D83D\\U+DE00", w1252), "😀");
     }
 
     #[test]
@@ -331,6 +383,19 @@ mod tests {
         // Round-trip through the decoder.
         let encoded = encode_legacy_string("a中b😀c", encoding_rs::WINDOWS_1252);
         let text = String::from_utf8(encoded).unwrap();
-        assert_eq!(decode_mif_escapes(&text), "a中b😀c");
+        assert_eq!(
+            decode_mif_escapes(&text, encoding_rs::WINDOWS_1252),
+            "a中b😀c"
+        );
+    }
+
+    #[test]
+    fn test_legacy_round_trip_is_identity() {
+        let enc = encoding_rs::WINDOWS_1252;
+        for original in ["94\u{00B0}", "\u{2205}45,6", "94\\U+00B0", "a中b😀c"] {
+            let bytes = encode_legacy_string(original, enc);
+            let (decoded, _, _) = enc.decode(&bytes);
+            assert_eq!(decode_mif_escapes(&decoded, enc), original);
+        }
     }
 }
