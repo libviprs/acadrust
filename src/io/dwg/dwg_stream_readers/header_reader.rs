@@ -84,7 +84,7 @@ impl SectionReader {
     fn with_encoding(
         data: Vec<u8>,
         version: DxfVersion,
-        encoding: &'static encoding_rs::Encoding,
+        encoding: impl Into<crate::io::dxf::code_page::LegacyCodePage>,
     ) -> Result<Self> {
         if version >= DxfVersion::AC1021 {
             // R2007+: three-stream merge.
@@ -223,7 +223,7 @@ pub fn read_header_with_encoding(
     data: &[u8],
     version: DxfVersion,
     maintenance_version: u8,
-    encoding: &'static encoding_rs::Encoding,
+    encoding: impl Into<crate::io::dxf::code_page::LegacyCodePage>,
 ) -> Result<HeaderVariables> {
     // ── Verify start sentinel ──
     if data.len() < 36 {
