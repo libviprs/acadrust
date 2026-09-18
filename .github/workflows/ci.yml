@@ -1,0 +1,126 @@
+# CI for libviprs/acadrust, a fork of hakanaktt/acadrust.
+#
+# Two jobs and no allow-list of failures. A red check here means a test is red,
+# and the fix belongs in the test or in the code, never in a skip added to this
+# file. The defect this exists to catch has already happened once in twelve
+# commits: a test that was green upstream went red in a PR and no machine said
+# so.
+#
+# There is deliberately no format job. `cargo fmt --check` is red on seven
+# upstream files that have never been rustfmt-clean (current_transparency.rs,
+# nested_copy.rs, entities/acis/types.rs, entities/translate.rs,
+# io/dxf/reader/section_reader.rs, io/dxf/writer/section_writer.rs, lib.rs -
+# all seven measured dirty, see tests/acadsharp/README.md:31-40), and a path
+# argument does not scope it: cargo fmt ignores the argument and reformats the
+# whole crate. Scoping a job to the files a PR touches does not help either,
+# because lib.rs is one of the seven and any new module has to touch it, which
+# would leave a contributor red for a reason the README forbids them to fix.
+# The remaining option - a list of seven files to skip - is the allow-list this
+# workflow refuses to have. Formatting stays a per-file local step:
+# `rustfmt --edition 2021 <file>`.
+#
+# Actions are disabled on a newly forked repository: until Settings -> Actions
+# allows them on libviprs/acadrust, this file runs on zero machines.
+name: CI
+
+on:
+  # Pushes to a PR branch already run through `pull_request`, so pushing the
+  # default branch is the only push worth its own run. A fork pays for minutes
+  # it does not need twice.
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A second push supersedes its own run rather than queueing beside it.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The test profile inherits dev, and debuginfo for the lib plus ~50
+  # integration binaries is the dominant link cost in this crate. Nothing in
+  # the suite reads a backtrace.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The runner's preinstalled stable, printed for the log. No toolchain
+      # action: this crate pins no channel and a fork does not need a matrix.
+      - run: cargo --version && rustc --version
+      # `cargo test` with no arguments DOES NOT COMPILE here. It builds the
+      # examples, and examples/entity_atlas.rs:549 include_bytes!'s
+      # examples/entity_atlas_assets/native_surfaces.dwg, which .gitignore:24
+      # excludes from the repository, so a fresh checkout dies with
+      #   error: couldn't read `examples/entity_atlas_assets/native_surfaces.dwg`
+      #   error: could not compile `acadrust` (example "entity_atlas")
+      # and exit 101 before one test runs. `--tests` builds the lib and the
+      # integration targets only.
+      #
+      # `--no-fail-fast` because cargo stops at the first failing target
+      # otherwise, and one red target hiding the rest is the exact failure mode
+      # this workflow exists to end.
+      #
+      # No `--locked`: Cargo.lock is gitignored (.gitignore:5) and absent from a
+      # fresh checkout, so `--locked` would fail on the lockfile rather than on
+      # the code.
+      #
+      # tests/acadsharp_conformance.rs runs here too and skips itself: this job
+      # sets no ACADSHARP_CORPUS. The conformance job below is the one that
+      # means something.
+      - run: cargo test --tests --no-fail-fast
+
+  conformance:
+    runs-on: ubuntu-latest
+    env:
+      ACADSHARP_CORPUS: ${{ github.workspace }}/target/acadsharp-corpus
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/acadsharp-corpus
+          # The corpus is one pinned libviprs-dep commit, so its bytes change
+          # only when tests/acadsharp/CORPUS.pin changes. On a hit the fetch
+          # script's own early exit (scripts/fetch-acadsharp-corpus.sh:25-28)
+          # skips the clone. No restore-keys on purpose: a corpus fetched at a
+          # different pin is the wrong oracle, not a warm start.
+          key: acadsharp-corpus-${{ hashFiles('tests/acadsharp/CORPUS.pin') }}
+      # Shallow fetch of the pinned commit of the public libviprs/libviprs-dep.
+      # No token: both repositories are public, an anonymous clone is enough.
+      - run: scripts/fetch-acadsharp-corpus.sh "$ACADSHARP_CORPUS"
+      - name: Assert the corpus materialised
+        # The harness treats an absent corpus as a skip rather than a failure:
+        # tests/acadsharp_conformance.rs:48-50 returns None when
+        # $ACADSHARP_CORPUS/expectations is not a directory and :69-74 returns
+        # from the test, so `cargo test --test acadsharp_conformance` prints
+        # "test result: ok. 1 passed" with no corpus at all. Counting the corpus
+        # BEFORE cargo is what stops a silent skip from reading as a pass.
+        # The pinned commit holds 45 record dumps and 52 fixtures
+        # (tests/acadsharp/README.md:44); the dumps are the geometry oracle and
+        # the harness looks each one up by fixture stem (:92).
+        run: |
+          for d in expectations fixtures; do
+            [ -d "$ACADSHARP_CORPUS/$d" ] || {
+              echo "::error::$ACADSHARP_CORPUS/$d is missing: the corpus did not materialise"
+              exit 1
+            }
+          done
+          dumps=$(find "$ACADSHARP_CORPUS/expectations" -name '*.txt' | wc -l | tr -d ' ')
+          dwgs=$(find "$ACADSHARP_CORPUS/fixtures" -name '*.dwg' | wc -l | tr -d ' ')
+          echo "corpus: $dumps record dumps, $dwgs fixtures"
+          [ "$dumps" -ge 45 ] || { echo "::error::only $dumps record dumps under expectations/, want >= 45"; exit 1; }
+          [ "$dwgs" -ge 52 ] || { echo "::error::only $dwgs fixtures under fixtures/, want >= 52"; exit 1; }
+      # Asserts every fixture's verdict against tests/acadsharp/BASELINE.tsv in
+      # both directions: a fixture that got worse fails, and one that got better
+      # fails too and asks to be re-recorded (tests/acadsharp/README.md:190-198).
+      # The two recorded DIFFs are deliberate and are argued in that README
+      # under "Where acadrust is ahead of the recording"; re-recording is a
+      # local step, never a CI one.
+      - run: cargo test --test acadsharp_conformance
