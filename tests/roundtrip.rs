@@ -622,6 +622,13 @@ fn normalize_entity_common(common: &mut acadrust::entities::EntityCommon) {
     // entity_mode is DWG-internal and not set for programmatic documents;
     // normalize to None to avoid false differences in DWG roundtrip tests.
     common.entity_mode = None;
+    // raw_record is the source-bytes provenance cache the DWG reader attaches
+    // to every entity it decodes. A programmatically built document has None,
+    // a document read back from DWG has Some(..), and the field is in
+    // EntityCommon's derived PartialEq — so leaving it set makes every DWG
+    // roundtrip comparison fail before a single geometry field is examined.
+    // It is not part of the drawing's data, so it is normalized away.
+    common.raw_record = None;
 }
 
 /// Comprehensive normalization for roundtrip comparison.
