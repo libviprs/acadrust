@@ -956,8 +956,7 @@ impl<R: Read + Seek> DwgReader<R> {
                     &classes_buf,
                     dxf_version,
                     info.acad_maintenance_version,
-                    crate::io::dxf::code_page::encoding_from_dwg_code_page(info.code_page)
-                        .encoding(),
+                    crate::io::dxf::code_page::encoding_from_dwg_code_page(info.code_page),
                 ) {
                     Ok(classes) => document.classes = classes,
                     Err(e) => report_read_error(
@@ -988,8 +987,7 @@ impl<R: Read + Seek> DwgReader<R> {
                     &header_buf,
                     dxf_version,
                     info.acad_maintenance_version,
-                    crate::io::dxf::code_page::encoding_from_dwg_code_page(info.code_page)
-                        .encoding(),
+                    crate::io::dxf::code_page::encoding_from_dwg_code_page(info.code_page),
                 ) {
                     Ok(header_vars) => document.header = header_vars,
                     Err(e) => report_read_error(
