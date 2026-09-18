@@ -199,15 +199,6 @@ pub fn encode_legacy_string(text: &str, encoding: &'static Encoding) -> Vec<u8> 
     out
 }
 
-/// Re-spell UTF-16 units as canonical MIF escapes.
-fn text_of_escapes(units: &[u16]) -> String {
-    let mut out = String::with_capacity(units.len() * 7);
-    for unit in units {
-        out.push_str(&format!("\\U+{:04X}", unit));
-    }
-    out
-}
-
 /// Decode AutoCAD MIF `\U+XXXX` escapes (exactly four hex digits) into
 /// Unicode characters, but only where the escape is transport and not
 /// content.
@@ -250,6 +241,13 @@ pub fn decode_mif_escapes(text: &str, encoding: &'static Encoding) -> String {
     while i < len {
         if chars[i] == '\\' && i + 7 <= len && chars[i + 1] == 'U' && chars[i + 2] == '+' {
             if let Some(unit) = hex_at(i + 3) {
+                // Where the escape turns out to be content, the characters
+                // the file actually holds are what goes back out, copied
+                // from here rather than re-spelled: `hex_at` accepts
+                // lower-case digits, so re-formatting one would rewrite
+                // `\U+00b0` as `\U+00B0` in the very branch whose job is to
+                // leave content alone.
+                let escape_start = i;
                 i += 7;
                 let mut units = [unit, 0];
                 let mut count = 1usize;
@@ -277,7 +275,7 @@ pub fn decode_mif_escapes(text: &str, encoding: &'static Encoding) -> String {
                     if err {
                         out.push(ch);
                     } else {
-                        out.push_str(&text_of_escapes(&units[..count]));
+                        out.extend(chars[escape_start..i].iter().copied());
                     }
                 }
                 continue;
@@ -392,7 +390,16 @@ mod tests {
     #[test]
     fn test_legacy_round_trip_is_identity() {
         let enc = encoding_rs::WINDOWS_1252;
-        for original in ["94\u{00B0}", "\u{2205}45,6", "94\\U+00B0", "a中b😀c"] {
+        // The lower-case row is the one that catches a decoder which
+        // re-spells a content escape instead of copying it: `\U+00b0` is
+        // seven representable characters and has to survive as written.
+        for original in [
+            "94\u{00B0}",
+            "\u{2205}45,6",
+            "94\\U+00B0",
+            "94\\U+00b0",
+            "a中b😀c",
+        ] {
             let bytes = encode_legacy_string(original, enc);
             let (decoded, _, _) = enc.decode(&bytes);
             assert_eq!(decode_mif_escapes(&decoded, enc), original);

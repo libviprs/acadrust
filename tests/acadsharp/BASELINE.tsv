@@ -27,8 +27,8 @@ g13_long_text	MATCH
 g13_mesh	MATCH
 g13_mesh_bad_faces	MATCH
 g13_mirrored_bulge	MATCH
-g13_mline	DIFF:3
-g13_nan_bulge	COUNT:2/0
+g13_mline	MATCH
+g13_nan_bulge	MATCH
 g13_nonuniform	MATCH
 g13_ocs_mirror	MATCH
 g13_ocs_plane	MATCH
@@ -42,7 +42,7 @@ g13_ray_xline	MATCH
 g13_scale_1x	MATCH
 g13_slot	MATCH
 g13_slot_block	MATCH
-g13_solid	DIFF:1
+g13_solid	MATCH
 g13_spline	MATCH
 g13_text	MATCH
 g13_tolerance	MATCH
@@ -51,5 +51,5 @@ g13_unsupported	MATCH
 g13_wide_polyline	MATCH
 g13_wipeout	MATCH
 g13_xref	MATCH
-real_AC1018	DIFF:4
-real_AC1032	DIFF:2
+real_AC1018	DIFF:1
+real_AC1032	DIFF:1
