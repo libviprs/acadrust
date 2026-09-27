@@ -87,27 +87,12 @@ impl DwgWriter {
                 owned.assign_table_entry_handles();
             }
             if owned.version < DxfVersion::AC1027 {
-                let required: Vec<_> = owned
-                    .entities()
-                    .filter_map(|entity| {
-                        owned
-                            .classes
-                            .get_by_name(entity_class_name(entity))
-                            .cloned()
-                    })
-                    .collect();
-                let source_numbers: std::collections::HashMap<String, i16> = required
-                    .iter()
-                    .map(|class| (class.dxf_name.clone(), class.class_number))
-                    .collect();
-                owned.classes.retain_legacy_dwg_classes();
-                for mut class in required {
-                    if !owned.classes.contains(&class.dxf_name) {
-                        class.class_number = 0;
-                        owned.classes.add_or_update(class);
-                    }
+                // A table read from a file of this version is already valid
+                // for it, and the verbatim records copied from that file
+                // carry its class numbers: leave it as it is.
+                if owned.dwg_source_version != Some(owned.version) {
+                    prepare_legacy_classes(&mut owned);
                 }
-                drop_renumbered_raw_records(&mut owned, &source_numbers);
                 prepare_legacy_document(&mut owned);
             }
             &owned
@@ -518,36 +503,39 @@ fn entity_class_name(entity: &crate::entities::EntityType) -> &str {
         crate::entities::EntityType::Surface(surface) => surface.kind.dxf_name(),
         crate::entities::EntityType::Extended(entity) => entity.class_name(),
         crate::entities::EntityType::Underlay(entity) => entity.entity_name(),
+        crate::entities::EntityType::Hatch(hatch) if hatch.is_mpolygon => "MPOLYGON",
+        crate::entities::EntityType::Insert(insert) if insert.view_rep_handle.is_some() => {
+            "ACDBVIEWREPBLOCKREFERENCE"
+        }
         _ => entity.as_entity().entity_type(),
     }
 }
 
-/// Re-encode the entities whose class the legacy class table renumbered.
+/// Shrink the class table to the pre-R2013 profile, keeping every class a
+/// record of the document is written under.
 ///
-/// A verbatim record encodes its class number as its object type, so it only
-/// stays valid while the class keeps the number the source file gave it.
-/// Rebuilding the table for a pre-R2013 target can renumber a class (a
-/// MULTILEADER read as 521 is written as 511): copied as is, such a record
-/// points at a number no class declares, and the reader drops the entity.
-fn drop_renumbered_raw_records(
-    document: &mut CadDocument,
-    source_numbers: &std::collections::HashMap<String, i16>,
-) {
-    let renumbered: std::collections::HashSet<&str> = source_numbers
-        .iter()
-        .filter(|(name, number)| {
-            document.classes.get_by_name(name).map(|class| class.class_number) != Some(**number)
-        })
-        .map(|(name, _)| name.as_str())
+/// Classes are positional: the writer numbers them 500 + index, and each
+/// class-registered record takes its type code from that number. A class the
+/// profile would drop while an entity or object still uses it leaves the
+/// record without a valid type code, so it is kept, after the profile.
+fn prepare_legacy_classes(document: &mut CadDocument) {
+    let entity_classes = document.entities().map(entity_class_name);
+    let object_classes = document.objects.values().flat_map(
+        crate::io::dwg::dwg_stream_writers::object_writer::objects::object_class_names,
+    );
+    let mut seen = std::collections::HashSet::new();
+    let required: Vec<_> = entity_classes
+        .map(std::borrow::Cow::Borrowed)
+        .chain(object_classes)
+        .filter_map(|name| document.classes.get_by_name(&name).cloned())
+        .filter(|class| seen.insert(class.dxf_name.to_ascii_uppercase()))
         .collect();
 
-    if renumbered.is_empty() {
-        return;
-    }
-
-    for entity in document.entities_mut_keep_raw() {
-        if renumbered.contains(entity_class_name(entity)) {
-            entity.common_mut().raw_record = None;
+    document.classes.retain_legacy_dwg_classes();
+    for mut class in required {
+        if !document.classes.contains(&class.dxf_name) {
+            class.class_number = 0;
+            document.classes.add_or_update(class);
         }
     }
 }
@@ -2087,7 +2075,6 @@ mod tests {
     use super::*;
     use crate::document::CadDocument;
     use crate::types::{DxfVersion, Handle};
-    use std::collections::HashMap;
 
     #[test]
     fn acds_record_table_indexes_each_length_prefixed_blob() {
@@ -2129,78 +2116,116 @@ mod tests {
         }
     }
 
-    fn raw_record() -> Option<std::sync::Arc<crate::entities::RawRecord>> {
-        Some(std::sync::Arc::new(crate::entities::RawRecord {
-            data: vec![0; 4],
-            handle_bits: 0,
-            version: DxfVersion::AC1032,
-        }))
-    }
-
-    fn document_with_raw_multileader_and_line() -> CadDocument {
-        use crate::entities::{EntityType, Line, MultiLeader};
-        use crate::types::Vector3;
-
-        let mut document = CadDocument::new();
-        document
-            .add_entity(EntityType::MultiLeader(MultiLeader::new()))
-            .unwrap();
-        document
-            .add_entity(EntityType::Line(Line::from_points(
-                Vector3::ZERO,
-                Vector3::UNIT_X,
-            )))
-            .unwrap();
-
-        for entity in document.entities_mut_keep_raw() {
-            entity.common_mut().raw_record = raw_record();
-        }
-
-        document
-    }
-
-    fn raw_records_by_type(document: &CadDocument) -> Vec<(&str, bool)> {
-        document
-            .entities()
-            .map(|entity| {
-                (
-                    entity.as_entity().entity_type(),
-                    entity.common().raw_record.is_some(),
-                )
-            })
+    fn class_names(classes: &crate::classes::DxfClassCollection) -> Vec<String> {
+        classes
+            .iter()
+            .map(|class| class.dxf_name.to_ascii_uppercase())
             .collect()
     }
 
-    fn multileader_class_number(document: &CadDocument) -> i16 {
+    fn layer_filter_document() -> CadDocument {
+        use crate::objects::{ClassObject, ClassObjectData, LayerFilter, ObjectType};
+
+        let mut document = CadDocument::new();
+        let mut filter = ClassObject::new(ClassObjectData::LayerFilter(LayerFilter {
+            names: vec!["WALLS".into()],
+        }));
+        filter.handle = document.allocate_handle();
         document
-            .classes
-            .get_by_name("MULTILEADER")
-            .unwrap()
-            .class_number
+            .objects
+            .insert(filter.handle, ObjectType::ClassObject(filter));
+        document
     }
 
     #[test]
-    fn renumbered_class_drops_the_verbatim_records_of_its_entities() {
-        let mut document = document_with_raw_multileader_and_line();
-        let source_number = multileader_class_number(&document) + 10;
-        let source_numbers = HashMap::from([("MULTILEADER".to_string(), source_number)]);
-        drop_renumbered_raw_records(&mut document, &source_numbers);
-        assert_eq!(
-            raw_records_by_type(&document),
-            [("MULTILEADER", false), ("LINE", true)]
-        );
+    fn legacy_class_table_keeps_the_classes_objects_are_written_under() {
+        let mut document = layer_filter_document();
+        document.version = DxfVersion::AC1024;
+        let mut legacy = document.classes.clone();
+        legacy.retain_legacy_dwg_classes();
+        assert!(!legacy.contains("LAYERFILTER"));
+
+        prepare_legacy_classes(&mut document);
+
+        // The legacy profile first, then the class the layer filter needs.
+        let mut expected = class_names(&legacy);
+        expected.push("LAYERFILTER".to_string());
+        assert_eq!(class_names(&document.classes), expected);
     }
 
     #[test]
-    fn unchanged_class_number_keeps_the_verbatim_records() {
-        let mut document = document_with_raw_multileader_and_line();
-        let source_number = multileader_class_number(&document);
-        let source_numbers = HashMap::from([("MULTILEADER".to_string(), source_number)]);
-        drop_renumbered_raw_records(&mut document, &source_numbers);
-        assert_eq!(
-            raw_records_by_type(&document),
-            [("MULTILEADER", true), ("LINE", true)]
-        );
+    fn legacy_write_keeps_class_registered_objects() {
+        use crate::objects::{ClassObjectData, ObjectType};
+
+        let mut document = layer_filter_document();
+        document.version = DxfVersion::AC1024;
+        let bytes = DwgWriter::write_to_vec(&document).unwrap();
+        let decoded = crate::io::dwg::DwgReader::from_stream(Cursor::new(bytes))
+            .read()
+            .unwrap();
+
+        let filters: Vec<_> = decoded
+            .objects
+            .values()
+            .filter_map(|object| match object {
+                ObjectType::ClassObject(object) => match &object.data {
+                    ClassObjectData::LayerFilter(filter) => Some(filter.names.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(filters, [vec!["WALLS".to_string()]]);
+    }
+
+    #[test]
+    fn same_version_legacy_write_keeps_the_source_class_table() {
+        let mut document = CadDocument::new();
+        document.version = DxfVersion::AC1024;
+        document.dwg_source_version = Some(DxfVersion::AC1024);
+
+        let bytes = DwgWriter::write_to_vec(&document).unwrap();
+        let decoded = crate::io::dwg::DwgReader::from_stream(Cursor::new(bytes))
+            .read()
+            .unwrap();
+
+        assert_eq!(class_names(&decoded.classes), class_names(&document.classes));
+        for class in document.classes.iter() {
+            assert_eq!(
+                decoded.classes.get_by_name(&class.dxf_name).map(|c| c.class_number),
+                Some(class.class_number),
+                "{} was renumbered",
+                class.dxf_name
+            );
+        }
+    }
+
+    #[test]
+    fn object_without_its_class_is_skipped_instead_of_written_as_class_500() {
+        use crate::objects::ObjectType;
+
+        let mut document = layer_filter_document();
+        document.version = DxfVersion::AC1024;
+        document.dwg_source_version = Some(DxfVersion::AC1024);
+        let mut classes = crate::classes::DxfClassCollection::new();
+        for class in document.classes.iter() {
+            if !class.dxf_name.eq_ignore_ascii_case("LAYERFILTER") {
+                classes.push_preserving(class.clone());
+            }
+        }
+        document.classes = classes;
+        let source_objects = document.objects.len() - 1;
+
+        let bytes = DwgWriter::write_to_vec(&document).unwrap();
+        let decoded = crate::io::dwg::DwgReader::from_stream(Cursor::new(bytes))
+            .read()
+            .unwrap();
+
+        assert_eq!(decoded.objects.len(), source_objects);
+        assert!(!decoded
+            .objects
+            .values()
+            .any(|object| matches!(object, ObjectType::ClassObject(_))));
     }
 
     #[test]
