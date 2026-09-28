@@ -23,6 +23,7 @@ fn inherit_common(source: &EntityCommon) -> EntityCommon {
     EntityCommon {
         handle: Handle::NULL,
         layer: source.layer.clone(),
+        layer_handle: source.layer_handle,
         color: source.color,
         line_weight: source.line_weight,
         linetype: source.linetype.clone(),
