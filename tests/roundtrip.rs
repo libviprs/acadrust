@@ -679,6 +679,12 @@ fn normalize_entity_for_comparison(entity: &mut EntityType) {
         EntityType::MText(m) => {
             m.dwg_x_direction = None;
         }
+        EntityType::Spline(s) => {
+            s.dwg_scenario = None;
+        }
+        EntityType::Helix(h) => {
+            h.spline.dwg_scenario = None;
+        }
         // MultiLeader: many handle fields at multiple levels
         EntityType::MultiLeader(mld) => {
             mld.style_handle = None;

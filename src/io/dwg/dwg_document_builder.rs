@@ -3498,6 +3498,7 @@ impl DwgDocumentBuilder {
                     e.knot_parameterization = data.knot_param;
                     e.cv_frame_visible = data.flags1 & 2 != 0;
                     e.dwg_flags1 = data.flags1;
+                    e.dwg_scenario = Some(data.scenario);
                     let _ = document.add_entity(EntityType::Spline(e));
                 }
                 OBJ_HELIX => {
@@ -3525,6 +3526,7 @@ impl DwgDocumentBuilder {
                     e.spline.knot_parameterization = data.knot_param;
                     e.spline.cv_frame_visible = data.flags1 & 2 != 0;
                     e.spline.dwg_flags1 = data.flags1;
+                    e.spline.dwg_scenario = Some(data.scenario);
                     // AcDbHelix parameters follow the spline record.
                     e.major_version = reader.read_bit_long();
                     e.maintenance_version = reader.read_bit_long();
