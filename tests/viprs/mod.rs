@@ -947,7 +947,7 @@ fn render_one(p: &Placed) -> Option<Record> {
                 pts.join(";"),
                 if any { bulges.join(",") } else { String::new() },
                 {
-                    let n = at.direction((pl.normal.x, pl.normal.y, pl.normal.z));
+                    let n = at.plane_normal(&pl.normal);
                     p3(n.0, n.1, n.2)
                 }
             )
@@ -1088,12 +1088,12 @@ fn render_one(p: &Placed) -> Option<Record> {
             let flip = if at.mirrored() { -1.0 } else { 1.0 };
             let bulges: Vec<String> = p2.vertices.iter().map(|v| f6(v.bulge * flip)).collect();
             let any = bulges.iter().any(|b| b != "0.000000");
-            // Same unit-vector convention as record 9's: the slot is a
-            // direction, the file may store any length, and `direction`
-            // renormalises as it carries it across. No corpus fixture stores a
+            // The slot is a direction, the file may store any length, and the
+            // normal is carried the way the reference carries it
+            // (`plane_normal`, acadrust#14). No corpus fixture stores a
             // POLYLINE extrusion that is not already +/-Z, so this is closing
             // the hole rather than fixing an observed difference.
-            let n = at.direction((p2.normal.x, p2.normal.y, p2.normal.z));
+            let n = at.plane_normal(&p2.normal);
             write!(
                 body,
                 "n={} closed={} pts=[{}] bulges=[{}] normal=[{}]",
@@ -1123,7 +1123,7 @@ fn render_one(p: &Placed) -> Option<Record> {
                     p3(x, y, z)
                 })
                 .collect();
-            let n = at.direction((p3d.normal.x, p3d.normal.y, p3d.normal.z));
+            let n = at.plane_normal(&p3d.normal);
             write!(
                 body,
                 "n={} closed={} pts=[{}] bulges=[] normal=[{}]",
@@ -1305,10 +1305,34 @@ impl Xform {
         (n[0], n[1], n[2])
     }
 
-    /// The normal a placed polyline's record carries.
-    // (stub: still the old convention, `Unit(L . n)`; replaced in the fix)
+    /// The normal a placed polyline's record carries, taken the way the
+    /// reference takes it (`Flattener.cs` `BasisOf` and `MeasureBasis`): the
+    /// entity's OCS axes are carried through the placement, and the normal is
+    /// the unit cross product of the two in-plane images, negated when the
+    /// placement mirrors. A normal is a covector, so `Unit(L . n)` is only
+    /// right where `L` is a rotation or a uniform scale (acadrust#14).
+    ///
+    /// A cross product of length nothing is a placement that collapsed the
+    /// plane onto a line; the third axis' image is then the closest thing to a
+    /// plane, as it is over there (`Eps` is `1e-12` in `Flattener.cs`).
     fn plane_normal(&self, n: &acadrust::types::Vector3) -> (f64, f64, f64) {
-        self.direction((n.x, n.y, n.z))
+        let o = Ocs::new(n);
+        let a = self.linear((o.ax[0], o.ax[1], o.ax[2]));
+        let b = self.linear((o.ay[0], o.ay[1], o.ay[2]));
+        let c = self.linear((o.az[0], o.az[1], o.az[2]));
+        let cr = cross([a.0, a.1, a.2], [b.0, b.1, b.2]);
+        let mirrored = cr[0] * c.0 + cr[1] * c.1 + cr[2] * c.2 < 0.0;
+        let len = (cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]).sqrt();
+        let plane = if len < 1e-12 {
+            norm([c.0, c.1, c.2])
+        } else {
+            norm(cr)
+        };
+        if mirrored {
+            (-plane[0], -plane[1], -plane[2])
+        } else {
+            (plane[0], plane[1], plane[2])
+        }
     }
 
     /// Where an in-plane angle ends up. The point at that angle on the unit
