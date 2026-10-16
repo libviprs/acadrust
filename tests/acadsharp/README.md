@@ -236,6 +236,21 @@ better also fails, and asks you to re-record. Both are the point.
 ACADSHARP_CORPUS=... cargo test --test acadsharp_conformance -- --ignored record_baseline
 ```
 
+The baseline is baked into the test binary, so on its own it only proves the run agrees
+with whatever the same commit shipped: a regression plus a re-record is green. That is
+why a pull request also runs the test against the base branch's copy, through
+`ACADSHARP_BASELINE=<file>` (the conformance job fetches the base sha and `git show`s
+`tests/acadsharp/BASELINE.tsv` out of it). That second run is red on any pull request
+that moves a verdict, on purpose: the red is the review signal, and a maintainer merges
+a deliberate re-record knowing it moved. It is not a flake and nothing here should be
+skipped to make it green. Locally:
+
+```bash
+git show origin/main:tests/acadsharp/BASELINE.tsv > /tmp/base.tsv
+ACADSHARP_REQUIRE_CORPUS=1 ACADSHARP_CORPUS=target/acadsharp-corpus \
+  ACADSHARP_BASELINE=/tmp/base.tsv cargo test --test acadsharp_conformance
+```
+
 ## The pin
 
 `CORPUS.pin` names the libviprs-dep commit the corpus is read from. It is
