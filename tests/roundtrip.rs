@@ -2020,12 +2020,19 @@ fn binary_dxf_roundtrip_deep() {
 macro_rules! real_dwg_roundtrip {
     ($test_name:ident, $file:expr) => {
         #[test]
+        #[ignore = concat!(
+            "reads ",
+            $file,
+            ", a gitignored private file from upstream with no provenance: run with --ignored if you have it"
+        )]
         fn $test_name() {
             let path = concat!(env!("CARGO_MANIFEST_DIR"), "/", $file);
-            if !std::path::Path::new(path).exists() {
-                eprintln!("Skipping {}: file not found", $file);
-                return;
-            }
+            assert!(
+                std::path::Path::new(path).exists(),
+                "{} is not present. It is upstream's private file and is gitignored; this test is \
+                 #[ignore]d, so asking for it with --ignored means you have it",
+                $file
+            );
 
             let mut reader = DwgReader::from_file(path).expect("Failed to open DWG file");
             let doc = reader.read().expect("Failed to read DWG file");

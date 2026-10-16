@@ -1,7 +1,8 @@
 //! Semantic round-trip validation of the annotative
 //! `AcDb*ObjectContextData` encoder.
 //!
-//! Strategy: the golden R2018 file `~/Downloads/0718-mbmdmc.dwg` carries 134
+//! Strategy: the golden R2018 file `0718-mbmdmc.dwg` (a private file, path in
+//! `ACADRUST_GOLDEN_0718`) carries 134
 //! real `AcDbBlkRefObjectContextData` leaves (class 533). The reader models each
 //! into an `ObjectContextData`.
 //!
@@ -24,15 +25,23 @@ use acadrust::objects::{
 use acadrust::types::{DxfVersion, Vector2, Vector3};
 use acadrust::{CadDocument, DwgReader, DwgWriter, Handle};
 
-const GOLDEN: &str = "/home/hakanseven/Downloads/0718-mbmdmc.dwg";
+/// The golden drawing is a private file nobody can fetch, so the two tests that
+/// read it are `#[ignore]`d with that reason and read its path from this
+/// variable. Whoever has the file runs them with
+/// `ACADRUST_GOLDEN_0718=<path> cargo test --test annotative_context_encoder -- --ignored`.
+const GOLDEN_VAR: &str = "ACADRUST_GOLDEN_0718";
 
-fn load_golden() -> Option<CadDocument> {
-    if std::fs::metadata(GOLDEN).is_err() {
-        eprintln!("SKIP: golden file {GOLDEN} not present");
-        return None;
-    }
-    let mut reader = DwgReader::from_file(GOLDEN).expect("open golden");
-    Some(reader.read().expect("read golden"))
+fn load_golden() -> CadDocument {
+    let path = std::env::var(GOLDEN_VAR).unwrap_or_else(|_| {
+        panic!(
+            "{GOLDEN_VAR} is not set. This test reads 0718-mbmdmc.dwg, a private file; \
+             set the variable to its path to run it"
+        )
+    });
+    let mut reader = DwgReader::from_file(&path).unwrap_or_else(|e| {
+        panic!("{GOLDEN_VAR}={path} could not be opened: {e}")
+    });
+    reader.read().expect("read golden")
 }
 
 fn roundtrip(doc: &CadDocument) -> CadDocument {
@@ -42,8 +51,9 @@ fn roundtrip(doc: &CadDocument) -> CadDocument {
 }
 
 #[test]
+#[ignore = "reads 0718-mbmdmc.dwg, a private file: set ACADRUST_GOLDEN_0718=<path> and run with --ignored"]
 fn baseline_roundtrip_preserves_all_contexts() {
-    let Some(doc) = load_golden() else { return };
+    let doc = load_golden();
 
     let ctx0 = doc.context_scales.len();
     let blk0 = blkref_fields(&doc);
@@ -101,8 +111,9 @@ fn blkref_fields(doc: &CadDocument) -> std::collections::BTreeMap<Handle, BlkFie
 }
 
 #[test]
+#[ignore = "reads 0718-mbmdmc.dwg, a private file: set ACADRUST_GOLDEN_0718=<path> and run with --ignored"]
 fn encoder_preserves_context_fields_and_scale_link() {
-    let Some(doc) = load_golden() else { return };
+    let doc = load_golden();
 
     // Ground truth: the fields AutoCAD stored + which SCALE each leaf points at.
     let original = blkref_fields(&doc);
