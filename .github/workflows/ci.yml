@@ -88,6 +88,16 @@ jobs:
       # sets no ACADSHARP_CORPUS. The conformance job below is the one that
       # means something.
       - run: cargo test --tests --no-fail-fast
+      # `--tests` leaves out two target classes, and this and the next step put
+      # them back (acadrust#11 c, d). Doc tests never run under `--tests`;
+      # `cargo test --doc` is the only thing that builds the public API's
+      # examples, including the `compile_fail` ones that pin a type-level
+      # contract (LegacyCodePage).
+      - run: cargo test --doc
+      # `--tests` builds no examples, and only entity_atlas is broken on a clean
+      # clone (above). The other two compile, so they are checked by name; any
+      # example added later has to be listed here or fixed to build.
+      - run: cargo check --example gen_all_entities_all_versions --example roundtrip_analysis
 
   conformance:
     runs-on: ubuntu-latest
