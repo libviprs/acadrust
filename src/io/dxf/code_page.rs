@@ -181,6 +181,8 @@ pub fn dwg_code_page_index(code_page: &str) -> u16 {
 /// | `windows-1250` | `ANSI_1250` | `DOS852` |
 /// | `windows-1253` | `ANSI_1253` | `DOS869` |
 /// | `windows-1254` | `ANSI_1254` | `DOS857`, `ISO8859-9` |
+/// | `ibm866` | `DOS866` | `DOS855`, `DOS437` |
+/// | `euc-kr` | `KOREAN`, `ANSI_949` | `JOHAB` |
 ///
 /// `MAC-ROMAN` and `ANSI_1252` are the pair that proves it, and
 /// `mac_roman_and_ansi_1252_alias_one_encoding` pins it: both resolve to
@@ -244,9 +246,8 @@ impl From<&'static Encoding> for LegacyCodePage {
 /// stand-in IBM866 is almost nothing but Cyrillic; CP932 maps neither `U+00A5`
 /// nor `U+203E`, where WHATWG Shift_JIS does; the WHATWG `Big5` row is a
 /// superset of the code page it stands in for (`Big5` is HKSCS, CP950 is
-/// not), while the `EUC-KR` row *is* CP949 — which is why `ANSI_949` and
-/// `KOREAN` are candidates for the faithful list rather than permanent
-/// stand-ins (`#9`);
+/// not), while the `EUC-KR` row *is* CP949, so `ANSI_949` and `KOREAN` are
+/// faithful (`JOHAB` is CP1361, not CP949, and stays a stand-in);
 /// `MAC-ROMAN` has no arm at all and lands on the windows-1252 default. An
 /// unrecognised name reaches that same default and is a stand-in for whatever
 /// the drawing really declared.
@@ -272,6 +273,13 @@ pub fn code_page_is_faithful(code_page: &str) -> bool {
             | "ansi_1257"
             | "ansi_1258"
             | "ansi_874"
+            // encoding_rs' ibm866 is CP866 and its euc-kr is CP949, measured
+            // against Microsoft's CP866.TXT and CP949.TXT with no difference in
+            // either direction. DOS855 (CP855) and JOHAB (CP1361) share those
+            // rows and are not on this list.
+            | "dos866"
+            | "korean"
+            | "ansi_949"
             // ISO rows that map to their own `encoding_rs` row. ISO8859-1 and
             // ISO8859-9 are absent on purpose: they borrow windows-1252 and
             // windows-1254.
@@ -303,12 +311,14 @@ pub fn code_page_is_faithful(code_page: &str) -> bool {
             | "iso8859-15"
             | "iso_8859-15"
             | "koi8-r"
-            // GBK is CP936's row here, and the two agree on 23907 of GBK's
-            // 24085 BMP scalars. The 178 GBK-only ones — U+1E3F,
+            // GBK is CP936's row here, but it is not CP936: the two agree on
+            // 23907 of GBK's 24085 BMP scalars. The 178 GBK-only ones — U+1E3F,
             // U+9FB4..U+9FBB, U+FE10..U+FE19 and 159 PUA — are confirmed
             // absent from CP936 by unicode.org's CP936.TXT and by
             // per-character iconv, so an escape naming one of those is
-            // transport this gate calls content. Tracked in `#9`.
+            // transport this gate calls content. Accepted in `#9`: the DWG
+            // index table and ACadSharp both treat ANSI_936 as the CP936
+            // identity, and 178 scalars are not worth a narrowing predicate.
             | "gb2312"
             | "ansi_936"
     )
@@ -347,14 +357,16 @@ pub fn encoding_from_dwg_code_page(index: u16) -> LegacyCodePage {
 
 /// Encode a string to a legacy (pre-UTF-16) DWG code page.
 ///
-/// Characters the code page cannot represent are emitted as AutoCAD MIF
+/// Characters the code page cannot represent, or that the encoder would write
+/// as some other character (WHATWG Shift_JIS writes `U+00A5` as `0x5C`, which
+/// reads back as a backslash), are emitted as AutoCAD MIF
 /// `\U+XXXX` escapes (astral-plane characters as a surrogate pair of
 /// escapes) instead of `encoding_rs`'s HTML `&#NNNNN;` references, which
 /// no CAD application understands. Well-formed MIF escapes round-trip
 /// through [`decode_mif_escapes`].
 pub fn encode_legacy_string(text: &str, encoding: &'static Encoding) -> Vec<u8> {
     let (encoded, _, unmappable) = encoding.encode(text);
-    if !unmappable {
+    if !unmappable && encoding.decode_without_bom_handling(&encoded).0 == text {
         return encoded.into_owned();
     }
     let mut out = Vec::with_capacity(text.len() + 6);
@@ -362,7 +374,10 @@ pub fn encode_legacy_string(text: &str, encoding: &'static Encoding) -> Vec<u8> 
     for ch in text.chars() {
         // Every DWG code page is stateless, so per-char encoding is safe.
         let (bytes, _, err) = encoding.encode(ch.encode_utf8(&mut buf));
-        if err {
+        // Also escape a character the encoder maps onto another one, or the
+        // premise `decode_mif_escapes` rests on (an escape never names a
+        // character the code page can hold) stops being true by construction.
+        if err || !round_trips(encoding, &bytes, ch) {
             let mut units = [0u16; 2];
             for unit in ch.encode_utf16(&mut units) {
                 out.extend_from_slice(format!("\\U+{:04X}", unit).as_bytes());
@@ -372,6 +387,12 @@ pub fn encode_legacy_string(text: &str, encoding: &'static Encoding) -> Vec<u8> 
         }
     }
     out
+}
+
+/// Whether `bytes`, as written for `ch`, decode back to `ch` exactly.
+fn round_trips(encoding: &'static Encoding, bytes: &[u8], ch: char) -> bool {
+    let (back, _, bad) = encoding.decode(bytes);
+    !bad && back.chars().eq(std::iter::once(ch))
 }
 
 /// Decode AutoCAD MIF `\U+XXXX` escapes (exactly four hex digits) into
@@ -590,6 +611,8 @@ mod tests {
             (21, 32),       // DOS869,    ANSI_1253
             (15, 33),       // DOS857,    ANSI_1254
             (10, 33),       // ISO8859-9, ANSI_1254
+            (14, 27),       // DOS855,    DOS866
+            (26, 25),       // JOHAB,     KOREAN
         ] {
             let stand_in_page = encoding_from_dwg_code_page(stand_in);
             let faithful_page = encoding_from_dwg_code_page(faithful);
@@ -692,18 +715,20 @@ mod tests {
             "KOI8-R",
             "GB2312",
             "ANSI_936",
+            "DOS866",
+            "KOREAN",
+            "ANSI_949",
         ] {
             assert!(code_page_is_faithful(name), "{name} is its own encoder");
         }
         for name in [
             "DOS437",
             "DOS850",
-            "DOS866",
+            "DOS855",
             "MAC-ROMAN",
             "ANSI_932",
             "BIG5",
-            "ANSI_949",
-            "KOREAN",
+            "JOHAB",
             "ISO8859-1",
             "ISO8859-9",
             // WHATWG windows-1255 holds U+05BA where CP1255 does not, and
@@ -759,6 +784,16 @@ mod tests {
         // Astral-plane chars become a surrogate pair of escapes.
         let encoded = encode_legacy_string("😀", encoding_rs::WINDOWS_1252);
         assert_eq!(String::from_utf8(encoded).unwrap(), "\\U+D83D\\U+DE00");
+        // Shift_JIS writes U+00A5 as a bare 0x5C, which reads back as a
+        // backslash, so it is escaped like an unmappable character.
+        assert_ne!(
+            encode_legacy_string("\u{A5}", encoding_rs::SHIFT_JIS),
+            b"\\"
+        );
+        assert_eq!(
+            encode_legacy_string("\u{A5}", encoding_rs::SHIFT_JIS),
+            b"\\U+00A5"
+        );
         // GBK encodes Chinese directly with no escapes.
         assert_eq!(encode_legacy_string("中", encoding_rs::GBK), &[0xD6, 0xD0]);
         // Round-trip through the decoder.
