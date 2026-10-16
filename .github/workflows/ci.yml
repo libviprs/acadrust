@@ -93,6 +93,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ACADSHARP_CORPUS: ${{ github.workspace }}/target/acadsharp-corpus
+      # This job exists to compare, so a missing corpus is a failure here.
+      ACADSHARP_REQUIRE_CORPUS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -108,12 +110,10 @@ jobs:
       # No token: both repositories are public, an anonymous clone is enough.
       - run: scripts/fetch-acadsharp-corpus.sh "$ACADSHARP_CORPUS"
       - name: Assert the corpus materialised
-        # The harness treats an absent corpus as a skip rather than a failure:
-        # tests/acadsharp_conformance.rs:48-50 returns None when
-        # $ACADSHARP_CORPUS/expectations is not a directory and :69-74 returns
-        # from the test, so `cargo test --test acadsharp_conformance` prints
-        # "test result: ok. 1 passed" with no corpus at all. Counting the corpus
-        # BEFORE cargo is what stops a silent skip from reading as a pass.
+        # The harness now fails on its own when the corpus is absent
+        # (ACADSHARP_REQUIRE_CORPUS=1, set on this job), so this step is no
+        # longer what stops a silent skip. It checks the *right* corpus
+        # arrived, which the harness cannot see.
         # The pinned commit holds 45 record dumps and 52 fixtures
         # (tests/acadsharp/README.md:49); the dumps are the geometry oracle and
         # the harness looks each one up by fixture stem (:92).
@@ -127,8 +127,8 @@ jobs:
           dumps=$(find "$ACADSHARP_CORPUS/expectations" -name '*.txt' | wc -l | tr -d ' ')
           dwgs=$(find "$ACADSHARP_CORPUS/fixtures" -name '*.dwg' | wc -l | tr -d ' ')
           echo "corpus: $dumps record dumps, $dwgs fixtures"
-          [ "$dumps" -ge 45 ] || { echo "::error::only $dumps record dumps under expectations/, want >= 45"; exit 1; }
-          [ "$dwgs" -ge 52 ] || { echo "::error::only $dwgs fixtures under fixtures/, want >= 52"; exit 1; }
+          [ "$dumps" -eq 45 ] || { echo "::error::$dumps record dumps under expectations/, want exactly 45"; exit 1; }
+          [ "$dwgs" -eq 52 ] || { echo "::error::$dwgs fixtures under fixtures/, want exactly 52"; exit 1; }
       # Asserts every fixture's verdict against tests/acadsharp/BASELINE.tsv in
       # both directions: a fixture that got worse fails, and one that got better
       # fails too and asks to be re-recorded (tests/acadsharp/README.md:221-229).
