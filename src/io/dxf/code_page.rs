@@ -247,12 +247,18 @@ impl LegacyCodePage {
     }
 }
 
-/// A bare encoding names no code page, so the gate has nothing to stand on and
-/// every escape decodes — exactly the behaviour callers had before the gate
-/// existed. Paths that do know the drawing's code page carry a
-/// [`LegacyCodePage`] instead and get the gate.
-impl From<&'static Encoding> for LegacyCodePage {
-    fn from(encoding: &'static Encoding) -> Self {
+impl LegacyCodePage {
+    /// A code page nobody named: the gate has nothing to stand on, so every
+    /// well-formed escape decodes, which is what callers had before the gate
+    /// existed. Paths that know the drawing's code page carry the
+    /// [`LegacyCodePage`] [`legacy_code_page`] or [`encoding_from_dwg_code_page`]
+    /// returned instead.
+    ///
+    /// This is a constructor and not a `From<&'static Encoding>` so that "I
+    /// deliberately do not know the code page" cannot be spelled by accident:
+    /// a call site that forgot to plumb the code page through fails to
+    /// compile instead of silently meaning something else (`#12`).
+    pub fn unknown(encoding: &'static Encoding) -> Self {
         Self {
             encoding,
             faithful: false,
@@ -440,8 +446,8 @@ fn round_trips(encoding: &'static Encoding, bytes: &[u8], ch: char) -> bool {
 ///
 /// That condition may only be put to a code page whose `encoding_rs` row is
 /// the code page — [`LegacyCodePage::is_faithful`]. Where the row is a
-/// stand-in, or where the caller passes a bare `&'static Encoding` and so
-/// names no code page at all, every well-formed escape decodes, which is
+/// stand-in, or where the caller built the page with
+/// [`LegacyCodePage::unknown`] and so names no code page at all, every well-formed escape decodes, which is
 /// what this function did before the gate existed. Putting the question to a
 /// stand-in answers about the wrong character set: IBM866, asked what a
 /// `DOS437` drawing could hold, called a `\U+0411` transport escape content
@@ -452,8 +458,8 @@ fn round_trips(encoding: &'static Encoding, bytes: &[u8], ch: char) -> bool {
 /// left as literal text. A lone surrogate names no scalar, so no encoder
 /// can have escaped one: such an escape is content by the same test as any
 /// other, seven representable ASCII characters that have to cross verbatim.
-pub fn decode_mif_escapes(text: &str, code_page: impl Into<LegacyCodePage>) -> String {
-    decode_mif_escapes_inner(text, code_page.into())
+pub fn decode_mif_escapes(text: &str, code_page: LegacyCodePage) -> String {
+    decode_mif_escapes_inner(text, code_page)
 }
 
 fn decode_mif_escapes_inner(text: &str, code_page: LegacyCodePage) -> String {
@@ -721,7 +727,7 @@ mod tests {
     fn a_bare_encoding_names_no_code_page_and_decodes_unconditionally() {
         // Callers handed only an encoding know nothing about the drawing's
         // code page, and get the pre-gate behaviour rather than a guess.
-        let bare: LegacyCodePage = encoding_rs::WINDOWS_1252.into();
+        let bare = LegacyCodePage::unknown(encoding_rs::WINDOWS_1252);
         assert!(!bare.is_faithful());
         assert_eq!(decode_mif_escapes("94\\U+00B0", bare), "94°");
     }
