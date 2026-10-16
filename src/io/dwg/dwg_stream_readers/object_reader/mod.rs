@@ -164,14 +164,14 @@ impl DwgObjectReader {
         dxf_version: DxfVersion,
         handle_map: HashMap<u64, i64>,
     ) -> Result<Self> {
-        Self::with_encoding(data, dxf_version, handle_map, encoding_rs::WINDOWS_1252)
+        Self::with_encoding(data, dxf_version, handle_map, crate::io::dxf::code_page::LegacyCodePage::unknown(encoding_rs::WINDOWS_1252))
     }
 
     pub fn with_encoding(
         data: Vec<u8>,
         dxf_version: DxfVersion,
         handle_map: HashMap<u64, i64>,
-        encoding: impl Into<crate::io::dxf::code_page::LegacyCodePage>,
+        encoding: crate::io::dxf::code_page::LegacyCodePage,
     ) -> Result<Self> {
         let version = DwgVersion::from_dxf_version(dxf_version)?;
         Ok(DwgObjectReader {
@@ -179,7 +179,7 @@ impl DwgObjectReader {
             version,
             dxf_version,
             handle_map,
-            encoding: encoding.into(),
+            encoding,
         })
     }
 
