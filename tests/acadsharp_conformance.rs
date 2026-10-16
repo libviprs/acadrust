@@ -30,6 +30,12 @@
 //! file. A fixture that gets better fails the test and asks you to re-record;
 //! a fixture that gets worse fails it and names what moved. Both are the point.
 //!
+//! # The expectation the change under test can't edit
+//!
+//! `BASELINE.tsv` is baked into the binary, so the pull request under test owns
+//! it. `ACADSHARP_BASELINE=<file>` reads the recording from a file instead; the
+//! CI job uses it to compare a pull request against the base branch's copy.
+//!
 //! # Running it
 //!
 //!   scripts/fetch-acadsharp-corpus.sh
@@ -83,8 +89,27 @@ fn corpus() -> Option<PathBuf> {
 
 const BASELINE: &str = include_str!("acadsharp/BASELINE.tsv");
 
+/// The recording to compare against: `ACADSHARP_BASELINE` names a file when it
+/// is set, otherwise the copy baked into this binary. The baked copy belongs to
+/// the change under test, so it can be edited in the same change that moves a
+/// verdict. CI points this at the base branch's copy on a pull request, which
+/// the change under test cannot reach. A named file that cannot be read fails
+/// the run: naming a baseline says you meant to compare against it.
+fn baseline_text() -> std::borrow::Cow<'static, str> {
+    match std::env::var("ACADSHARP_BASELINE")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        Some(path) => std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("ACADSHARP_BASELINE={path} could not be read: {e}"))
+            .into(),
+        None => BASELINE.into(),
+    }
+}
+
 fn baseline() -> BTreeMap<String, String> {
-    BASELINE
+    baseline_text()
+        .as_ref()
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
