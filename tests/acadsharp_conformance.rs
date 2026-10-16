@@ -35,8 +35,15 @@
 //!   scripts/fetch-acadsharp-corpus.sh
 //!   ACADSHARP_CORPUS=target/acadsharp-corpus cargo test --test acadsharp_conformance
 //!
-//! With no corpus the test skips rather than fails, because the corpus is a
-//! network fetch and a crate's test suite should not need one to be green.
+//! With neither variable below set, the test skips rather than fails, because
+//! the corpus is a network fetch and a crate's test suite should not need one
+//! to be green. Two things turn the skip into a failure:
+//!
+//! - `ACADSHARP_REQUIRE_CORPUS=1` says the comparison is required, so a missing
+//!   corpus panics. The conformance CI job sets it.
+//! - A set `ACADSHARP_CORPUS` that holds no `expectations/` directory panics
+//!   whether or not the flag is set: setting it says you meant to compare, so a
+//!   typo, an empty cache or a failed fetch must not read as a pass.
 
 mod viprs;
 
@@ -45,9 +52,33 @@ use std::path::PathBuf;
 
 use viprs::{dump_fixture, Verdict};
 
+/// The corpus, or `None` when the run is allowed to skip. Panics when the run
+/// was meant to compare and has nothing to compare against.
 fn corpus() -> Option<PathBuf> {
-    let p = PathBuf::from(std::env::var("ACADSHARP_CORPUS").ok()?);
-    p.join("expectations").is_dir().then_some(p)
+    let required = std::env::var("ACADSHARP_REQUIRE_CORPUS").as_deref() == Ok("1");
+    // A variable that is set but empty is how a shell unsets one in a template,
+    // so it counts as unset.
+    match std::env::var("ACADSHARP_CORPUS").ok().filter(|v| !v.is_empty()) {
+        Some(v) => {
+            let p = PathBuf::from(v);
+            if p.join("expectations").is_dir() {
+                Some(p)
+            } else {
+                panic!(
+                    "ACADSHARP_CORPUS={} holds no expectations/ directory, so there is nothing \
+                     to compare against. Setting the variable says the comparison was meant to \
+                     run: check the path, or run scripts/fetch-acadsharp-corpus.sh.",
+                    p.display()
+                )
+            }
+        }
+        None if required => panic!(
+            "ACADSHARP_REQUIRE_CORPUS=1 but ACADSHARP_CORPUS is not set, so the comparison \
+             would run against nothing. Run scripts/fetch-acadsharp-corpus.sh and point \
+             ACADSHARP_CORPUS at the result (the corpus belongs at target/acadsharp-corpus)."
+        ),
+        None => None,
+    }
 }
 
 const BASELINE: &str = include_str!("acadsharp/BASELINE.tsv");
