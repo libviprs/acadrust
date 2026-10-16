@@ -68,7 +68,7 @@ impl DwgBitReader {
             dxf_version,
             // No code page was named, so no escape is presumed to be
             // content. `from_shared_with_encoding` supplies the real one.
-            encoding: encoding_rs::WINDOWS_1252.into(),
+            encoding: crate::io::dxf::code_page::LegacyCodePage::unknown(encoding_rs::WINDOWS_1252),
             is_empty: false,
             text_stream_pos: -1,
             text_stream_end_pos: -1,
@@ -79,10 +79,10 @@ impl DwgBitReader {
         data: Arc<[u8]>,
         version: DwgVersion,
         dxf_version: DxfVersion,
-        encoding: impl Into<crate::io::dxf::code_page::LegacyCodePage>,
+        encoding: crate::io::dxf::code_page::LegacyCodePage,
     ) -> Self {
         let mut reader = Self::from_shared(data, version, dxf_version);
-        reader.encoding = encoding.into();
+        reader.encoding = encoding;
         reader
     }
 
@@ -91,10 +91,10 @@ impl DwgBitReader {
         data: Vec<u8>,
         version: DwgVersion,
         dxf_version: DxfVersion,
-        encoding: impl Into<crate::io::dxf::code_page::LegacyCodePage>,
+        encoding: crate::io::dxf::code_page::LegacyCodePage,
     ) -> Self {
         let mut r = Self::new(data, version, dxf_version);
-        r.encoding = encoding.into();
+        r.encoding = encoding;
         r
     }
 
