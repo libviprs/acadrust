@@ -89,7 +89,7 @@ impl DwgMergedReader {
             data,
             dxf_version,
             handle_start_bits,
-            encoding_rs::WINDOWS_1252,
+            crate::io::dxf::code_page::LegacyCodePage::unknown(encoding_rs::WINDOWS_1252),
         )
     }
 
@@ -97,10 +97,9 @@ impl DwgMergedReader {
         data: Vec<u8>,
         dxf_version: DxfVersion,
         handle_start_bits: i64,
-        encoding: impl Into<crate::io::dxf::code_page::LegacyCodePage>,
+        encoding: crate::io::dxf::code_page::LegacyCodePage,
     ) -> Self {
-        let encoding = encoding.into();
-        let dwg = DwgVersion::from_dxf_version(dxf_version).unwrap_or(DwgVersion::AC15);
+                let dwg = DwgVersion::from_dxf_version(dxf_version).unwrap_or(DwgVersion::AC15);
 
         let mode = if dxf_version >= DxfVersion::AC1021 {
             MergeMode::ThreeStream
@@ -184,7 +183,7 @@ impl DwgMergedReader {
             _mode: mode,
             dxf_version,
             raw_data: None,
-            encoding: encoding_rs::WINDOWS_1252.into(),
+            encoding: crate::io::dxf::code_page::LegacyCodePage::unknown(encoding_rs::WINDOWS_1252),
             handle_bits: 0,
             ref_handle: 0,
             handle_start_bit: 0,
