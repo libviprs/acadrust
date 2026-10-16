@@ -1696,4 +1696,65 @@ mod tests {
             (0.0, 0.0, 1.0)
         ));
     }
+    /// acadrust#13 (b). The harness had no self-test, and the corpus runs the
+    /// Spline / Polyline2D / Polyline3D placement arms at identity only, so
+    /// "no verdict moved" says nothing about them. Four curve kinds that each
+    /// describe the single point (1, 0, 0) in a block's frame must all land at
+    /// the one place the block's insertion puts it: (10, 20, 0) plus twice
+    /// (1, 0, 0). Reverting `at.point` in any of the arms makes its record
+    /// hold (1, 0, 0), and the matching assertion fails.
+    #[test]
+    fn placed_curve_points_land_in_the_drawing_s_space() {
+        use acadrust::entities::{
+            Insert, LwPolyline, Polyline2D, Polyline3D, Spline, Vertex2D,
+        };
+        use acadrust::tables::BlockRecord;
+        use acadrust::types::{DxfVersion, Vector2, Vector3};
+        use acadrust::CadDocument;
+
+        let mut doc = CadDocument::with_version(DxfVersion::AC1032);
+        let mut br = BlockRecord::new("CURVES");
+        br.handle = doc.allocate_handle();
+        br.block_entity_handle = doc.allocate_handle();
+        br.block_end_handle = doc.allocate_handle();
+        let owner = br.handle;
+        doc.block_records.add(br).unwrap();
+
+        let one = Vector3::new(1.0, 0.0, 0.0);
+        let mut members = vec![
+            EntityType::LwPolyline(LwPolyline::from_points(vec![Vector2::new(1.0, 0.0)])),
+            EntityType::Polyline3D(Polyline3D::from_points(vec![one])),
+            EntityType::Spline(Spline::from_control_points(0, vec![one])),
+        ];
+        let mut p2 = Polyline2D::new();
+        p2.add_vertex(Vertex2D::new(one));
+        members.push(EntityType::Polyline2D(p2));
+        for mut m in members {
+            m.common_mut().owner_handle = owner;
+            doc.add_entity(m).unwrap();
+        }
+        doc.add_entity(EntityType::Insert(
+            Insert::new("CURVES", Vector3::new(10.0, 20.0, 0.0)).with_scale(2.0, 2.0, 2.0),
+        ))
+        .unwrap();
+
+        let placed = expand(&doc).expect("expand");
+        let want = "(12.000000,20.000000,0.000000)";
+        let mut seen = Vec::new();
+        for p in &placed {
+            let r = render_one(p).expect("a record");
+            seen.push(r.kind.clone());
+            assert!(
+                r.body.contains(want),
+                "{} was not placed: {}",
+                r.kind,
+                r.body
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            4,
+            "expected the LWPOLYLINE, POLYLINE x2 and SPLINE, got {seen:?}"
+        );
+    }
 }
