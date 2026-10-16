@@ -1482,6 +1482,52 @@ fn dwg_double_roundtrip_stability() {
     );
 }
 
+/// `normalize_entity_common` drops `raw_record` from the comparator, and has to:
+/// in the build-write-read tests the original is structurally `None`. That also
+/// stops `dwg_double_roundtrip_stability` asserting that an untouched record is
+/// copied rather than re-encoded, which is the one place both sides genuinely
+/// hold source bytes. This asserts it directly, by addition.
+///
+/// `raw_record` is public surface and closer to an implementation property
+/// than to a user-visible outcome, but it defends a real invariant: if the
+/// passthrough silently stops firing, `rt1` and `rt2` still compare equal
+/// semantically and nothing notices that unmodelled record content was lost.
+#[test]
+fn an_untouched_record_is_rewritten_byte_for_byte() {
+    let (doc, _) = build_rich_document(DxfVersion::AC1032);
+    let rt1 = dwg_roundtrip(&doc);
+    let rt2 = dwg_roundtrip(&rt1);
+    let mut compared = 0;
+    for (a, b) in rt1.entities().zip(rt2.entities()) {
+        // The compound types re-serialise: their records embed VERTEX/SEQEND
+        // handles the writer reassigns (object_writer/entities.rs:62).
+        if matches!(
+            a,
+            EntityType::Polyline(_)
+                | EntityType::Polyline2D(_)
+                | EntityType::Polyline3D(_)
+                | EntityType::PolyfaceMesh(_)
+                | EntityType::PolygonMesh(_)
+                | EntityType::Insert(_)
+        ) {
+            continue;
+        }
+        let (Some(x), Some(y)) = (a.common().raw_record.as_ref(), b.common().raw_record.as_ref())
+        else {
+            continue;
+        };
+        assert_eq!(
+            x.data,
+            y.data,
+            "{:?} was re-encoded rather than copied",
+            a.common().handle
+        );
+        assert_eq!(x.handle_bits, y.handle_bits);
+        compared += 1;
+    }
+    assert!(compared > 20, "only {compared} records reached the passthrough");
+}
+
 // ── DWG: Table preservation ───────────────────────────────────────────
 
 #[test]
