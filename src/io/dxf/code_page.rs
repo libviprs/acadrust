@@ -191,6 +191,29 @@ pub fn dwg_code_page_index(code_page: &str) -> u16 {
 /// it there) and stay literal in an `ANSI_1252` one (windows-1252 holds `Þ` at
 /// `0xDE`, so nothing escaped it). A function handed only `&'static Encoding`
 /// cannot be right about both.
+///
+/// Handing the gate a bare encoding is a decision a call site has to spell out
+/// with [`LegacyCodePage::unknown`], not a coercion it can fall into by
+/// forgetting to plumb the code page through (`#12`):
+///
+/// ```compile_fail,E0308
+/// use acadrust::io::dxf::code_page::decode_mif_escapes;
+/// let _ = decode_mif_escapes("94\\U+00B0", encoding_rs::WINDOWS_1252);
+/// ```
+///
+/// ```compile_fail,E0277
+/// use acadrust::io::dxf::code_page::LegacyCodePage;
+/// let _: LegacyCodePage = encoding_rs::WINDOWS_1252.into();
+/// ```
+///
+/// The deliberate spelling, which decodes every escape:
+///
+/// ```
+/// use acadrust::io::dxf::code_page::{decode_mif_escapes, LegacyCodePage};
+/// let unknown = LegacyCodePage::unknown(encoding_rs::WINDOWS_1252);
+/// assert!(!unknown.is_faithful());
+/// assert_eq!(decode_mif_escapes("94\\U+00B0", unknown), "94\u{b0}");
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LegacyCodePage {
     encoding: &'static Encoding,
