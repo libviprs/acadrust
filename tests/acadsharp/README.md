@@ -10,15 +10,19 @@ dump it produced.
 
 ```bash
 scripts/fetch-acadsharp-corpus.sh
-ACADSHARP_CORPUS=target/acadsharp-corpus cargo test --test acadsharp_conformance
+ACADSHARP_REQUIRE_CORPUS=1 ACADSHARP_CORPUS=target/acadsharp-corpus \
+  cargo test --test acadsharp_conformance
 
 # the human-readable version, one line per fixture
 ACADSHARP_CORPUS=target/acadsharp-corpus \
   cargo test --test acadsharp_conformance -- --ignored report --nocapture
 ```
 
-With no corpus the test skips rather than fails. Fetching it is a network call
-and a crate's suite should not need one to go green.
+With neither variable set the test skips rather than fails. Fetching the corpus is a
+network call and a crate's suite should not need one to go green. The command above is the
+strict run: `ACADSHARP_REQUIRE_CORPUS=1` makes a missing corpus a failure, and a set
+`ACADSHARP_CORPUS` with no `expectations/` in it fails either way, so a typo or a failed fetch
+can't pass for a comparison. The `test` job sets neither and keeps skipping, on purpose.
 
 ## Formatting this harness: never `cargo fmt`
 
