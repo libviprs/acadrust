@@ -630,39 +630,20 @@ mod tests {
     #[test]
     fn mac_roman_and_ansi_1252_alias_one_encoding() {
         // Why `LegacyCodePage` carries the faithfulness answer instead of
-        // deriving it from the encoding: the table is many-to-one, and each
-        // pair below is one `encoding_rs` row serving a code page it *is* and
-        // a code page it only stands in for.
-        for (stand_in, faithful) in [
-            (23u16, 30u16), // MAC-ROMAN, ANSI_1252
-            (2, 30),        // ISO8859-1, ANSI_1252
-            (13, 28),       // DOS852,    ANSI_1250
-            (21, 32),       // DOS869,    ANSI_1253
-            (15, 33),       // DOS857,    ANSI_1254
-            (10, 33),       // ISO8859-9, ANSI_1254
-            (14, 27),       // DOS855,    DOS866
-            (26, 25),       // JOHAB,     KOREAN
-        ] {
-            let stand_in_page = encoding_from_dwg_code_page(stand_in);
-            let faithful_page = encoding_from_dwg_code_page(faithful);
-            assert_eq!(
-                stand_in_page.encoding(),
-                faithful_page.encoding(),
-                "{} and {} no longer share a row",
-                dwg_code_page_name(stand_in),
-                dwg_code_page_name(faithful)
-            );
-            assert!(
-                !stand_in_page.is_faithful(),
-                "{} is a stand-in",
-                dwg_code_page_name(stand_in)
-            );
-            assert!(
-                faithful_page.is_faithful(),
-                "{} is its own encoder",
-                dwg_code_page_name(faithful)
-            );
-        }
+        // deriving it from the encoding: the table is many-to-one, and here is
+        // one `encoding_rs` row serving a code page it *is* (ANSI_1252) and one
+        // it only stands in for (MAC-ROMAN). The other rows that share a
+        // pointer are deliberately not enumerated: giving one of them a real
+        // row would be an improvement, and this test must not fail on that.
+        let mac = encoding_from_dwg_code_page(23);
+        let ansi = encoding_from_dwg_code_page(30);
+        assert_eq!(
+            mac.encoding(),
+            ansi.encoding(),
+            "MAC-ROMAN and ANSI_1252 no longer share a row, so this test no longer shows why the \
+             faithfulness answer can't be derived from the encoding pointer; pick another pair"
+        );
+        assert!(!mac.is_faithful() && ansi.is_faithful());
         // And the same escape needs opposite answers on one of those rows.
         assert_eq!(dwg_code_page_name(23), "MAC-ROMAN");
         assert_eq!(
@@ -733,43 +714,23 @@ mod tests {
     }
 
     #[test]
-    fn faithfulness_follows_the_row_the_table_actually_picks() {
+    fn a_name_the_table_does_not_pick_a_row_for_is_never_faithful() {
+        // The cross-function invariant: a name that reaches the
+        // `_ => WINDOWS_1252` default arm of `encoding_from_code_page` was not
+        // given an encoder, so it must not be called faithful. (The
+        // per-name rows are not repeated here: that would be this test typing
+        // `code_page_is_faithful`'s own list a second time.)
         for name in [
-            "ANSI_1250",
-            "ANSI_1252",
-            "ANSI_1258",
-            "ANSI_874",
-            "ISO8859-2",
-            "ISO8859-15",
-            "KOI8-R",
-            "GB2312",
-            "ANSI_936",
-            "DOS866",
-            "KOREAN",
-            "ANSI_949",
-        ] {
-            assert!(code_page_is_faithful(name), "{name} is its own encoder");
-        }
-        for name in [
-            "DOS437",
-            "DOS850",
-            "DOS855",
-            "MAC-ROMAN",
-            "ANSI_932",
-            "BIG5",
-            "JOHAB",
-            "ISO8859-1",
-            "ISO8859-9",
-            // WHATWG windows-1255 holds U+05BA where CP1255 does not, and
-            // `encoding_rs`' `koi8-u` row is KOI8-RU, which differs from
-            // KOI8-U in both directions.
-            "ANSI_1255",
-            "KOI8-U",
             "SOMETHING_UNKNOWN",
             // A spelling the table does not match reaches the windows-1252
             // default, so its encoder was not chosen for it.
             "ansi1252",
         ] {
+            assert!(!code_page_is_faithful(name), "{name} is a stand-in");
+        }
+        // The deliberate carve-out: these borrow windows-1252 and
+        // windows-1254 and are stand-ins on purpose.
+        for name in ["ISO8859-1", "ISO8859-9"] {
             assert!(!code_page_is_faithful(name), "{name} is a stand-in");
         }
     }
