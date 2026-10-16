@@ -136,3 +136,18 @@ jobs:
       # under "Where acadrust is ahead of the recording"; re-recording is a
       # local step, never a CI one.
       - run: cargo test --test acadsharp_conformance
+      # The run above compares against the baseline this commit ships, which the
+      # change under test can edit in the same commit (acadrust#10). On a pull
+      # request, compare against the base branch's copy as well: it is not
+      # reachable from inside the PR, and the test reads it through
+      # ACADSHARP_BASELINE because include_str! has already baked the head's in.
+      # This step is red on a PR that deliberately moves a verdict, and that is
+      # the review signal (tests/acadsharp/README.md, "Why a baseline").
+      - name: Compare verdicts against the base branch's recording
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --depth 1 origin "$BASE_SHA"
+          git show "$BASE_SHA:tests/acadsharp/BASELINE.tsv" > "$RUNNER_TEMP/base.tsv"
+          ACADSHARP_BASELINE="$RUNNER_TEMP/base.tsv" cargo test --test acadsharp_conformance
