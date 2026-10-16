@@ -25,6 +25,17 @@
 # allow-list this workflow refuses to have. Formatting stays a per-file local
 # step: `rustfmt --edition 2021 <file>`.
 #
+# There is deliberately no clippy job either, and this is a measurement rather
+# than a preference. `cargo clippy --locked --all-targets -- -D warnings` on
+# rust:1.99.1-bookworm at this commit stops with 434 errors in the lib test
+# target alone, across more than thirty lints (clamp-like patterns 72,
+# useless `vec!` 43, `chunks_exact` with a constant size 21, field assignment
+# after `Default::default()` 19, manual assign operations 17, ... down to single
+# instances), almost all of them in upstream's code. A job that is red on
+# upstream's code is the allow-list this workflow refuses to have, and a lint
+# set narrowed until it passes is the same allow-list spelled differently.
+# Revisit it when upstream's tree is clippy-clean or the fork stops tracking it.
+#
 # This file has never executed. `gh api repos/libviprs/acadrust/actions/workflows`
 # and `.../actions/runs` both report total_count 0, because the workflow is not
 # on the default branch yet. Repository Actions are enabled
@@ -67,37 +78,31 @@ jobs:
       # The runner's preinstalled stable, printed for the log. No toolchain
       # action: this crate pins no channel and a fork does not need a matrix.
       - run: cargo --version && rustc --version
-      # `cargo test` with no arguments DOES NOT COMPILE here. It builds the
-      # examples, and examples/entity_atlas.rs:549 include_bytes!'s
-      # examples/entity_atlas_assets/native_surfaces.dwg, which .gitignore:24
-      # excludes from the repository, so a fresh checkout dies with
-      #   error: couldn't read `examples/entity_atlas_assets/native_surfaces.dwg`
-      #   error: could not compile `acadrust` (example "entity_atlas")
-      # and exit 101 before one test runs. `--tests` builds the lib and the
-      # integration targets only.
+      # Bare `cargo test`, so the lib, every integration target, the examples
+      # and the doc tests all build and run. It used to be `--tests` because
+      # examples/entity_atlas.rs include_bytes!'d a gitignored .dwg and a fresh
+      # clone died on it (upstream hakanaktt/acadrust#97); the fork now carries
+      # upstream's entity_atlas, which embeds nothing, so nothing here has to be
+      # steered around. The next example that does is a red check on purpose.
+      #
+      # `--locked` because Cargo.lock is committed in this fork (acadrust#17:
+      # the fork is a build input of a pinned parity run, and upstream keeps
+      # ignoring the file on its side without a conflict), so a green run is a
+      # function of the commit and a dependency release cannot turn it red or
+      # green on its own. A PR that changes dependencies updates the lock.
       #
       # `--no-fail-fast` because cargo stops at the first failing target
       # otherwise, and one red target hiding the rest is the exact failure mode
       # this workflow exists to end.
       #
-      # No `--locked`: Cargo.lock is gitignored (.gitignore:5) and absent from a
-      # fresh checkout, so `--locked` would fail on the lockfile rather than on
-      # the code.
+      # The tests that read a private file (annotative_context_encoder's golden
+      # drawing, the nine real_dwg_roundtrip cases) are #[ignore]d with their
+      # reason, so they show up as ignored here and never as passed.
       #
       # tests/acadsharp_conformance.rs runs here too and skips itself: this job
       # sets no ACADSHARP_CORPUS. The conformance job below is the one that
       # means something.
-      - run: cargo test --tests --no-fail-fast
-      # `--tests` leaves out two target classes, and this and the next step put
-      # them back (acadrust#11 c, d). Doc tests never run under `--tests`;
-      # `cargo test --doc` is the only thing that builds the public API's
-      # examples, including the `compile_fail` ones that pin a type-level
-      # contract (LegacyCodePage).
-      - run: cargo test --doc
-      # `--tests` builds no examples, and only entity_atlas is broken on a clean
-      # clone (above). The other two compile, so they are checked by name; any
-      # example added later has to be listed here or fixed to build.
-      - run: cargo check --example gen_all_entities_all_versions --example roundtrip_analysis
+      - run: cargo test --locked --no-fail-fast
 
   conformance:
     runs-on: ubuntu-latest
@@ -145,7 +150,7 @@ jobs:
       # The two recorded DIFFs are deliberate and are argued in that README
       # under "Where acadrust is ahead of the recording"; re-recording is a
       # local step, never a CI one.
-      - run: cargo test --test acadsharp_conformance
+      - run: cargo test --locked --test acadsharp_conformance
       # The run above compares against the baseline this commit ships, which the
       # change under test can edit in the same commit (acadrust#10). On a pull
       # request, compare against the base branch's copy as well: it is not
@@ -160,4 +165,4 @@ jobs:
         run: |
           git fetch --depth 1 origin "$BASE_SHA"
           git show "$BASE_SHA:tests/acadsharp/BASELINE.tsv" > "$RUNNER_TEMP/base.tsv"
-          ACADSHARP_BASELINE="$RUNNER_TEMP/base.tsv" cargo test --test acadsharp_conformance
+          ACADSHARP_BASELINE="$RUNNER_TEMP/base.tsv" cargo test --locked --test acadsharp_conformance
