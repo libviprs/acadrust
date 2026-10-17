@@ -549,6 +549,8 @@ pub struct HeaderVariables {
     pub dim_arrow_block1_handle: Handle,
     /// Dimension arrow block 2 handle
     pub dim_arrow_block2_handle: Handle,
+    /// Dimension leader arrow block handle (DIMLDRBLK)
+    pub dim_leader_arrow_block_handle: Handle,
     /// DIMLWD - Dimension line weight
     pub dim_line_weight: i16,
     /// DIMLWE - Extension line weight
@@ -902,6 +904,7 @@ impl Default for HeaderVariables {
             dim_linetype2_handle: Handle::NULL,
             dim_arrow_block_handle: Handle::NULL,
             dim_arrow_block1_handle: Handle::NULL,
+            dim_leader_arrow_block_handle: Handle::NULL,
             dim_arrow_block2_handle: Handle::NULL,
             dim_line_weight: -2,     // ByBlock
             dim_ext_line_weight: -2, // ByBlock
@@ -5070,4 +5073,50 @@ fn valid_symbol_table_name(name: &str) -> bool {
                     '<' | '>' | '/' | '\\' | '"' | ':' | ';' | '?' | '*' | '|' | ',' | '=' | '`'
                 )
         })
+}
+
+/// The arrowheads AutoCAD ships. Each one is a block named with a leading
+/// underscore (`_BoxBlank`), while the dimension variables ($DIMBLK, $DIMBLK1,
+/// $DIMBLK2, $DIMLDRBLK) hold the name without it (`BoxBlank`).
+const STANDARD_ARROWS: [&str; 19] = [
+    "Dot",
+    "DotSmall",
+    "DotBlank",
+    "Origin",
+    "Origin2",
+    "Open",
+    "Open90",
+    "Open30",
+    "Closed",
+    "Small",
+    "None",
+    "Oblique",
+    "BoxFilled",
+    "BoxBlank",
+    "ClosedBlank",
+    "DatumFilled",
+    "DatumBlank",
+    "Integral",
+    "ArchTick",
+];
+
+/// The value of a dimension arrow variable for the arrow block of this name:
+/// the block's name, less the underscore of a standard arrowhead.
+pub(crate) fn arrow_variable_from_block_name(block: &str) -> String {
+    match block.strip_prefix('_') {
+        Some(rest) if STANDARD_ARROWS.iter().any(|a| a.eq_ignore_ascii_case(rest)) => {
+            rest.to_string()
+        }
+        _ => block.to_string(),
+    }
+}
+
+/// The block name a dimension arrow variable refers to: the name with the
+/// underscore a standard arrowhead's block carries.
+pub(crate) fn arrow_block_name_from_variable(value: &str) -> String {
+    if STANDARD_ARROWS.iter().any(|a| a.eq_ignore_ascii_case(value)) {
+        format!("_{value}")
+    } else {
+        value.to_string()
+    }
 }

@@ -1840,7 +1840,9 @@ impl<'a> SectionReader<'a> {
                 }
                 "$XCLIPFRAME" => {
                     if let Some(p) = self.reader.read_pair()? {
-                        if let Some(v) = p.as_i16() {
+                        // AutoCAD writes it under 290 (a bool); older writers
+                        // and the reference's attribute say 280 (an integer).
+                        if let Some(v) = p.as_i16().or_else(|| p.as_bool().map(i16::from)) {
                             hdr.xclip_frame = v;
                         }
                     }

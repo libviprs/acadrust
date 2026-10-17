@@ -782,6 +782,25 @@ fn prepare_header(
         h.paper_space_block_handle = br.handle;
     }
 
+    // ── Dimension arrow blocks: the name in the variable, the handle in the file ──
+    {
+        let find = |value: &str| -> Handle {
+            if value.is_empty() {
+                return Handle::NULL;
+            }
+            document
+                .block_records
+                .get(&crate::document::arrow_block_name_from_variable(value))
+                .or_else(|| document.block_records.get(value))
+                .map(|b| b.handle)
+                .unwrap_or(Handle::NULL)
+        };
+        h.dim_arrow_block_handle = find(&h.dim_arrow_block);
+        h.dim_arrow_block1_handle = find(&h.dim_arrow_block1);
+        h.dim_arrow_block2_handle = find(&h.dim_arrow_block2);
+        h.dim_leader_arrow_block_handle = find(&h.dim_leader_arrow_block);
+    }
+
     // ── Sync current style handles (validate against actual objects) ──
     // CLAYER: must point to an actual layer; fall back to "0" if invalid
     {
