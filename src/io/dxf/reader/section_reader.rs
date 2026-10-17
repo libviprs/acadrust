@@ -1427,7 +1427,11 @@ impl<'a> SectionReader<'a> {
                     }
                 }
                 "$ACADMAINTVER" => {
-                    self.reader.read_pair()?;
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = p.as_int() {
+                            hdr.acad_maintenance_version = v as i32;
+                        }
+                    }
                 }
                 "$REQUIREDVERSIONS" => {
                     if let Some(p) = self.reader.read_pair()? {
@@ -6497,7 +6501,21 @@ impl<'a> SectionReader<'a> {
                             .insert(object.handle, ObjectType::Associative(object));
                     }
                     name if is_class_object_name(name) => {
-                        let object = self.read_class_object_dxf(name, document.version)?;
+                        let object = match self.read_class_object_dxf(name, document.version) {
+                            Ok(object) => object,
+                            // A class object whose payload this reader cannot decode (a
+                            // DATATABLE cell type it has no codec for) costs that object,
+                            // not the drawing: its records were already read to the next
+                            // object, so say what was dropped and carry on.
+                            Err(crate::error::DxfError::NotImplemented(why)) => {
+                                document.notifications.notify(
+                                    crate::notification::NotificationType::NotImplemented,
+                                    format!("Object skipped, {name}: {why}"),
+                                );
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        };
                         if let ClassObjectData::SectionViewStyle(style) = &object.data {
                             document.section_view_style = Some(crate::entities::SectionViewStyle {
                                 show_arrows: style.flags & 0x02 != 0,

@@ -98,6 +98,11 @@ pub struct HeaderVariables {
     // ==================== Version-specific Flags ====================
     /// REQUIREDVERSIONS (R2013+) - Bit coded required versions
     pub required_versions: i64,
+    /// `$ACADMAINTVER` as a DXF header carries it (AutoCAD's maintenance build
+    /// number, for example 329 for an AC1032 save). 0 when the file has none, as a
+    /// DWG's header does not. Not the DWG file-header byte that
+    /// [`CadDocument::maintenance_version`] holds, which is a different quantity.
+    pub acad_maintenance_version: i32,
 
     // ==================== Drawing Mode Flags ====================
     /// DIMASO - Associates dimensions with geometry
@@ -666,6 +671,7 @@ impl Default for HeaderVariables {
         Self {
             // Version-specific flags
             required_versions: 0,
+            acad_maintenance_version: 0,
 
             // Drawing mode flags
             associate_dimensions: true,
