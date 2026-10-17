@@ -2552,6 +2552,7 @@ mod unregistered_class_tests {
         let mut object = DataObject::new(DataObjectData::BreakPointRef);
         object.handle = handle;
         doc.objects.insert(handle, ObjectType::DataObject(object));
+        doc.classes.clear();
         assert!(doc.classes.get_by_name("BREAKPOINTREF").is_none());
         let (_, handles, _, _) = DwgObjectWriter::new(&doc).unwrap().write();
         handles.into_iter().map(|(h, _)| h).collect()
