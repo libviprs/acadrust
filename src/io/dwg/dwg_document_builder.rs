@@ -2913,6 +2913,66 @@ impl DwgDocumentBuilder {
             .map(|layer| layer.name.clone())
             .unwrap_or_default();
 
+        // The DWG header holds the current text style, linetype and dimension
+        // style as handles too, and the DXF reader gives their names. Resolve
+        // them the same way, and leave the default when a handle names nothing
+        // (a header that points at an entry the file does not hold).
+        if let Some(style) = document
+            .text_styles
+            .iter()
+            .find(|s| s.handle == document.header.current_text_style_handle)
+        {
+            document.header.current_text_style_name = style.name.clone();
+        }
+        if let Some(lt) = document
+            .line_types
+            .iter()
+            .find(|l| l.handle == document.header.current_linetype_handle)
+        {
+            document.header.current_linetype_name = lt.name.clone();
+        }
+        if let Some(ds) = document
+            .dim_styles
+            .iter()
+            .find(|d| d.handle == document.header.current_dimstyle_handle)
+        {
+            document.header.current_dimstyle_name = ds.name.clone();
+        }
+
+        // The arrow blocks of the dimension variables (R2000+ keep a handle
+        // where R14 kept the name). The variable holds the arrowhead's name, and
+        // a standard one is a block named with an underscore in front.
+        {
+            let header = &document.header;
+            let resolve = |handle: Handle| -> Option<String> {
+                if handle.is_null() {
+                    return None;
+                }
+                document
+                    .block_records
+                    .iter()
+                    .find(|b| b.handle == handle)
+                    .map(|b| crate::document::arrow_variable_from_block_name(&b.name))
+            };
+            let blk = resolve(header.dim_arrow_block_handle);
+            let blk1 = resolve(header.dim_arrow_block1_handle);
+            let blk2 = resolve(header.dim_arrow_block2_handle);
+            let ldr = resolve(header.dim_leader_arrow_block_handle);
+            let header = &mut document.header;
+            if let Some(n) = blk {
+                header.dim_arrow_block = n;
+            }
+            if let Some(n) = blk1 {
+                header.dim_arrow_block1 = n;
+            }
+            if let Some(n) = blk2 {
+                header.dim_arrow_block2 = n;
+            }
+            if let Some(n) = ldr {
+                header.dim_leader_arrow_block = n;
+            }
+        }
+
         // ── Post-pass: guarantee the mandatory *Model_Space / *Paper_Space ──
         // block records exist and enumerate their geometry.
         //
