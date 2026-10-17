@@ -21,6 +21,9 @@ enum IntWidth {
 /// Binary DXF stream writer
 pub struct DxfBinaryWriter<W: Write> {
     writer: W,
+    /// R12 files give a group code one byte (255 then two bytes for the
+    /// extended-data range); R13 and later always use two.
+    short_codes: bool,
     /// Stack buffer for formatting handles without heap allocation.
     hex_buf: [u8; 17],
 }
@@ -32,12 +35,29 @@ impl<W: Write> DxfBinaryWriter<W> {
         writer.write_all(BINARY_DXF_SENTINEL)?;
         Ok(Self {
             writer,
+            short_codes: false,
             hex_buf: [0u8; 17],
         })
     }
 
+    /// A writer for the R12 binary layout, which has one-byte group codes.
+    pub fn new_r12(writer: W) -> Result<Self> {
+        let mut w = Self::new(writer)?;
+        w.short_codes = true;
+        Ok(w)
+    }
+
     /// Write a DXF code as 16-bit little-endian
     fn write_code(&mut self, code: i32) -> Result<()> {
+        if self.short_codes {
+            if (0..255).contains(&code) {
+                self.writer.write_u8(code as u8)?;
+            } else {
+                self.writer.write_u8(255)?;
+                self.writer.write_i16::<LittleEndian>(code as i16)?;
+            }
+            return Ok(());
+        }
         self.writer.write_i16::<LittleEndian>(code as i16)?;
         Ok(())
     }

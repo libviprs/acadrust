@@ -14,7 +14,7 @@ fn repro_path() -> std::path::PathBuf {
 }
 
 #[test]
-fn ac1009_is_preserved_on_read_and_written_as_r13() {
+fn ac1009_is_preserved_on_read_and_written_as_r12() {
     assert_eq!(DxfVersion::parse("AC1009"), Some(DxfVersion::AC1009));
     assert_eq!(DxfVersion::AC1009.as_str(), "AC1009");
     assert_eq!(DxfVersion::AC1009.version_code(), 1009);
@@ -40,24 +40,23 @@ fn ac1009_is_preserved_on_read_and_written_as_r13() {
         "round-tripped file still declares an UNKNOWN version"
     );
 
-    // The DXF writer has no R12 emit mode: it always writes handles, `330`
-    // owner pointers and `100` subclass markers. Declaring AC1009 over that
-    // content makes the file unreadable to consumers that apply R12 parsing
-    // rules, so R12 input is written as R13 - the oldest version whose
-    // structure matches what is emitted.
+    // R12 input is written as R12, in the R12 layout: no handles, no
+    // subclass markers, no CLASSES or OBJECTS section. Declaring AC1009 over
+    // R13 constructs was what made R12-rules readers fail on the table
+    // records (this issue); writing R13 instead (the old workaround) meant
+    // AC1009 could not be written at all (acadsharp-rs-tests#111).
+    assert!(!text.contains("CLASSES") && !text.contains("AcDb"));
     let reloaded = DxfReader::from_file(&output).unwrap().read().unwrap();
-    assert_eq!(
-        reloaded.version,
-        DxfVersion::AC1012,
-        "R12 input must be written as a documented supported version"
-    );
+    assert_eq!(reloaded.version, DxfVersion::AC1009);
 }
 
 #[test]
 fn mleaderstyle_text_style_handle_resolves_after_read() {
     let input = repro_path();
 
-    let document = DxfReader::from_file(&input).unwrap().read().unwrap();
+    let mut document = DxfReader::from_file(&input).unwrap().read().unwrap();
+    // R12 has no OBJECTS section, so the MLEADERSTYLE this checks needs R13+.
+    document.version = DxfVersion::AC1012;
 
     let text_style_handles: std::collections::HashSet<u64> = document
         .text_styles

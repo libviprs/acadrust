@@ -316,19 +316,14 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
 
     /// The version this writer actually emits for a requested target.
     ///
-    /// R12 (AC1009) predates the handle-based object model: its table records
-    /// carry no handles, no `330` owner pointers and no `100` subclass markers,
-    /// and it has no OBJECTS section. This writer always emits those R13+
-    /// constructs, so declaring `AC1009` in `$ACADVER` would describe the file
-    /// as something it is not - consumers applying R12 parsing rules then fail
-    /// to read the table records at all (issue #68). R12 input is therefore
-    /// preserved through read (`document.version` stays `AC1009`) but written
-    /// as R13, the oldest version whose structure matches what is emitted.
+    /// R12 (AC1009) is declared as such: the section writer produces the R13
+    /// structure for it, and the R12 layout (no handles, no subclass markers,
+    /// no OBJECTS section, the R12 entities) is made from that by
+    /// `r12::downgrade`, so the declared version describes the file (issue #68
+    /// was the opposite mistake, and acadsharp-rs-tests#111 the cost of the
+    /// workaround that wrote R13 instead).
     pub(crate) fn writable_version(version: DxfVersion) -> DxfVersion {
-        match version {
-            DxfVersion::AC1009 => DxfVersion::AC1012,
-            other => other,
-        }
+        version
     }
 
     /// Returns true if the target version requires SAB binary format (AC1027+)
