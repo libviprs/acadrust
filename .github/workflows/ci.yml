@@ -16,7 +16,7 @@
 # io/dwg/dwg_stream_writers/object_writer/mod.rs,
 # io/dxf/reader/section_reader.rs, io/dxf/writer/section_writer.rs, lib.rs,
 # nested_copy.rs, objects/mod.rs; and two under tests/:
-# dxf_autocad_conformance.rs, read_visiting.rs (see tests/acadsharp/README.md:31-45).
+# dxf_autocad_conformance.rs, read_visiting.rs (see tests/acadsharp/README.md).
 # A path argument does not scope it: cargo fmt ignores the argument and
 # reformats the whole crate. Scoping a job to the files a PR touches does not
 # help either, because lib.rs is one of the fourteen and any new module has to
@@ -99,70 +99,267 @@ jobs:
       # drawing, the nine real_dwg_roundtrip cases) are #[ignore]d with their
       # reason, so they show up as ignored here and never as passed.
       #
-      # tests/acadsharp_conformance.rs runs here too and skips itself: this job
-      # sets no ACADSHARP_CORPUS. The conformance job below is the one that
-      # means something.
+      # Nothing in the fork looks for a corpus any more: parity is the suite's, and
+      # the `suite` job below is the one that runs it.
       - run: cargo test --locked --no-fail-fast
 
-  conformance:
+  suite:
+    # The fork side of the cross-repo pin: a fork PR runs the parity suite against
+    # its own tree before it merges, so a change that moves a parity verdict cannot
+    # land green here and red there. This job replaces `conformance`, which held a
+    # second copy of the flattener, the comparator and the verdicts (acadrust#18).
+    # The required check on `main` has to be renamed with it: `conformance` out and
+    # `Suite (acadsharp-rs-tests)` in, in the repository's branch protection.
+    #
+    # Deliberately plain, like `MSRV` and `Docs` above, and for the same reason:
+    # a version or a sha in a required check's name means the next bump renames
+    # the context, the old name stays required, and every PR blocks until
+    # somebody edits branch protection (libviprs#1011, libviprs-cli#57).
+    #
+    # This job carries no conditional and swallows no failure, on purpose. A
+    # skipped check is the same colour as a passing one, and a job that can go
+    # green having tested nothing is worth less than no job at all.
+    name: Suite (acadsharp-rs-tests)
     runs-on: ubuntu-latest
     env:
-      ACADSHARP_CORPUS: ${{ github.workspace }}/target/acadsharp-corpus
-      # This job exists to compare, so a missing corpus is a failure here.
-      ACADSHARP_REQUIRE_CORPUS: "1"
+      # `gh api` wants a token even for a public repo's compare endpoint.
+      GH_TOKEN: ${{ github.token }}
+      SUITE_REPO: ${{ github.repository_owner }}/acadsharp-rs-tests
+      # The suite's gate needs all of these, and they are here and not on the
+      # run step for the reason `Test` says at length: a REQUIRE variable that
+      # reaches one step of a job is a guard that is off everywhere the next
+      # step looks. Each turns "I cannot tell" or "there is nothing to run" from
+      # a printed reason into a failure.
+      #
+      # The suite's pin test asserts the sibling sits at the suite's
+      # COUNTERPART_REV. Here it deliberately does not: the sibling is this PR,
+      # which is the whole point. `github.sha` is what actions/checkout laid
+      # down in `acadrust/` for both events this workflow fires on (the
+      # branch head on `push`, the merge commit on `pull_request`), so it is the
+      # sha the suite should be told to expect, rather than
+      # `github.event.pull_request.head.sha`, which is not what is on disk.
+      VIPRS_REQUIRE_COUNTERPART: 1
+      ACADRUST_EXPECTED_SHA: ${{ github.sha }}
+      # The suite's pin test for the fork. Set unconditionally: a suite that
+      # predates the fork pin ignores it.
+      ACADRUST_REQUIRE: 1
+      # Without an archive the suite runs its non-native subset and goes green
+      # having compiled every native test out, and the parity run has nothing to
+      # compare. The fetch step below lays it down; this makes its absence a
+      # failure.
+      ACADSHARP_REQUIRE_NATIVE: 1
+      # The parity run: a missing fixture, frozen output or emitter is red.
+      PARITY_REQUIRE_CORPUS: 1
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Two sibling checkouts under the workspace, because the suite depends on
+      # this fork as `{ path = "../acadrust", optional = true }`. That makes the
+      # parent of the suite checkout the directory that has to hold `acadrust/`, so
+      # neither of them can sit at the workspace root.
+      - uses: actions/checkout@v4
         with:
-          path: target/acadsharp-corpus
-          # The corpus is one pinned libviprs-dep commit, so its bytes change
-          # only when tests/acadsharp/CORPUS.pin changes. On a hit the fetch
-          # script's own early exit (scripts/fetch-acadsharp-corpus.sh:25-28)
-          # skips the clone. No restore-keys on purpose: a corpus fetched at a
-          # different pin is the wrong oracle, not a warm start.
-          key: acadsharp-corpus-${{ hashFiles('tests/acadsharp/CORPUS.pin') }}
-      # Shallow fetch of the pinned commit of the public libviprs/libviprs-dep.
-      # No token: both repositories are public, an anonymous clone is enough.
-      - run: scripts/fetch-acadsharp-corpus.sh "$ACADSHARP_CORPUS"
-      - name: Assert the corpus materialised
-        # The harness now fails on its own when the corpus is absent
-        # (ACADSHARP_REQUIRE_CORPUS=1, set on this job), so this step is no
-        # longer what stops a silent skip. It checks the *right* corpus
-        # arrived, which the harness cannot see.
-        # The pinned commit holds 45 record dumps and 52 fixtures
-        # (tests/acadsharp/README.md:49); the dumps are the geometry oracle and
-        # the harness looks each one up by fixture stem (:92).
+          path: acadrust
+
+      - name: Read SUITE_REV
+        id: pin
+        working-directory: acadrust
         run: |
-          for d in expectations fixtures; do
-            [ -d "$ACADSHARP_CORPUS/$d" ] || {
-              echo "::error::$ACADSHARP_CORPUS/$d is missing: the corpus did not materialise"
+          set -euo pipefail
+          # The first line that is neither blank nor a comment, in one awk
+          # rather than a `grep | head` pipeline: with `pipefail` set, head
+          # closing the pipe can kill grep and turn a fine read into a failed
+          # step. `tests/suite_pin_check.rs` applies the same rule from Rust.
+          rev="$(awk 'NF == 0 { next } $1 ~ /^#/ { next } { print $1; exit }' SUITE_REV)"
+          # 40 lowercase hex, matched in bash so there is no second pipeline to
+          # get wrong. A branch name is never allowed here: guessing one is
+          # exactly what libviprs#1013 is open about.
+          case "$rev" in
+            "" | *[!0-9a-f]*)
+              echo "::error file=SUITE_REV::SUITE_REV must hold one 40-character lowercase sha, and its first non-comment line is '$rev'"
               exit 1
-            }
-          done
-          dumps=$(find "$ACADSHARP_CORPUS/expectations" -name '*.txt' | wc -l | tr -d ' ')
-          dwgs=$(find "$ACADSHARP_CORPUS/fixtures" -name '*.dwg' | wc -l | tr -d ' ')
-          echo "corpus: $dumps record dumps, $dwgs fixtures"
-          [ "$dumps" -eq 45 ] || { echo "::error::$dumps record dumps under expectations/, want exactly 45"; exit 1; }
-          [ "$dwgs" -eq 52 ] || { echo "::error::$dwgs fixtures under fixtures/, want exactly 52"; exit 1; }
-      # Asserts every fixture's verdict against tests/acadsharp/BASELINE.tsv in
-      # both directions: a fixture that got worse fails, and one that got better
-      # fails too and asks to be re-recorded (tests/acadsharp/README.md:221-229).
-      # The two recorded DIFFs are deliberate and are argued in that README
-      # under "Where acadrust is ahead of the recording"; re-recording is a
-      # local step, never a CI one.
-      - run: cargo test --locked --test acadsharp_conformance
-      # The run above compares against the baseline this commit ships, which the
-      # change under test can edit in the same commit (acadrust#10). On a pull
-      # request, compare against the base branch's copy as well: it is not
-      # reachable from inside the PR, and the test reads it through
-      # ACADSHARP_BASELINE because include_str! has already baked the head's in.
-      # This step is red on a PR that deliberately moves a verdict, and that is
-      # the review signal (tests/acadsharp/README.md, "Why a baseline").
-      - name: Compare verdicts against the base branch's recording
-        if: github.event_name == 'pull_request'
+              ;;
+          esac
+          if [ "${#rev}" -ne 40 ]; then
+            echo "::error file=SUITE_REV::SUITE_REV must hold one 40-character lowercase sha, and '$rev' is ${#rev} characters"
+            exit 1
+          fi
+          echo "Pinned acadsharp-rs-tests revision: $rev"
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch acadsharp-rs-tests at exactly SUITE_REV
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          SUITE_REV: ${{ steps.pin.outputs.rev }}
         run: |
-          git fetch --depth 1 origin "$BASE_SHA"
-          git show "$BASE_SHA:tests/acadsharp/BASELINE.tsv" > "$RUNNER_TEMP/base.tsv"
-          ACADSHARP_BASELINE="$RUNNER_TEMP/base.tsv" cargo test --locked --test acadsharp_conformance
+          set -euo pipefail
+          dest="${GITHUB_WORKSPACE}/acadsharp-rs-tests"
+          mkdir -p "$dest"
+          git -C "$dest" init -q
+          git -C "$dest" remote add origin "https://github.com/${SUITE_REPO}.git"
+          # One sha, fetched as a sha. No branch name, no default-branch
+          # fallback, and a fetch that cannot find it is the end of the job.
+          # Not `--depth 1`: the reachability step below asks git whether the
+          # suite's main reaches this pin, and a shallow pin has no parents on
+          # disk, so merge-base could not tell an open suite PR head from an
+          # unrelated history. `--filter=blob:none` keeps it cheap (commits and
+          # trees only); the blobs come down at checkout.
+          if ! git -C "$dest" fetch --quiet --filter=blob:none origin "+refs/heads/main:refs/remotes/origin/main" "$SUITE_REV"; then
+            echo "::error file=SUITE_REV::could not fetch $SUITE_REPO's main and $SUITE_REV. Either that sha does not exist there or the server will not serve it by sha. There is no fallback branch here on purpose."
+            exit 1
+          fi
+          git -C "$dest" checkout -q "$SUITE_REV"
+          got="$(git -C "$dest" rev-parse HEAD)"
+          if [ "$got" != "$SUITE_REV" ]; then
+            echo "::error file=SUITE_REV::asked for $SUITE_REV and the checkout is at $got"
+            exit 1
+          fi
+          echo "Checked out $SUITE_REPO at $got"
+
+      - name: SUITE_REV obeys the merged-only rule
+        env:
+          SUITE_REV: ${{ steps.pin.outputs.rev }}
+        run: |
+          set -euo pipefail
+          # `gh` exits 1 and prints a 404 body when the compare crosses
+          # unrelated histories (a rewritten suite main). Under `set -e` that
+          # would die inside the command substitution with no word about which
+          # pin is wrong, so it is caught here and turned into a refusal that
+          # names SUITE_REV. An unrelated history can never become mergeable,
+          # so this is refused on every ref, PR branches included.
+          if ! status="$(gh api "repos/$SUITE_REPO/compare/main...$SUITE_REV" --jq .status 2>/dev/null)"; then
+            echo "::error file=SUITE_REV::GitHub could not compare $SUITE_REPO's main with SUITE_REV $SUITE_REV (no common ancestor, or the sha is unknown there). A pin on an unrelated history can never merge; move SUITE_REV onto a commit on the suite's main."
+            exit 1
+          fi
+          # GITHUB_REF_NAME is already in this step's environment: `main` on a
+          # push to main, `<number>/merge` on a pull_request event, the branch
+          # name otherwise. The script reads it and decides. It lives in a file
+          # because the `main` arm of the rule cannot be rehearsed by pushing a
+          # branch, so `tests/suite_pin_check.rs` drives it instead.
+          acadrust/tools/suite_pin_check.sh "$status" "$SUITE_REV"
+
+      - name: SUITE_REV is reachable from the suite's main
+        env:
+          SUITE_REV: ${{ steps.pin.outputs.rev }}
+        run: |
+          set -euo pipefail
+          # The same question asked of git instead of the API, so the Docker
+          # path and `cargo test` get it without a token. Same script, same
+          # three-way split.
+          acadrust/tools/suite_pin_check.sh reachable acadsharp-rs-tests/.git "$SUITE_REV"
+
+      # The suite depends on the crate by path too (`{ path = "../acadsharp-rs" }`).
+      # Cargo reads the manifest of every path dependency at resolve time
+      # (rust-lang/cargo#4544), so without `../acadsharp-rs` the `cargo metadata`
+      # below fails at manifest load and nothing about this PR is learned. The
+      # crate is laid down by the pinned suite's own `tools/counterpart.sh`, so
+      # the rule (one sha, fetched as a sha, verified, on the crate's main) is the
+      # suite's and not a copy here. Nothing clones the fork: it is this checkout,
+      # `acadrust/`, beside the suite.
+      - name: Lay the crate down at the suite's COUNTERPART_REV
+        run: |
+          set -euo pipefail
+          suite="${GITHUB_WORKSPACE}/acadsharp-rs-tests"
+          COUNTERPART_NAME=acadsharp-rs \
+            COUNTERPART_REPO="${GITHUB_REPOSITORY_OWNER}/acadsharp-rs" \
+            "$suite/tools/counterpart.sh" clone "${GITHUB_WORKSPACE}/acadsharp-rs"
+
+      # Before the resolution check below, because that check is `cargo
+      # metadata` and cargo has to exist first.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: acadsharp-rs-tests
+
+      - name: The pinned suite resolves this fork as a normal path dependency
+        env:
+          SUITE_REV: ${{ steps.pin.outputs.rev }}
+        run: |
+          set -euo pipefail
+          suite="${GITHUB_WORKSPACE}/acadsharp-rs-tests"
+          fork="$(realpath "${GITHUB_WORKSPACE}/acadrust")"
+          # The suite tests this fork only if it builds against this checkout.
+          # Otherwise it resolves `acadrust` from somewhere else, or does not
+          # depend on it at all, and a green run says nothing about the PR that
+          # produced it. Asking cargo rather than grepping the manifest: a grep
+          # proves the declaration and not the resolution (a `[patch]`, a
+          # workspace member or an entry under `[dev-dependencies]` all satisfy a
+          # text match and change what gets built). `--features acadrust`
+          # because the dependency is optional and absent from the graph without
+          # it.
+          tmp="$(mktemp -d)"
+          if ! cargo metadata --format-version 1 --features acadrust --manifest-path "$suite/Cargo.toml" \
+            >"$tmp/meta.json" 2>"$tmp/meta.err"; then
+            echo "::error file=SUITE_REV::cargo could not resolve the pinned suite's manifest with this fork beside it:"
+            cat "$tmp/meta.err"
+            exit 1
+          fi
+
+          # 1. A package called acadrust is in the graph at all.
+          manifest="$(jq -r '[.packages[] | select(.name == "acadrust") | .manifest_path] | first // empty' "$tmp/meta.json")"
+          if [ -z "$manifest" ]; then
+            echo "::error file=SUITE_REV::the pinned suite does not point back at this fork. cargo resolved no package called acadrust from $SUITE_REV, so running its tests would prove nothing about this PR."
+            exit 1
+          fi
+
+          # 2. It is this checkout and not a registry copy or some other tree.
+          #    `source` is null exactly for a path dependency.
+          source="$(jq -r '[.packages[] | select(.name == "acadrust") | .source] | first' "$tmp/meta.json")"
+          if [ "$source" != "null" ]; then
+            echo "::error file=SUITE_REV::the pinned suite resolves acadrust from $source rather than from this checkout, so its tests are not about this PR."
+            exit 1
+          fi
+          if [ "$(realpath "$manifest")" != "$fork/Cargo.toml" ]; then
+            echo "::error file=SUITE_REV::the pinned suite resolves acadrust at $(realpath "$manifest") and this PR's checkout is $fork, so its tests are about some other tree."
+            exit 1
+          fi
+
+          # 3. It is a normal dependency of the suite (optional, behind the
+          #    feature). `dep_kinds` spells a normal dependency as a null kind.
+          root="$(jq -r '.resolve.root' "$tmp/meta.json")"
+          kinds="$(jq -c --arg root "$root" '[.resolve.nodes[] | select(.id == $root) | .deps[] | select(.name == "acadrust") | .dep_kinds] | first // empty' "$tmp/meta.json")"
+          if [ -z "$kinds" ]; then
+            echo "::error file=SUITE_REV::cargo resolved acadrust but the pinned suite's own package does not depend on it, so nothing it builds reaches this fork."
+            exit 1
+          fi
+          if ! printf '%s' "$kinds" | jq -e 'any(.[]; .kind == null)' >/dev/null; then
+            echo "::error file=SUITE_REV::acadrust has to be a normal dependency of the pinned suite, and cargo says it is $kinds."
+            exit 1
+          fi
+          echo "The pinned suite depends on this checkout ($fork) as a normal path dependency, so its tests are about this tree."
+
+      # Without this the suite runs its non-native subset and goes green having
+      # compiled every native test out, which is the same colour as a pass. The
+      # crate's own guards cannot see over the repo boundary, so the archive has to
+      # be here before the suite builds.
+      # The steps live in a composite action because `Test` needs exactly the
+      # same three and the pin has to move in one place.
+      - name: Fetch the pinned native archive
+        uses: ./acadsharp-rs/.github/actions/fetch-native-archive
+
+      # Which three trees the gate is about to test, each beside the pin that
+      # names it. The acadrust row is this checkout's sha, which is what makes a
+      # green run here about this PR and not about whatever the suite pins.
+      - name: Say which trees the suite's gate tests
+        working-directory: acadsharp-rs-tests
+        run: tools/run-tests.sh --plan
+
+      # The suite's gate, and nothing else: `tools/run-tests.sh --in-ci` is the
+      # same command the pre-push hook runs for a push from this repo, so the
+      # job and the local gate are one script and there is no second copy of the
+      # test lines to keep in step. It runs the suite's own tests, the doc tests
+      # and the parity lane, and the parity lane's failure output is the verdict
+      # diff: the moved row, both verdicts and the first differing record.
+      #
+      # The workflow-level `RUSTFLAGS: -Dwarnings` reaches this too. That matches
+      # what the suite's own CI sets, so the suite is held to the same bar here as
+      # it is at home and this job cannot red on a warning its own repo tolerates.
+      - name: Run the pinned suite's gate against this PR's tree
+        working-directory: acadsharp-rs-tests
+        run: tools/run-tests.sh --in-ci
+
+      # For when Actions comes back. The emitted JSONL, the sidecars and run.json
+      # are where the gate leaves them for a local run; there is no second format
+      # and the diff itself is in the log above.
+      - name: Keep the parity run
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity
+          path: acadsharp-rs-tests/target/parity

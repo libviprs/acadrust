@@ -1,0 +1,15 @@
+# The revision of libviprs/acadsharp-rs-tests that this fork's `Suite
+# (acadsharp-rs-tests)` job runs against its own tree.
+#
+# The same rules as acadsharp-rs' SUITE_REV, from the same script
+# (tools/suite_pin_check.sh): one 40-character sha, fetched as a sha, verified
+# after checkout, and on the suite's main. On a pull request an unmerged pin is a
+# notice (a paired change lands suite first, then this pin moves); on main it is
+# a failure. The first line below that is neither blank nor a comment is the
+# pin.
+#
+# Moved by a one-line PR once the suite change it needs has merged, never ahead
+# of the suite's main.
+00096da1c5bdca9d2384fc44bee6423cdc930c94
+# acadsharp-rs-tests main @ 2026-10-16: the first commit that carries the gate
+# script (tools/run-tests.sh), the parity run and its verdict table.
