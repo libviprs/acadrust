@@ -1,6 +1,7 @@
 //! DXF writer module
 
 mod binary_writer;
+mod r12;
 mod section_writer;
 mod stream_writer;
 mod text_writer;
@@ -55,6 +56,9 @@ impl<'a> DxfWriter<'a> {
 
     /// Write to any writer
     pub fn write_to_writer<W: Write>(&self, writer: W) -> Result<()> {
+        if self.document.version == crate::types::DxfVersion::AC1009 {
+            return self.write_r12(writer);
+        }
         if self.binary {
             let mut stream_writer = DxfBinaryWriter::new(writer)?;
             self.write_dxf(&mut stream_writer)?;
@@ -63,6 +67,24 @@ impl<'a> DxfWriter<'a> {
             let mut stream_writer = DxfTextWriter::new(writer);
             self.write_dxf(&mut stream_writer)?;
             stream_writer.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Write the R12 (AC1009) layout: the R13 structure recorded, taken down
+    /// to what R12 has, and played into the ASCII or binary writer.
+    fn write_r12<W: Write>(&self, writer: W) -> Result<()> {
+        let mut recorder = r12::PairRecorder::new(self.binary);
+        self.write_dxf(&mut recorder)?;
+        let pairs = r12::downgrade(recorder.into_pairs());
+        if self.binary {
+            let mut w = DxfBinaryWriter::new_r12(writer)?;
+            r12::replay(&pairs, &mut w)?;
+            w.flush()?;
+        } else {
+            let mut w = DxfTextWriter::new(writer);
+            r12::replay(&pairs, &mut w)?;
+            w.flush()?;
         }
         Ok(())
     }
