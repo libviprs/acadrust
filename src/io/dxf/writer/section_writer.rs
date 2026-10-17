@@ -3896,7 +3896,14 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         }
 
         self.writer.write_string(7, &mtext.style)?;
-        if mtext.rotation != 0.0 {
+        // Group 50 is the rotation here and the height of each column after the
+        // column marker 75. A reader tells them apart by position alone, so
+        // when column heights follow the rotation is written even at zero:
+        // otherwise the first height is read as the rotation.
+        let column_heights_follow = mtext.column_data.column_type == 2
+            && !mtext.column_data.auto_height
+            && !mtext.column_data.heights.is_empty();
+        if mtext.rotation != 0.0 || column_heights_follow {
             self.writer.write_double(50, mtext.rotation.to_degrees())?;
         }
         // Laid-out text extents (output-only). Skipped when never computed so
