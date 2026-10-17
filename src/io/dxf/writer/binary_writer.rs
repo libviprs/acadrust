@@ -9,6 +9,15 @@ use std::io::Write;
 /// Binary DXF sentinel
 const BINARY_DXF_SENTINEL: &[u8] = b"AutoCAD Binary DXF\r\n\x1a\x00";
 
+/// Byte widths of an integer value in binary DXF.
+#[derive(Clone, Copy)]
+enum IntWidth {
+    One,
+    Two,
+    Four,
+    Eight,
+}
+
 /// Binary DXF stream writer
 pub struct DxfBinaryWriter<W: Write> {
     writer: W,
@@ -86,6 +95,60 @@ impl<W: Write> DxfBinaryWriter<W> {
         Ok(true)
     }
 
+    /// Write an integer at the width the group code fixes in binary DXF.
+    ///
+    /// The format gives every code its own width (16 bits for 60-79, 32 for
+    /// 90-99, one byte for 290-299, and so on), whatever integer type the
+    /// caller happens to hold. A writer that takes the width from the Rust type
+    /// shifts every later group, which is what made readers refuse the file
+    /// (acadsharp-rs-tests#110). A value that does not fit its group is an
+    /// error: writing half of it would corrupt the file without saying so. A
+    /// code the format does not define keeps the width of the caller's type.
+    fn write_integer(&mut self, code: i32, value: i64, native: IntWidth) -> Result<()> {
+        use crate::error::DxfError;
+        use crate::io::dxf::GroupCodeValueType;
+
+        let too_big = || {
+            DxfError::Parse(format!(
+                "value {value} does not fit the width binary DXF gives group {code}"
+            ))
+        };
+        let width = match GroupCodeValueType::from_raw_code(code) {
+            GroupCodeValueType::Bool => IntWidth::One,
+            GroupCodeValueType::Byte | GroupCodeValueType::Int16 => IntWidth::Two,
+            GroupCodeValueType::Int32 => IntWidth::Four,
+            GroupCodeValueType::Int64 => IntWidth::Eight,
+            GroupCodeValueType::Double | GroupCodeValueType::Point3D => {
+                self.write_code(code)?;
+                self.writer.write_f64::<LittleEndian>(value as f64)?;
+                return Ok(());
+            }
+            _ => native,
+        };
+        match width {
+            IntWidth::One => {
+                let v = u8::try_from(value).ok().filter(|v| *v <= 1).ok_or_else(too_big)?;
+                self.write_code(code)?;
+                self.writer.write_u8(v)?;
+            }
+            IntWidth::Two => {
+                let v = i16::try_from(value).map_err(|_| too_big())?;
+                self.write_code(code)?;
+                self.writer.write_i16::<LittleEndian>(v)?;
+            }
+            IntWidth::Four => {
+                let v = i32::try_from(value).map_err(|_| too_big())?;
+                self.write_code(code)?;
+                self.writer.write_i32::<LittleEndian>(v)?;
+            }
+            IntWidth::Eight => {
+                self.write_code(code)?;
+                self.writer.write_i64::<LittleEndian>(value)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Get the inner writer
     pub fn into_inner(self) -> W {
         self.writer
@@ -127,28 +190,20 @@ impl<W: Write> DxfStreamWriter for DxfBinaryWriter<W> {
     }
 
     fn write_byte(&mut self, code: i32, value: u8) -> Result<()> {
-        self.write_code(code)?;
         // Group codes 280-289 are "Byte" type but written as Int16 in binary DXF
-        self.writer.write_i16::<LittleEndian>(value as i16)?;
-        Ok(())
+        self.write_integer(code, i64::from(value), IntWidth::Two)
     }
 
     fn write_i16(&mut self, code: i32, value: i16) -> Result<()> {
-        self.write_code(code)?;
-        self.writer.write_i16::<LittleEndian>(value)?;
-        Ok(())
+        self.write_integer(code, i64::from(value), IntWidth::Two)
     }
 
     fn write_i32(&mut self, code: i32, value: i32) -> Result<()> {
-        self.write_code(code)?;
-        self.writer.write_i32::<LittleEndian>(value)?;
-        Ok(())
+        self.write_integer(code, i64::from(value), IntWidth::Four)
     }
 
     fn write_i64(&mut self, code: i32, value: i64) -> Result<()> {
-        self.write_code(code)?;
-        self.writer.write_i64::<LittleEndian>(value)?;
-        Ok(())
+        self.write_integer(code, value, IntWidth::Eight)
     }
 
     fn write_double(&mut self, code: i32, value: f64) -> Result<()> {
@@ -158,26 +213,10 @@ impl<W: Write> DxfStreamWriter for DxfBinaryWriter<W> {
     }
 
     fn write_bool(&mut self, code: i32, value: bool) -> Result<()> {
-        use crate::io::dxf::GroupCodeValueType;
-
         // Logical flags also occur in integer groups, including history
         // flags 280/281. Their binary width follows the group code, not the
         // Rust value type; only groups 290-299 use a single byte.
-        let value = u8::from(value);
-        match GroupCodeValueType::from_raw_code(code) {
-            GroupCodeValueType::Bool => {
-                self.write_code(code)?;
-                self.writer.write_u8(value)?;
-                Ok(())
-            }
-            GroupCodeValueType::Byte | GroupCodeValueType::Int16 => {
-                self.write_i16(code, i16::from(value))
-            }
-            GroupCodeValueType::Int32 => self.write_i32(code, i32::from(value)),
-            GroupCodeValueType::Int64 => self.write_i64(code, i64::from(value)),
-            GroupCodeValueType::Double => self.write_double(code, f64::from(value)),
-            _ => Err(crate::error::DxfError::InvalidDxfCode(code)),
-        }
+        self.write_integer(code, i64::from(value), IntWidth::One)
     }
 
     fn write_handle(&mut self, code: i32, handle: Handle) -> Result<()> {
@@ -296,5 +335,78 @@ mod tests {
         let str_end = buf[str_start..].iter().position(|&b| b == 0).unwrap() + str_start;
         let written = std::str::from_utf8(&buf[str_start..str_end]).unwrap();
         assert_eq!(written, "Hello\\PWorld\\PFoo\\PBar");
+    }
+}
+
+/// The width of a group's value in binary DXF is fixed by its code, whatever
+/// Rust type the caller holds. These tests hold the writer to the table in
+/// the DXF reference, code by code (acadsharp-rs-tests#110).
+#[cfg(test)]
+mod width_tests {
+    use super::*;
+
+    /// Bytes a value of this code occupies after the two-byte code, or None
+    /// for the codes whose value is a string or a length-prefixed chunk.
+    fn width(code: i32) -> Option<usize> {
+        match code {
+            10..=59 | 110..=149 | 210..=239 | 460..=469 | 1010..=1059 => Some(8),
+            60..=79 | 170..=179 | 270..=289 | 370..=389 | 400..=409 | 1060..=1070 => Some(2),
+            90..=99 | 420..=429 | 440..=459 | 1071 => Some(4),
+            160..=169 => Some(8),
+            290..=299 => Some(1),
+            _ => None,
+        }
+    }
+
+    fn written(f: impl FnOnce(&mut DxfBinaryWriter<&mut Vec<u8>>) -> Result<()>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut w = DxfBinaryWriter::new(&mut buf).unwrap();
+            f(&mut w).unwrap();
+        }
+        buf[BINARY_DXF_SENTINEL.len()..].to_vec()
+    }
+
+    #[test]
+    fn integers_take_the_width_of_the_code_and_not_of_the_rust_type() {
+        for code in 0..=1071 {
+            let Some(w) = width(code) else { continue };
+            if w == 8 && !(160..=169).contains(&code) {
+                continue; // doubles: covered below
+            }
+            for (name, bytes) in [
+                ("write_i16", written(|x| x.write_i16(code, 1))),
+                ("write_i32", written(|x| x.write_i32(code, 1))),
+                ("write_i64", written(|x| x.write_i64(code, 1))),
+                ("write_byte", written(|x| x.write_byte(code, 1))),
+                ("write_bool", written(|x| x.write_bool(code, true))),
+            ] {
+                assert_eq!(
+                    bytes.len(),
+                    2 + w,
+                    "{name} on group {code} wrote {} value bytes, the format has {w}",
+                    bytes.len().saturating_sub(2)
+                );
+                assert_eq!(bytes[0..2], (code as i16).to_le_bytes());
+                assert_eq!(bytes[2], 1, "{name} on group {code} lost the value");
+            }
+        }
+    }
+
+    #[test]
+    fn a_double_takes_eight_bytes_on_a_double_code() {
+        for code in (10..=59).chain(110..=149).chain(210..=239).chain(460..=469) {
+            let bytes = written(|x| x.write_double(code, 1.5));
+            assert_eq!(bytes.len(), 10, "group {code}");
+            assert_eq!(bytes[2..], 1.5f64.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn a_value_that_does_not_fit_its_group_is_an_error_and_not_a_truncation() {
+        let mut buf = Vec::new();
+        let mut w = DxfBinaryWriter::new(&mut buf).unwrap();
+        assert!(w.write_i32(73, 70_000).is_err());
+        assert!(w.write_i32(290, 2).is_err());
     }
 }
