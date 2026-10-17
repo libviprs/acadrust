@@ -745,10 +745,10 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
     // R2000+ dimension handles
     if r2000_plus(v) {
         w.write_handle_ref(DwgReferenceType::HardPointer, h.dim_text_style_handle);
-        w.write_handle_ref(DwgReferenceType::HardPointer, Handle::NULL); // DIMLDRBLK
-        w.write_handle_ref(DwgReferenceType::HardPointer, Handle::NULL); // DIMBLK
-        w.write_handle_ref(DwgReferenceType::HardPointer, Handle::NULL); // DIMBLK1
-        w.write_handle_ref(DwgReferenceType::HardPointer, Handle::NULL); // DIMBLK2
+        w.write_handle_ref(DwgReferenceType::HardPointer, h.dim_leader_arrow_block_handle);
+        w.write_handle_ref(DwgReferenceType::HardPointer, h.dim_arrow_block_handle);
+        w.write_handle_ref(DwgReferenceType::HardPointer, h.dim_arrow_block1_handle);
+        w.write_handle_ref(DwgReferenceType::HardPointer, h.dim_arrow_block2_handle);
     }
 
     // R2007+ dimension linetype handles
