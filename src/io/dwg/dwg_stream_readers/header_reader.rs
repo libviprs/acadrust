@@ -674,10 +674,10 @@ fn read_header_fields(r: &mut SectionReader, v: DxfVersion, h: &mut HeaderVariab
     // R2000+ dimension handles
     if r2000_plus(v) {
         h.dim_text_style_handle = Handle::new(r.read_handle());
-        let _ = r.read_handle(); // DIMLDRBLK
-        let _ = r.read_handle(); // DIMBLK
-        let _ = r.read_handle(); // DIMBLK1
-        let _ = r.read_handle(); // DIMBLK2
+        h.dim_leader_arrow_block_handle = Handle::new(r.read_handle());
+        h.dim_arrow_block_handle = Handle::new(r.read_handle());
+        h.dim_arrow_block1_handle = Handle::new(r.read_handle());
+        h.dim_arrow_block2_handle = Handle::new(r.read_handle());
     }
 
     // R2007+ dimension linetype handles
