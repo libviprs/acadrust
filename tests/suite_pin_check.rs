@@ -513,6 +513,6 @@ fn the_suite_job_lays_the_crate_down_before_it_asks_cargo_anything() {
     let lay = job
         .find("COUNTERPART_NAME=acadsharp-rs")
         .expect("the suite job never lays acadsharp-rs down");
-    let meta = job.find("cargo metadata").expect("the suite job never runs cargo metadata");
+    let meta = job.find("cargo metadata --format-version").expect("the suite job never runs cargo metadata");
     assert!(lay < meta, "the crate is laid down after cargo metadata has already run:\n{job}");
 }
