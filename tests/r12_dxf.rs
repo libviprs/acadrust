@@ -113,7 +113,7 @@ fn r12_writes_the_polyline_in_its_heavy_form_and_text_for_mtext() {
     );
     let texts: Vec<&String> = p
         .iter()
-        .skip_while(|(c, v)| !(*c == 0 && v == "ENTITIES"))
+        .skip_while(|(c, v)| !(*c == 2 && v == "ENTITIES"))
         .filter(|(c, _)| *c == 1)
         .map(|(_, v)| v)
         .collect();
