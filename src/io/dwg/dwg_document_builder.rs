@@ -2939,6 +2939,29 @@ impl DwgDocumentBuilder {
             document.header.current_dimstyle_name = ds.name.clone();
         }
 
+        // The dimension text style and linetypes are handles in the DWG header too.
+        if let Some(style) = document
+            .text_styles
+            .iter()
+            .find(|s| s.handle == document.header.dim_text_style_handle)
+        {
+            document.header.dim_text_style_name = style.name.clone();
+        }
+        for (handle, slot) in [
+            (document.header.dim_linetype_handle, 0usize),
+            (document.header.dim_linetype1_handle, 1),
+            (document.header.dim_linetype2_handle, 2),
+        ] {
+            if let Some(lt) = document.line_types.iter().find(|l| l.handle == handle) {
+                let name = lt.name.clone();
+                match slot {
+                    0 => document.header.dim_linetype_name = name,
+                    1 => document.header.dim_linetype1_name = name,
+                    _ => document.header.dim_linetype2_name = name,
+                }
+            }
+        }
+
         // The arrow blocks of the dimension variables (R2000+ keep a handle
         // where R14 kept the name). The variable holds the arrowhead's name, and
         // a standard one is a block named with an underscore in front.

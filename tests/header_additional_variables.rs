@@ -107,6 +107,7 @@ fn the_dxf_reader_takes_them_too() {
     let text = "  0\nSECTION\n  2\nHEADER\n  9\n$ACADVER\n  1\nAC1032\n\
   9\n$DIMFXL\n 40\n2.5\n  9\n$DIMFXLON\n290\n     1\n  9\n$DIMMZS\n  1\nxx\n\
   9\n$DIMTFILLCLR\n 62\n     6\n  9\n$PELLIPSE\n 70\n     1\n  9\n$CSHADOW\n280\n     2\n\
+  9\n$DIMTXSTY\n  7\nMyDimText\n  9\n$DIMLTYPE\n  6\nBATTING\n  9\n$DIMLTEX1\n  6\nTRACKS\n\
   9\n$UCSORGTOP\n 10\n1.0\n 20\n2.0\n 30\n3.0\n  9\n$PUCSORGBACK\n 10\n4.0\n 20\n5.0\n 30\n6.0\n\
   0\nENDSEC\n  0\nEOF\n";
     let h = DxfReader::from_reader(Cursor::new(text.as_bytes().to_vec()))
@@ -116,6 +117,9 @@ fn the_dxf_reader_takes_them_too() {
         .header;
     assert_eq!(h.dim_fixed_ext_length, 2.5);
     assert!(h.dim_fixed_ext_length_on);
+    assert_eq!(h.dim_text_style_name, "MyDimText");
+    assert_eq!(h.dim_linetype_name, "BATTING");
+    assert_eq!(h.dim_linetype1_name, "TRACKS");
     assert_eq!(h.dim_mzs, "xx");
     assert_eq!(h.dim_text_fill_color, Color::from_index(6));
     assert!(h.polyline_ellipse);

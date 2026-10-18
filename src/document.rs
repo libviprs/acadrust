@@ -556,6 +556,14 @@ pub struct HeaderVariables {
     pub dim_arrow_block2_handle: Handle,
     /// Dimension leader arrow block handle (DIMLDRBLK)
     pub dim_leader_arrow_block_handle: Handle,
+    /// DIMTXSTY - name of the dimension text style
+    pub dim_text_style_name: String,
+    /// DIMLTYPE - name of the dimension line linetype
+    pub dim_linetype_name: String,
+    /// DIMLTEX1 - name of the first extension line linetype
+    pub dim_linetype1_name: String,
+    /// DIMLTEX2 - name of the second extension line linetype
+    pub dim_linetype2_name: String,
     /// DIMFIT - the R13 fit variable that R2000 replaced with DIMATFIT
     pub dim_fit_r13: i16,
     /// DIMUNIT - the R13 unit format variable that R2000 replaced with DIMLUNIT
@@ -965,11 +973,15 @@ impl Default for HeaderVariables {
             dim_arrow_block_handle: Handle::NULL,
             dim_arrow_block1_handle: Handle::NULL,
             dim_leader_arrow_block_handle: Handle::NULL,
+            dim_text_style_name: String::from("Standard"),
+            dim_linetype_name: String::from("ByBlock"),
+            dim_linetype1_name: String::from("ByBlock"),
+            dim_linetype2_name: String::from("ByBlock"),
             dim_fit_r13: 0,
             dim_unit: 0,
-            dim_fixed_ext_length: 0.0,
+            dim_fixed_ext_length: 1.0,
             dim_fixed_ext_length_on: false,
-            dim_jog_angle: 0.7854,
+            dim_jog_angle: std::f64::consts::FRAC_PI_4,
             dim_text_fill: 0,
             dim_text_fill_color: Color::ByBlock,
             dim_arc_symbol: 0,
