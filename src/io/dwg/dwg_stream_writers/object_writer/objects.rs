@@ -310,6 +310,11 @@ impl<'a> DwgObjectWriter<'a> {
             {
                 o.dxf_name()
             }
+            ObjectType::Associative(o) => {
+                let prefixed = format!("ACDB{}", crate::objects::associative_canonical_name(&o.dxf_name));
+                return self.document.classes.get_by_name(&o.dxf_name).is_none()
+                    && self.document.classes.get_by_name(&prefixed).is_none();
+            }
             ObjectType::Field(_) => "FIELD",
             ObjectType::FieldList(_) => "FIELDLIST",
             ObjectType::DynamicBlock(o) => o.dxf_name.as_str(),

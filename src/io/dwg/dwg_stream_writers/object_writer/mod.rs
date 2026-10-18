@@ -2569,6 +2569,24 @@ mod unregistered_class_tests {
     }
 
     #[test]
+    fn an_associative_object_with_no_registered_class_is_left_out_of_an_older_save() {
+        use crate::objects::AssociativeObject;
+        for version in [DxfVersion::AC1014, DxfVersion::AC1015, DxfVersion::AC1018] {
+            let mut doc = CadDocument::with_version(version);
+            let handle = Handle::new(0x7100);
+            let mut object = AssociativeObject::new("ACDBASSOCPERSSUBENTMANAGER", "AcDbAssocPersSubentManager");
+            object.handle = handle;
+            doc.objects.insert(handle, ObjectType::Associative(object));
+            doc.classes.clear();
+            let (_, handles, _, _) = DwgObjectWriter::new(&doc).unwrap().write();
+            assert!(
+                !handles.iter().any(|(h, _)| *h == 0x7100),
+                "{version:?}: an associative object of an unregistered class was written as type 500"
+            );
+        }
+    }
+
+    #[test]
     fn a_same_version_save_keeps_it() {
         assert!(written_handles(DxfVersion::AC1015, Some(DxfVersion::AC1015)).contains(&0x7000));
     }
