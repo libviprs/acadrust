@@ -556,6 +556,68 @@ pub struct HeaderVariables {
     pub dim_arrow_block2_handle: Handle,
     /// Dimension leader arrow block handle (DIMLDRBLK)
     pub dim_leader_arrow_block_handle: Handle,
+    /// DIMTXSTY - name of the dimension text style
+    pub dim_text_style_name: String,
+    /// DIMLTYPE - name of the dimension line linetype
+    pub dim_linetype_name: String,
+    /// DIMLTEX1 - name of the first extension line linetype
+    pub dim_linetype1_name: String,
+    /// DIMLTEX2 - name of the second extension line linetype
+    pub dim_linetype2_name: String,
+    /// DIMFIT - the R13 fit variable that R2000 replaced with DIMATFIT
+    pub dim_fit_r13: i16,
+    /// DIMUNIT - the R13 unit format variable that R2000 replaced with DIMLUNIT
+    pub dim_unit: i16,
+    /// DIMFXL - fixed extension line length
+    pub dim_fixed_ext_length: f64,
+    /// DIMFXLON - extension line length is fixed
+    pub dim_fixed_ext_length_on: bool,
+    /// DIMJOGANG - jogged radius dimension transverse segment angle
+    pub dim_jog_angle: f64,
+    /// DIMTFILL - text background fill mode
+    pub dim_text_fill: i16,
+    /// DIMTFILLCLR - text background fill colour
+    pub dim_text_fill_color: Color,
+    /// DIMARCSYM - arc length symbol placement
+    pub dim_arc_symbol: i16,
+    /// DIMTXTDIRECTION - text reads right to left
+    pub dim_text_direction: bool,
+    /// DIMALTMZF - alternate units zero suppression scale factor
+    pub dim_alt_mzf: f64,
+    /// DIMALTMZS - alternate units zero suppression text
+    pub dim_alt_mzs: String,
+    /// DIMMZF - zero suppression scale factor
+    pub dim_mzf: f64,
+    /// DIMMZS - zero suppression text
+    pub dim_mzs: String,
+    /// UNITMODE
+    pub unit_mode: i16,
+    /// PELLIPSE
+    pub polyline_ellipse: bool,
+    /// 3DDWFPREC
+    pub dwf_3d_precision: f64,
+    /// PSOLWIDTH
+    pub polysolid_width: f64,
+    /// PSOLHEIGHT
+    pub polysolid_height: f64,
+    /// LIGHTGLYPHDISPLAY
+    pub light_glyph_display: i16,
+    /// TILEMODELIGHTSYNCH
+    pub tile_model_light_synch: i16,
+    /// DWFFRAME
+    pub dwf_frame: i16,
+    /// DGNFRAME
+    pub dgn_frame: i16,
+    /// CSHADOW
+    pub cast_shadow: i16,
+    /// INTERFERECOLOR
+    pub interfere_color: Color,
+    /// PUCSBASE - name of the UCS the paper space orthographic origins are relative to
+    pub paper_ucs_base: String,
+    /// UCSORGTOP, BOTTOM, LEFT, RIGHT, FRONT, BACK
+    pub ucs_ortho_origins: [Vector3; 6],
+    /// PUCSORGTOP, BOTTOM, LEFT, RIGHT, FRONT, BACK
+    pub paper_ucs_ortho_origins: [Vector3; 6],
     /// DIMLWD - Dimension line weight
     pub dim_line_weight: i16,
     /// DIMLWE - Extension line weight
@@ -911,6 +973,37 @@ impl Default for HeaderVariables {
             dim_arrow_block_handle: Handle::NULL,
             dim_arrow_block1_handle: Handle::NULL,
             dim_leader_arrow_block_handle: Handle::NULL,
+            dim_text_style_name: String::from("Standard"),
+            dim_linetype_name: String::from("ByBlock"),
+            dim_linetype1_name: String::from("ByBlock"),
+            dim_linetype2_name: String::from("ByBlock"),
+            dim_fit_r13: 0,
+            dim_unit: 0,
+            dim_fixed_ext_length: 1.0,
+            dim_fixed_ext_length_on: false,
+            dim_jog_angle: std::f64::consts::FRAC_PI_4,
+            dim_text_fill: 0,
+            dim_text_fill_color: Color::ByBlock,
+            dim_arc_symbol: 0,
+            dim_text_direction: false,
+            dim_alt_mzf: 0.0,
+            dim_alt_mzs: String::new(),
+            dim_mzf: 0.0,
+            dim_mzs: String::new(),
+            unit_mode: 0,
+            polyline_ellipse: false,
+            dwf_3d_precision: 2.0,
+            polysolid_width: 0.25,
+            polysolid_height: 0.25,
+            light_glyph_display: 0,
+            tile_model_light_synch: 1,
+            dwf_frame: 0,
+            dgn_frame: 0,
+            cast_shadow: 0,
+            interfere_color: Color::from_index(257),
+            paper_ucs_base: String::new(),
+            ucs_ortho_origins: [Vector3::ZERO; 6],
+            paper_ucs_ortho_origins: [Vector3::ZERO; 6],
             dim_arrow_block2_handle: Handle::NULL,
             dim_line_weight: -2,     // ByBlock
             dim_ext_line_weight: -2, // ByBlock

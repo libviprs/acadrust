@@ -410,7 +410,7 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
     }
 
     w.write_bit(h.display_silhouette);
-    w.write_bit(false); // PELLIPSE (CreateEllipseAsPolyline) — default false
+    w.write_bit(h.polyline_ellipse); // PELLIPSE
     w.write_bit_short(h.proxy_graphics);
 
     if r13_14_only(v) {
@@ -461,7 +461,7 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
     w.write_bit_short(h.spline_type);
     w.write_bit_short(h.shade_edge);
     w.write_bit_short(h.shade_diffuse);
-    w.write_bit_short(0); // UNITMODE — default 0
+    w.write_bit_short(h.unit_mode); // UNITMODE
     w.write_bit_short(h.max_active_viewports);
     w.write_bit_short(h.isolines);
     w.write_bit_short(h.multiline_justification);
@@ -555,13 +555,10 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
         // PUCSBASE
         w.write_handle_ref(DwgReferenceType::HardPointer, Handle::NULL);
 
-        // Paper space orthographic origins (6 × 3BD) — default zeros
-        w.write_3bit_double(Vector3::ZERO); // PUCSORGTOP
-        w.write_3bit_double(Vector3::ZERO); // PUCSORGBOTTOM
-        w.write_3bit_double(Vector3::ZERO); // PUCSORGLEFT
-        w.write_3bit_double(Vector3::ZERO); // PUCSORGRIGHT
-        w.write_3bit_double(Vector3::ZERO); // PUCSORGFRONT
-        w.write_3bit_double(Vector3::ZERO); // PUCSORGBACK
+        // Paper space orthographic origins (6 × 3BD): top, bottom, left, right, front, back
+        for origin in &h.paper_ucs_ortho_origins {
+            w.write_3bit_double(*origin);
+        }
     }
 
     // ── Model space extents/limits/UCS ──
@@ -585,13 +582,10 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
         // UCSBASE
         w.write_handle_ref(DwgReferenceType::HardPointer, Handle::NULL);
 
-        // Model space orthographic origins (6 × 3BD) — default zeros
-        w.write_3bit_double(Vector3::ZERO); // UCSORGTOP
-        w.write_3bit_double(Vector3::ZERO); // UCSORGBOTTOM
-        w.write_3bit_double(Vector3::ZERO); // UCSORGLEFT
-        w.write_3bit_double(Vector3::ZERO); // UCSORGRIGHT
-        w.write_3bit_double(Vector3::ZERO); // UCSORGFRONT
-        w.write_3bit_double(Vector3::ZERO); // UCSORGBACK
+        // Model space orthographic origins (6 × 3BD): top, bottom, left, right, front, back
+        for origin in &h.ucs_ortho_origins {
+            w.write_3bit_double(*origin);
+        }
 
         // DIMPOST, DIMAPOST
         w.write_variable_text(&h.dim_post);
@@ -623,7 +617,7 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
         w.write_byte(h.dim_alt_tolerance_zero_suppression as u8);
         w.write_byte(h.dim_alt_tolerance_zero_tight as u8);
         w.write_byte(h.dim_text_above as u8);
-        w.write_bit_short(0); // DIMUNIT
+        w.write_bit_short(h.dim_unit); // DIMUNIT
         w.write_bit_short(h.dim_angular_decimal_places);
         w.write_bit_short(h.dim_decimal_places);
         w.write_bit_short(h.dim_tolerance_decimal_places);
@@ -647,10 +641,10 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
 
     // R2007+ dimension extras
     if r2007_plus(v) {
-        w.write_bit_double(0.0); // DIMFXL
-        w.write_bit_double(0.7854); // DIMJOGANG (default 45°)
-        w.write_bit_short(0); // DIMTFILL
-        w.write_cm_color(&Color::ByBlock); // DIMTFILLCLR
+        w.write_bit_double(h.dim_fixed_ext_length); // DIMFXL
+        w.write_bit_double(h.dim_jog_angle); // DIMJOGANG
+        w.write_bit_short(h.dim_text_fill); // DIMTFILL
+        w.write_cm_color(&h.dim_text_fill_color); // DIMTFILLCLR
     }
 
     // R2000+ dimension flags
@@ -667,7 +661,7 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
     }
 
     if r2007_plus(v) {
-        w.write_bit_short(0); // DIMARCSYM
+        w.write_bit_short(h.dim_arc_symbol); // DIMARCSYM
     }
 
     // ── Dimension sizes (Common) ──
@@ -730,16 +724,16 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
 
     // R2007+: DIMFXLON
     if r2007_plus(v) {
-        w.write_bit(false); // DimensionIsExtensionLineLengthFixed
+        w.write_bit(h.dim_fixed_ext_length_on); // DIMFXLON
     }
 
     // R2010+: extra dimension fields
     if r2010_plus(v) {
-        w.write_bit(false); // DIMTXTDIRECTION
-        w.write_bit_double(0.0); // DIMALTMZF
-        w.write_variable_text(""); // DIMALTMZS
-        w.write_bit_double(0.0); // DIMMZF
-        w.write_variable_text(""); // DIMMZS
+        w.write_bit(h.dim_text_direction); // DIMTXTDIRECTION
+        w.write_bit_double(h.dim_alt_mzf); // DIMALTMZF
+        w.write_variable_text(&h.dim_alt_mzs); // DIMALTMZS
+        w.write_bit_double(h.dim_mzf); // DIMMZF
+        w.write_variable_text(&h.dim_mzs); // DIMMZS
     }
 
     // R2000+ dimension handles
@@ -887,13 +881,13 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
 
         w.write_bit_double(h.steps_per_second);
         w.write_bit_double(h.step_size);
-        w.write_bit_double(2.0); // 3DDWFPREC — valid range 1..6
+        w.write_bit_double(h.dwf_3d_precision); // 3DDWFPREC
         w.write_bit_double(h.lens_length);
         w.write_bit_double(h.camera_height);
         w.write_byte(u8::from(h.record_solid_history));
         w.write_byte(h.show_solid_history.clamp(0, 2) as u8);
-        w.write_bit_double(0.25); // PSOLWIDTH — valid range >0
-        w.write_bit_double(0.25); // PSOLHEIGHT
+        w.write_bit_double(h.polysolid_width); // PSOLWIDTH
+        w.write_bit_double(h.polysolid_height); // PSOLHEIGHT
         w.write_bit_double(h.loft_angle1);
         w.write_bit_double(h.loft_angle2);
         w.write_bit_double(h.loft_magnitude1);
@@ -904,20 +898,20 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
         w.write_bit_double(h.longitude);
         w.write_bit_double(h.north_direction);
         w.write_bit_long(h.timezone);
-        w.write_byte(0); // LIGHTGLYPHDISPLAY
-        w.write_byte(1); // TILEMODELIGHTSYNCH — valid range 0..1
-        w.write_byte(0); // DWFFRAME
-        w.write_byte(0); // DGNFRAME
+        w.write_byte(h.light_glyph_display as u8); // LIGHTGLYPHDISPLAY
+        w.write_byte(h.tile_model_light_synch as u8); // TILEMODELIGHTSYNCH
+        w.write_byte(h.dwf_frame as u8); // DWFFRAME
+        w.write_byte(h.dgn_frame as u8); // DGNFRAME
 
         w.write_bit(false); // unknown
 
-        w.write_cm_color(&Color::from_index(h.intersection_color));
+        w.write_cm_color(&h.interfere_color);
 
         w.write_handle_ref(DwgReferenceType::HardPointer, Handle::NULL); // INTERFEREOBJVS
         w.write_handle_ref(DwgReferenceType::HardPointer, Handle::NULL); // INTERFEREVPVS
         w.write_handle_ref(DwgReferenceType::HardPointer, Handle::NULL); // DRAGVS
 
-        w.write_byte(0); // CSHADOW
+        w.write_byte(h.cast_shadow as u8); // CSHADOW
         w.write_bit_double(h.shadow_plane_location);
     }
 
