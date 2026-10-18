@@ -4607,8 +4607,18 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 self.writer.write_double(10, arc.center.x)?;
                 self.writer.write_double(20, arc.center.y)?;
                 self.writer.write_double(40, arc.radius)?;
-                self.writer.write_double(50, arc.start_angle.to_degrees())?;
-                self.writer.write_double(51, arc.end_angle.to_degrees())?;
+                // AutoCAD stores a clockwise edge's angles as 360 minus each
+                // (ezdxf's ArcEdge says the same), so the file says the same arc.
+                let (start, end) = if arc.counter_clockwise {
+                    (arc.start_angle.to_degrees(), arc.end_angle.to_degrees())
+                } else {
+                    (
+                        360.0 - arc.start_angle.to_degrees(),
+                        360.0 - arc.end_angle.to_degrees(),
+                    )
+                };
+                self.writer.write_double(50, start)?;
+                self.writer.write_double(51, end)?;
                 self.writer
                     .write_i16(73, if arc.counter_clockwise { 1 } else { 0 })?;
             }
