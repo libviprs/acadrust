@@ -195,6 +195,14 @@ pub trait DxfStreamReader {
         // Default: no-op
     }
 
+    /// Set the drawing's legacy code page: strings that are not UTF-8 are
+    /// decoded with it, and MIF `\U+XXXX` escapes (what the page cannot hold)
+    /// are decoded to the characters they name, under the same gate as the DWG
+    /// reader.
+    fn set_code_page(&mut self, code_page: crate::io::dxf::code_page::LegacyCodePage) {
+        self.set_encoding(code_page.encoding());
+    }
+
     fn diagnostic_context(&self) -> DxfStreamContext {
         DxfStreamContext::default()
     }

@@ -26,9 +26,21 @@ pub struct DxfBinaryWriter<W: Write> {
     short_codes: bool,
     /// Stack buffer for formatting handles without heap allocation.
     hex_buf: [u8; 17],
+    /// The legacy code page a pre-2007 file is written in. `None` writes UTF-8.
+    legacy: Option<&'static encoding_rs::Encoding>,
 }
 
 impl<W: Write> DxfBinaryWriter<W> {
+    /// Write strings in `encoding`, with MIF `\U+XXXX` for what it cannot hold,
+    /// as a pre-2007 file declares in `$DWGCODEPAGE`.
+    pub fn with_legacy_encoding(
+        mut self,
+        encoding: Option<&'static encoding_rs::Encoding>,
+    ) -> Self {
+        self.legacy = encoding;
+        self
+    }
+
     /// Create a new binary DXF writer
     pub fn new(mut writer: W) -> Result<Self> {
         // Write the binary sentinel at the start
@@ -37,6 +49,7 @@ impl<W: Write> DxfBinaryWriter<W> {
             writer,
             short_codes: false,
             hex_buf: [0u8; 17],
+            legacy: None,
         })
     }
 
@@ -64,7 +77,13 @@ impl<W: Write> DxfBinaryWriter<W> {
 
     /// Write a null-terminated string
     fn write_null_string(&mut self, value: &str) -> Result<()> {
-        self.writer.write_all(value.as_bytes())?;
+        match self.legacy {
+            Some(enc) if !value.is_ascii() => {
+                let bytes = crate::io::dxf::code_page::encode_legacy_string(value, enc);
+                self.writer.write_all(&bytes)?;
+            }
+            _ => self.writer.write_all(value.as_bytes())?,
+        }
         self.writer.write_u8(0)?;
         Ok(())
     }
@@ -147,7 +166,10 @@ impl<W: Write> DxfBinaryWriter<W> {
         };
         match width {
             IntWidth::One => {
-                let v = u8::try_from(value).ok().filter(|v| *v <= 1).ok_or_else(too_big)?;
+                let v = u8::try_from(value)
+                    .ok()
+                    .filter(|v| *v <= 1)
+                    .ok_or_else(too_big)?;
                 self.write_code(code)?;
                 self.writer.write_u8(v)?;
             }
