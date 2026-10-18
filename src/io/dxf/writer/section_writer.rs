@@ -3678,6 +3678,10 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             self.writer.write_double(41, polyline.end_width)?;
         }
 
+        // The extrusion of the OCS the vertices are in (the LWPOLYLINE form has
+        // always written it; the heavy form dropped it, libviprs/acadsharp-rs-tests#160).
+        self.write_normal(polyline.normal)?;
+
         // XDATA precedes the child VERTEX/SEQEND records.
         self.write_xdata(&polyline.common.extended_data)?;
 
