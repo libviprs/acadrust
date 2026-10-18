@@ -287,8 +287,42 @@ fn matrix_to_row_major(m: &crate::types::Matrix4) -> [f64; 12] {
 impl<'a> DwgObjectWriter<'a> {
     // ── Object dispatch ─────────────────────────────────────────────
 
+    /// Whether a class-based object has no class in the output. Its type code
+    /// would be the fallback 500, the first class of the file, and a reader
+    /// would decode it as that class and lose its place in the stream. A save
+    /// back to the version the drawing came from keeps the class numbers it
+    /// carries, so only a save to another version leaves such an object out
+    /// (libviprs/acadsharp-rs-tests#112).
+    pub(super) fn lacks_class(&self, obj: &ObjectType) -> bool {
+        if self.document.dwg_source_version == Some(self.dxf_version) {
+            return false;
+        }
+        let name = match obj {
+            ObjectType::ClassObject(o) if !matches!(o.data, ClassObjectData::VbaProject(_)) => {
+                o.dxf_name()
+            }
+            ObjectType::DataObject(o)
+                if !matches!(
+                    o.data,
+                    crate::objects::DataObjectData::Dummy
+                        | crate::objects::DataObjectData::LongTransaction
+                ) =>
+            {
+                o.dxf_name()
+            }
+            ObjectType::Field(_) => "FIELD",
+            ObjectType::FieldList(_) => "FIELDLIST",
+            ObjectType::DynamicBlock(o) => o.dxf_name.as_str(),
+            _ => return false,
+        };
+        self.document.classes.get_by_name(name).is_none()
+    }
+
     /// Write a single non-graphical object record.
     pub(super) fn write_object(&mut self, obj: &ObjectType) {
+        if self.lacks_class(obj) {
+            return;
+        }
         match obj {
             ObjectType::Dictionary(d) => self.write_dictionary(d),
             ObjectType::Layout(l) => self.write_layout(l),
@@ -1363,6 +1397,14 @@ impl<'a> DwgObjectWriter<'a> {
 
     /// Returns `true` when the record at `handle` will be serialized.
     pub(super) fn is_writable_object(&self, handle: &Handle) -> bool {
+        if self
+            .document
+            .objects
+            .get(handle)
+            .is_some_and(|obj| self.lacks_class(obj))
+        {
+            return false;
+        }
         match self.document.objects.get(handle) {
             None => match self.document.get_entity(*handle) {
                 Some(crate::entities::EntityType::Unknown(entity)) => entity
