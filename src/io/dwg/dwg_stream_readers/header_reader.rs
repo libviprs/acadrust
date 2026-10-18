@@ -344,7 +344,7 @@ fn read_header_fields(r: &mut SectionReader, v: DxfVersion, h: &mut HeaderVariab
     }
 
     h.display_silhouette = r.read_bit();
-    let _ = r.read_bit(); // PELLIPSE
+    h.polyline_ellipse = r.read_bit(); // PELLIPSE
     h.proxy_graphics = r.read_bit_short();
 
     if r13_14_only(v) {
@@ -395,7 +395,7 @@ fn read_header_fields(r: &mut SectionReader, v: DxfVersion, h: &mut HeaderVariab
     h.spline_type = r.read_bit_short();
     h.shade_edge = r.read_bit_short();
     h.shade_diffuse = r.read_bit_short();
-    let _ = r.read_bit_short(); // UNITMODE
+    h.unit_mode = r.read_bit_short(); // UNITMODE
     h.max_active_viewports = r.read_bit_short();
     h.isolines = r.read_bit_short();
     h.multiline_justification = r.read_bit_short();
@@ -487,12 +487,9 @@ fn read_header_fields(r: &mut SectionReader, v: DxfVersion, h: &mut HeaderVariab
         let _ = r.read_handle(); // PUCSBASE
 
         // Paper space orthographic origins (6 × 3BD)
-        let _ = r.read_3bit_double(); // PUCSORGTOP
-        let _ = r.read_3bit_double(); // PUCSORGBOTTOM
-        let _ = r.read_3bit_double(); // PUCSORGLEFT
-        let _ = r.read_3bit_double(); // PUCSORGRIGHT
-        let _ = r.read_3bit_double(); // PUCSORGFRONT
-        let _ = r.read_3bit_double(); // PUCSORGBACK
+        for origin in h.paper_ucs_ortho_origins.iter_mut() {
+            *origin = r.read_3bit_double(); // PUCSORGTOP, BOTTOM, LEFT, RIGHT, FRONT, BACK
+        }
     }
 
     // ── Model space extents/limits/UCS ──
@@ -515,12 +512,9 @@ fn read_header_fields(r: &mut SectionReader, v: DxfVersion, h: &mut HeaderVariab
         let _ = r.read_handle(); // UCSBASE
 
         // Model space orthographic origins (6 × 3BD)
-        let _ = r.read_3bit_double(); // UCSORGTOP
-        let _ = r.read_3bit_double(); // UCSORGBOTTOM
-        let _ = r.read_3bit_double(); // UCSORGLEFT
-        let _ = r.read_3bit_double(); // UCSORGRIGHT
-        let _ = r.read_3bit_double(); // UCSORGFRONT
-        let _ = r.read_3bit_double(); // UCSORGBACK
+        for origin in h.ucs_ortho_origins.iter_mut() {
+            *origin = r.read_3bit_double(); // UCSORGTOP, BOTTOM, LEFT, RIGHT, FRONT, BACK
+        }
 
         // DIMPOST, DIMAPOST
         h.dim_post = r.read_variable_text();
@@ -547,12 +541,13 @@ fn read_header_fields(r: &mut SectionReader, v: DxfVersion, h: &mut HeaderVariab
         h.dim_tolerance_justification = r.read_byte() as i16;
         h.dim_horizontal_justification = r.read_byte() as i16;
         h.dim_fit = r.read_byte() as i16;
+        h.dim_fit_r13 = h.dim_fit;
         h.dim_user_positioned_text = r.read_bit();
         h.dim_tolerance_zero_suppression = r.read_byte() as i16;
         h.dim_alt_tolerance_zero_suppression = r.read_byte() as i16;
         h.dim_alt_tolerance_zero_tight = r.read_byte() as i16;
         h.dim_text_above = r.read_byte() as i16;
-        let _ = r.read_bit_short(); // DIMUNIT
+        h.dim_unit = r.read_bit_short(); // DIMUNIT
         h.dim_angular_decimal_places = r.read_bit_short();
         h.dim_decimal_places = r.read_bit_short();
         h.dim_tolerance_decimal_places = r.read_bit_short();
@@ -576,10 +571,10 @@ fn read_header_fields(r: &mut SectionReader, v: DxfVersion, h: &mut HeaderVariab
 
     // R2007+ dimension extras
     if r2007_plus(v) {
-        let _ = r.read_bit_double(); // DIMFXL
-        let _ = r.read_bit_double(); // DIMJOGANG
-        let _ = r.read_bit_short(); // DIMTFILL
-        let _ = r.read_cm_color(); // DIMTFILLCLR
+        h.dim_fixed_ext_length = r.read_bit_double(); // DIMFXL
+        h.dim_jog_angle = r.read_bit_double(); // DIMJOGANG
+        h.dim_text_fill = r.read_bit_short(); // DIMTFILL
+        h.dim_text_fill_color = r.read_cm_color(); // DIMTFILLCLR
     }
 
     // R2000+ dimension flags
@@ -596,7 +591,7 @@ fn read_header_fields(r: &mut SectionReader, v: DxfVersion, h: &mut HeaderVariab
     }
 
     if r2007_plus(v) {
-        let _ = r.read_bit_short(); // DIMARCSYM
+        h.dim_arc_symbol = r.read_bit_short(); // DIMARCSYM
     }
 
     // ── Dimension sizes (Common) ──
@@ -659,16 +654,16 @@ fn read_header_fields(r: &mut SectionReader, v: DxfVersion, h: &mut HeaderVariab
 
     // R2007+: DIMFXLON
     if r2007_plus(v) {
-        let _ = r.read_bit(); // DimensionIsExtensionLineLengthFixed
+        h.dim_fixed_ext_length_on = r.read_bit(); // DIMFXLON
     }
 
     // R2010+: extra dimension fields
     if r2010_plus(v) {
-        let _ = r.read_bit(); // DIMTXTDIRECTION
-        let _ = r.read_bit_double(); // DIMALTMZF
-        let _ = r.read_variable_text(); // DIMALTMZS
-        let _ = r.read_bit_double(); // DIMMZF
-        let _ = r.read_variable_text(); // DIMMZS
+        h.dim_text_direction = r.read_bit(); // DIMTXTDIRECTION
+        h.dim_alt_mzf = r.read_bit_double(); // DIMALTMZF
+        h.dim_alt_mzs = r.read_variable_text(); // DIMALTMZS
+        h.dim_mzf = r.read_bit_double(); // DIMMZF
+        h.dim_mzs = r.read_variable_text(); // DIMMZS
     }
 
     // R2000+ dimension handles
@@ -796,13 +791,13 @@ fn read_header_fields(r: &mut SectionReader, v: DxfVersion, h: &mut HeaderVariab
 
         h.steps_per_second = r.read_bit_double();
         h.step_size = r.read_bit_double();
-        let _ = r.read_bit_double(); // 3DDWFPREC
+        h.dwf_3d_precision = r.read_bit_double(); // 3DDWFPREC
         h.lens_length = r.read_bit_double();
         h.camera_height = r.read_bit_double();
         h.record_solid_history = r.read_byte() != 0;
         h.show_solid_history = (r.read_byte() as i16).clamp(0, 2);
-        let _ = r.read_bit_double(); // PSOLWIDTH
-        let _ = r.read_bit_double(); // PSOLHEIGHT
+        h.polysolid_width = r.read_bit_double(); // PSOLWIDTH
+        h.polysolid_height = r.read_bit_double(); // PSOLHEIGHT
         h.loft_angle1 = r.read_bit_double();
         h.loft_angle2 = r.read_bit_double();
         h.loft_magnitude1 = r.read_bit_double();
@@ -813,20 +808,20 @@ fn read_header_fields(r: &mut SectionReader, v: DxfVersion, h: &mut HeaderVariab
         h.longitude = r.read_bit_double();
         h.north_direction = r.read_bit_double();
         h.timezone = r.read_bit_long();
-        let _ = r.read_byte(); // LIGHTGLYPHDISPLAY
-        let _ = r.read_byte(); // TILEMODELIGHTSYNCH
-        let _ = r.read_byte(); // DWFFRAME
-        let _ = r.read_byte(); // DGNFRAME
+        h.light_glyph_display = r.read_byte() as i16; // LIGHTGLYPHDISPLAY
+        h.tile_model_light_synch = r.read_byte() as i16; // TILEMODELIGHTSYNCH
+        h.dwf_frame = r.read_byte() as i16; // DWFFRAME
+        h.dgn_frame = r.read_byte() as i16; // DGNFRAME
 
         let _ = r.read_bit(); // unknown
 
-        let _ = r.read_cm_color(); // INTERFERECOLOR
+        h.interfere_color = r.read_cm_color(); // INTERFERECOLOR
 
         let _ = r.read_handle(); // INTERFEREOBJVS
         let _ = r.read_handle(); // INTERFEREVPVS
         let _ = r.read_handle(); // DRAGVS
 
-        let _ = r.read_byte(); // CSHADOW
+        h.cast_shadow = r.read_byte() as i16; // CSHADOW
         h.shadow_plane_location = r.read_bit_double();
     }
 
