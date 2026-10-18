@@ -9,7 +9,8 @@ use acadrust::types::{DxfVersion, Vector3};
 use std::io::Cursor;
 
 const HELD_1250: &str = "ĄĆĘŁŃÓŚŹŻ ąćęłńóśźż";
-const HELD_1250_BYTES: &[u8] = b"\xa5\xc6\xca\xa3\xd1\xd3\x8c\x8f\xaf \xb9\xe6\xea\xb3\xf1\xf3\x9c\x9f\xbf";
+const HELD_1250_BYTES: &[u8] =
+    b"\xa5\xc6\xca\xa3\xd1\xd3\x8c\x8f\xaf \xb9\xe6\xea\xb3\xf1\xf3\x9c\x9f\xbf";
 
 fn doc_with(texts: &[&str], page: &str, version: DxfVersion) -> CadDocument {
     let mut doc = CadDocument::new();
@@ -63,12 +64,20 @@ fn issue_152_a_pre_2007_dxf_is_written_in_its_code_page() {
 fn issue_152_a_character_the_page_cannot_hold_is_a_mif_escape() {
     let doc = doc_with(&["\u{2205}45,6"], "ANSI_1250", DxfVersion::AC1015);
     let bytes = DxfWriter::new(&doc).write_to_vec().unwrap();
-    assert!(contains(&bytes, b"\\U+220545,6"), "{}", String::from_utf8_lossy(&bytes));
+    assert!(
+        contains(&bytes, b"\\U+220545,6"),
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
 }
 
 #[test]
 fn issue_152_binary_dxf_follows_the_same_rule() {
-    let doc = doc_with(&[HELD_1250, "\u{2205}45,6"], "ANSI_1250", DxfVersion::AC1015);
+    let doc = doc_with(
+        &[HELD_1250, "\u{2205}45,6"],
+        "ANSI_1250",
+        DxfVersion::AC1015,
+    );
     let bytes = DxfWriter::new_binary(&doc).write_to_vec().unwrap();
     assert!(contains(&bytes, HELD_1250_BYTES));
     assert!(contains(&bytes, b"\\U+220545,6"));
@@ -95,7 +104,11 @@ fn issue_152_every_page_round_trips_through_acadrust() {
         for ver in [DxfVersion::AC1015, DxfVersion::AC1018] {
             let doc = doc_with(&[held, "\u{2205}45,6"], page, ver);
             let back = texts_of(&read(&DxfWriter::new(&doc).write_to_vec().unwrap()));
-            assert_eq!(back, vec![held.to_string(), "\u{2205}45,6".to_string()], "{page} {ver:?}");
+            assert_eq!(
+                back,
+                vec![held.to_string(), "\u{2205}45,6".to_string()],
+                "{page} {ver:?}"
+            );
         }
     }
 }
@@ -109,7 +122,11 @@ fn minimal_dxf_ordered(page: &str, text: &[u8], page_first: bool) -> Vec<u8> {
     let mut v = Vec::new();
     let ver = "  9\r\n$ACADVER\r\n  1\r\nAC1015\r\n";
     let cp = format!("  9\r\n$DWGCODEPAGE\r\n  3\r\n{page}\r\n");
-    let vars = if page_first { format!("{cp}{ver}") } else { format!("{ver}{cp}") };
+    let vars = if page_first {
+        format!("{cp}{ver}")
+    } else {
+        format!("{ver}{cp}")
+    };
     let head = format!(
         "  0\r\nSECTION\r\n  2\r\nHEADER\r\n{vars}  0\r\nENDSEC\r\n  0\r\nSECTION\r\n  2\r\nENTITIES\r\n  0\r\nTEXT\r\n  5\r\n20\r\n  8\r\n0\r\n 10\r\n0.0\r\n 20\r\n0.0\r\n 30\r\n0.0\r\n 40\r\n2.5\r\n  1\r\n"
     );

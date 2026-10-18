@@ -54,17 +54,29 @@ impl<'a> DxfWriter<'a> {
         self.write_to_writer(writer)
     }
 
+    /// The encoding the strings of this file are written in: the document's
+    /// `$DWGCODEPAGE` for a file below AC1021, none (UTF-8) from AC1021 on, where
+    /// the format is Unicode. The reader decodes the same way.
+    fn legacy_encoding(&self) -> Option<&'static encoding_rs::Encoding> {
+        if self.document.version >= crate::types::DxfVersion::AC1021 {
+            return None;
+        }
+        crate::io::dxf::code_page::encoding_from_code_page(&self.document.header.code_page)
+    }
+
     /// Write to any writer
     pub fn write_to_writer<W: Write>(&self, writer: W) -> Result<()> {
         if self.document.version == crate::types::DxfVersion::AC1009 {
             return self.write_r12(writer);
         }
         if self.binary {
-            let mut stream_writer = DxfBinaryWriter::new(writer)?;
+            let mut stream_writer =
+                DxfBinaryWriter::new(writer)?.with_legacy_encoding(self.legacy_encoding());
             self.write_dxf(&mut stream_writer)?;
             stream_writer.flush()?;
         } else {
-            let mut stream_writer = DxfTextWriter::new(writer);
+            let mut stream_writer =
+                DxfTextWriter::new(writer).with_legacy_encoding(self.legacy_encoding());
             self.write_dxf(&mut stream_writer)?;
             stream_writer.flush()?;
         }
@@ -78,11 +90,12 @@ impl<'a> DxfWriter<'a> {
         self.write_dxf(&mut recorder)?;
         let pairs = r12::downgrade(recorder.into_pairs());
         if self.binary {
-            let mut w = DxfBinaryWriter::new_r12(writer)?;
+            let mut w =
+                DxfBinaryWriter::new_r12(writer)?.with_legacy_encoding(self.legacy_encoding());
             r12::replay(&pairs, &mut w)?;
             w.flush()?;
         } else {
-            let mut w = DxfTextWriter::new(writer);
+            let mut w = DxfTextWriter::new(writer).with_legacy_encoding(self.legacy_encoding());
             r12::replay(&pairs, &mut w)?;
             w.flush()?;
         }
