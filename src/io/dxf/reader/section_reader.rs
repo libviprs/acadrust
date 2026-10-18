@@ -3028,6 +3028,26 @@ impl<'a> SectionReader<'a> {
                         }
                     }
                 }
+                "$DIMTXSTY" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        hdr.dim_text_style_name = p.value_string.clone();
+                    }
+                }
+                "$DIMLTYPE" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        hdr.dim_linetype_name = p.value_string.clone();
+                    }
+                }
+                "$DIMLTEX1" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        hdr.dim_linetype1_name = p.value_string.clone();
+                    }
+                }
+                "$DIMLTEX2" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        hdr.dim_linetype2_name = p.value_string.clone();
+                    }
+                }
                 "$PUCSBASE" => {
                     if let Some(p) = self.reader.read_pair()? {
                         hdr.paper_ucs_base = p.value_string.clone();
