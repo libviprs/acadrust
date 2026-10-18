@@ -77,14 +77,17 @@ fn issue_159_a_clockwise_arc_edge_reads_back_as_it_was_written() {
 
 #[test]
 fn issue_159_a_dxf_that_autocad_would_write_reads_as_the_same_arc() {
-    // The stored form above, written by hand: 270 and 90 with the counter-clockwise flag 0.
-    let bytes = DxfWriter::new(&doc_with(FRAC_PI_2, 3.0 * FRAC_PI_2, false))
-        .write_to_vec()
-        .unwrap();
+    // What AutoCAD stores for the clockwise arc from 90 to 270 degrees: 270 and 90 with the
+    // counter-clockwise flag 0. Made here from a counter-clockwise edge of those two angles,
+    // whose flag is the only thing to change.
+    let bytes = DxfWriter::new(&doc_with(1.5 * PI, FRAC_PI_2, true)).write_to_vec().unwrap();
     let text = String::from_utf8_lossy(&bytes).replace('\r', "");
-    assert!(text.contains("\n 73\n     0\n"), "the flag is 0");
-    let (s, e, ccw) = read_back(bytes);
-    assert!(!ccw && (s - FRAC_PI_2).abs() < 1e-9 && (e - 3.0 * FRAC_PI_2).abs() < 1e-9);
+    let at = text.find("\nHATCH\n").expect("a HATCH record");
+    let flag = text[at..].find("\n 73\n     1\n").expect("the arc's flag") + at;
+    let edited = format!("{}\n 73\n     0\n{}", &text[..flag], &text[flag + "\n 73\n     1\n".len()..]);
+    let (s, e, ccw) = read_back(edited.into_bytes());
+    assert!(!ccw, "the flag is 0");
+    assert!((s - FRAC_PI_2).abs() < 1e-9 && (e - 1.5 * PI).abs() < 1e-9, "read {s} {e}");
 }
 
 #[test]
