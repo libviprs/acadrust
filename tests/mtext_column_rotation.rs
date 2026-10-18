@@ -1,10 +1,11 @@
-//! A dynamic, manual-height column MTEXT keeps its rotation through DXF.
+//! An MTEXT with columns keeps its rotation through DXF (libviprs/acadsharp-rs-tests#113).
 //!
-//! Group 50 means the rotation on an MTEXT and, after the column marker 75,
-//! the height of each column. A reader cannot tell them apart except by
-//! position, so the rotation has to come first, and it has to be there even
-//! when it is zero: without it the first column height is read as the
-//! rotation (libviprs/acadsharp-rs-tests#113).
+//! Group 50 means the rotation in the entity, and ACadSharp and ezdxf, which
+//! share no code, both keep the last one they see. The writer put the height
+//! of each column in group 50 too, so a zero rotation (never written) came back
+//! as the first column height, 6.23 radians in the sample drawing. The columns
+//! belong where AutoCAD keeps them: an embedded object in R2018, ACAD extended
+//! data from R2007 to R2013, nowhere below.
 
 use std::io::Cursor;
 
@@ -12,7 +13,7 @@ use acadrust::entities::{EntityType, MText};
 use acadrust::types::{DxfVersion, Vector3};
 use acadrust::{CadDocument, DxfReader, DxfWriter};
 
-fn doc_with(rotation: f64) -> CadDocument {
+fn document(version: DxfVersion, rotation: f64) -> CadDocument {
     let mut m = MText::with_value("two\nlines", Vector3::new(1.0, 2.0, 0.0));
     m.rotation = rotation;
     m.column_data.column_type = 2;
@@ -21,33 +22,37 @@ fn doc_with(rotation: f64) -> CadDocument {
     m.column_data.width = 15.0;
     m.column_data.gutter = 110.0;
     m.column_data.heights = vec![-2.9];
-    let mut doc = CadDocument::with_version(DxfVersion::AC1032);
+    let mut doc = CadDocument::with_version(version);
     doc.add_entity(EntityType::MText(m)).unwrap();
     doc
 }
 
-/// The (code, value) pairs of the first MTEXT after its AcDbMText marker.
-fn mtext_pairs(dxf: &str) -> Vec<(i32, String)> {
-    let lines: Vec<&str> = dxf.lines().collect();
+/// The (code, value) pairs of the first MTEXT, from its `0 MTEXT` to the next group 0.
+fn mtext_pairs(doc: &CadDocument) -> Vec<(i32, String)> {
+    let text = String::from_utf8(DxfWriter::new(doc).write_to_vec().unwrap()).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
     let mut pairs = Vec::new();
-    let mut in_mtext = false;
-    let mut i = 0;
-    while i + 1 < lines.len() {
-        let code: i32 = lines[i].trim().parse().unwrap();
-        let value = lines[i + 1].trim().to_string();
-        if code == 100 && value == "AcDbMText" {
-            in_mtext = true;
-        } else if in_mtext && code == 0 {
+    let mut inside = false;
+    for c in lines.chunks(2).filter(|c| c.len() == 2) {
+        let code: i32 = c[0].trim().parse().unwrap();
+        let value = c[1].trim().to_string();
+        if code == 0 && value == "MTEXT" {
+            inside = true;
+        } else if code == 0 && inside {
             break;
-        } else if in_mtext {
+        } else if inside {
             pairs.push((code, value));
         }
-        i += 2;
     }
     pairs
 }
 
-fn read_back(bytes: Vec<u8>) -> MText {
+fn count(pairs: &[(i32, String)], code: i32) -> usize {
+    pairs.iter().filter(|(c, _)| *c == code).count()
+}
+
+fn read_back(doc: &CadDocument) -> MText {
+    let bytes = DxfWriter::new(doc).write_to_vec().unwrap();
     let doc = DxfReader::from_reader(Cursor::new(bytes))
         .unwrap()
         .read()
@@ -60,29 +65,70 @@ fn read_back(bytes: Vec<u8>) -> MText {
 }
 
 #[test]
-fn a_zero_rotation_is_written_before_the_column_heights() {
-    let doc = doc_with(0.0);
-    let text = String::from_utf8(DxfWriter::new(&doc).write_to_vec().unwrap()).unwrap();
-    let pairs = mtext_pairs(&text);
-    let first_50 = pairs.iter().position(|(c, _)| *c == 50).expect("a group 50");
-    let marker_75 = pairs.iter().position(|(c, _)| *c == 75).expect("a group 75");
-    assert!(
-        first_50 < marker_75,
-        "the first group 50 comes after the column marker, so a reader takes a column height for the rotation: {pairs:?}"
+fn r2018_columns_are_an_embedded_object_and_no_group_50() {
+    let p = mtext_pairs(&document(DxfVersion::AC1032, 0.0));
+    assert_eq!(
+        count(&p, 50),
+        0,
+        "a zero rotation is not written and no height is group 50: {p:?}"
     );
-    assert_eq!(pairs[first_50].1.parse::<f64>().unwrap(), 0.0);
+    let at = p
+        .iter()
+        .position(|(c, v)| *c == 101 && v == "Embedded Object")
+        .expect("the embedded object");
+    let tail = &p[at..];
+    assert!(tail.contains(&(71, "2".to_string())));
+    assert!(tail
+        .iter()
+        .any(|(c, v)| *c == 46 && v.parse::<f64>().unwrap() == -2.9));
+    for old in [75, 76, 78, 79, 48, 49] {
+        assert_eq!(count(&p, old), 0, "group {old} in the entity itself");
+    }
 }
 
 #[test]
-fn rotation_and_column_heights_survive_a_dxf_round_trip() {
+fn a_rotation_is_the_only_group_50() {
+    let p = mtext_pairs(&document(DxfVersion::AC1032, 0.5));
+    let fifties: Vec<f64> = p
+        .iter()
+        .filter(|(c, _)| *c == 50)
+        .map(|(_, v)| v.parse().unwrap())
+        .collect();
+    assert_eq!(fifties.len(), 1, "{p:?}");
+    assert!((fifties[0] - 0.5f64.to_degrees()).abs() < 1e-9);
+}
+
+#[test]
+fn r2007_to_r2013_columns_are_acad_extended_data() {
+    let p = mtext_pairs(&document(DxfVersion::AC1027, 0.0));
+    assert_eq!(count(&p, 50), 0);
+    assert!(p.contains(&(1001, "ACAD".to_string())));
+    assert!(p.contains(&(1000, "ACAD_MTEXT_COLUMN_INFO_BEGIN".to_string())));
+    assert!(p.contains(&(1000, "ACAD_MTEXT_COLUMN_INFO_END".to_string())));
+    assert!(p
+        .iter()
+        .any(|(c, v)| *c == 1040 && v.parse::<f64>().unwrap() == -2.9));
+    assert_eq!(count(&p, 101), 0);
+}
+
+#[test]
+fn below_r2007_there_is_no_column_data() {
+    let p = mtext_pairs(&document(DxfVersion::AC1015, 0.0));
+    for code in [50, 75, 76, 78, 79, 101, 1001] {
+        assert_eq!(count(&p, code), 0, "group {code}: {p:?}");
+    }
+}
+
+#[test]
+fn rotation_and_columns_survive_an_r2018_round_trip() {
     for rotation in [0.0, 0.5] {
-        let doc = doc_with(rotation);
-        let m = read_back(DxfWriter::new(&doc).write_to_vec().unwrap());
+        let m = read_back(&document(DxfVersion::AC1032, rotation));
         assert!(
             (m.rotation - rotation).abs() < 1e-9,
             "rotation {rotation} came back as {}",
             m.rotation
         );
+        assert_eq!(m.column_data.column_type, 2);
         assert_eq!(m.column_data.heights, vec![-2.9]);
     }
 }
