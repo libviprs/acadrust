@@ -23,6 +23,12 @@ use crate::xdata::{ExtendedData, ExtendedDataRecord, XDataValue};
 /// Build a 4×4 from 12 row-major values (a SPATIAL_FILTER transform is stored
 /// row-major, matching the DWG builder — reading it column-major transposed the
 /// clip and put the xclip region in the wrong place).
+/// A header integer, which AutoCAD writes as an int in one version and as a bool
+/// (group code 290) in another.
+fn header_int(p: &super::stream_reader::DxfCodePair) -> Option<i16> {
+    p.as_i16().or_else(|| p.as_bool().map(i16::from))
+}
+
 fn matrix_from_row_major(v: &[f64]) -> Matrix4 {
     Matrix4 {
         m: [
@@ -2647,7 +2653,7 @@ impl<'a> SectionReader<'a> {
                         }
                     }
                 }
-                "$DIMATFIT" | "$DIMFIT" => {
+                "$DIMATFIT" => {
                     if let Some(p) = self.reader.read_pair()? {
                         if let Some(v) = p.as_i16() {
                             hdr.dim_fit = v;
@@ -2856,6 +2862,212 @@ impl<'a> SectionReader<'a> {
                             hdr.user_elapsed_time = v;
                         }
                     }
+                }
+
+                // ── Variables the DWG header carries and the DXF reader used to skip ──
+                // (libviprs/acadsharp-rs-tests#102). The integer ones are an int or a
+                // bool by the version of AutoCAD that wrote the file.
+                "$DIMFIT" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = header_int(&p) {
+                            hdr.dim_fit_r13 = v;
+                            // $DIMFIT also fed dim_fit before, and files that
+                            // predate $DIMATFIT rely on it.
+                            hdr.dim_fit = v;
+                        }
+                    }
+                }
+                "$DIMUNIT" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = header_int(&p) {
+                            hdr.dim_unit = v;
+                        }
+                    }
+                }
+                "$DIMFXL" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = p.as_double() {
+                            hdr.dim_fixed_ext_length = v;
+                        }
+                    }
+                }
+                "$DIMFXLON" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        hdr.dim_fixed_ext_length_on = header_int(&p).is_some_and(|v| v != 0);
+                    }
+                }
+                "$DIMJOGANG" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = p.as_double() {
+                            hdr.dim_jog_angle = v;
+                        }
+                    }
+                }
+                "$DIMTFILL" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = header_int(&p) {
+                            hdr.dim_text_fill = v;
+                        }
+                    }
+                }
+                "$DIMTFILLCLR" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = p.as_i16() {
+                            hdr.dim_text_fill_color = Color::from_index(v);
+                        }
+                    }
+                }
+                "$DIMARCSYM" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = header_int(&p) {
+                            hdr.dim_arc_symbol = v;
+                        }
+                    }
+                }
+                "$DIMTXTDIRECTION" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        hdr.dim_text_direction = header_int(&p).is_some_and(|v| v != 0);
+                    }
+                }
+                "$DIMALTMZF" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = p.as_double() {
+                            hdr.dim_alt_mzf = v;
+                        }
+                    }
+                }
+                "$DIMALTMZS" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        hdr.dim_alt_mzs = p.value_string.clone();
+                    }
+                }
+                "$DIMMZF" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = p.as_double() {
+                            hdr.dim_mzf = v;
+                        }
+                    }
+                }
+                "$DIMMZS" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        hdr.dim_mzs = p.value_string.clone();
+                    }
+                }
+                "$UNITMODE" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = header_int(&p) {
+                            hdr.unit_mode = v;
+                        }
+                    }
+                }
+                "$PELLIPSE" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        hdr.polyline_ellipse = header_int(&p).is_some_and(|v| v != 0);
+                    }
+                }
+                "$3DDWFPREC" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = p.as_double() {
+                            hdr.dwf_3d_precision = v;
+                        }
+                    }
+                }
+                "$PSOLWIDTH" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = p.as_double() {
+                            hdr.polysolid_width = v;
+                        }
+                    }
+                }
+                "$PSOLHEIGHT" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = p.as_double() {
+                            hdr.polysolid_height = v;
+                        }
+                    }
+                }
+                "$LIGHTGLYPHDISPLAY" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = header_int(&p) {
+                            hdr.light_glyph_display = v;
+                        }
+                    }
+                }
+                "$TILEMODELIGHTSYNCH" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = header_int(&p) {
+                            hdr.tile_model_light_synch = v;
+                        }
+                    }
+                }
+                "$DWFFRAME" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = header_int(&p) {
+                            hdr.dwf_frame = v;
+                        }
+                    }
+                }
+                "$DGNFRAME" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = header_int(&p) {
+                            hdr.dgn_frame = v;
+                        }
+                    }
+                }
+                "$CSHADOW" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = header_int(&p) {
+                            hdr.cast_shadow = v;
+                        }
+                    }
+                }
+                "$INTERFERECOLOR" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = p.as_i16() {
+                            hdr.interfere_color = Color::from_index(v);
+                        }
+                    }
+                }
+                "$PUCSBASE" => {
+                    if let Some(p) = self.reader.read_pair()? {
+                        hdr.paper_ucs_base = p.value_string.clone();
+                    }
+                }
+                "$UCSORGTOP" => {
+                    self.read_header_point3(&mut hdr.ucs_ortho_origins[0])?;
+                }
+                "$UCSORGBOTTOM" => {
+                    self.read_header_point3(&mut hdr.ucs_ortho_origins[1])?;
+                }
+                "$UCSORGLEFT" => {
+                    self.read_header_point3(&mut hdr.ucs_ortho_origins[2])?;
+                }
+                "$UCSORGRIGHT" => {
+                    self.read_header_point3(&mut hdr.ucs_ortho_origins[3])?;
+                }
+                "$UCSORGFRONT" => {
+                    self.read_header_point3(&mut hdr.ucs_ortho_origins[4])?;
+                }
+                "$UCSORGBACK" => {
+                    self.read_header_point3(&mut hdr.ucs_ortho_origins[5])?;
+                }
+                "$PUCSORGTOP" => {
+                    self.read_header_point3(&mut hdr.paper_ucs_ortho_origins[0])?;
+                }
+                "$PUCSORGBOTTOM" => {
+                    self.read_header_point3(&mut hdr.paper_ucs_ortho_origins[1])?;
+                }
+                "$PUCSORGLEFT" => {
+                    self.read_header_point3(&mut hdr.paper_ucs_ortho_origins[2])?;
+                }
+                "$PUCSORGRIGHT" => {
+                    self.read_header_point3(&mut hdr.paper_ucs_ortho_origins[3])?;
+                }
+                "$PUCSORGFRONT" => {
+                    self.read_header_point3(&mut hdr.paper_ucs_ortho_origins[4])?;
+                }
+                "$PUCSORGBACK" => {
+                    self.read_header_point3(&mut hdr.paper_ucs_ortho_origins[5])?;
                 }
 
                 _ => {
