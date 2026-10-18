@@ -15342,6 +15342,11 @@ impl<'a> SectionReader<'a> {
                 }
             }
         }
+        // A clockwise edge's angles are stored as 360 minus each (see the writer).
+        if !edge.counter_clockwise {
+            edge.start_angle = std::f64::consts::TAU - edge.start_angle;
+            edge.end_angle = std::f64::consts::TAU - edge.end_angle;
+        }
         Ok(edge)
     }
 
