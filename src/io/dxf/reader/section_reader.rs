@@ -1414,6 +1414,10 @@ impl<'a> SectionReader<'a> {
     /// Read the HEADER section
     pub fn read_header(&mut self, document: &mut CadDocument) -> Result<()> {
         let hdr = &mut document.header;
+        // $ACADVER and $DWGCODEPAGE in either order: the page applies to a
+        // pre-2007 file once both have been read.
+        let mut code_page_name = String::new();
+        let mut version_seen = false;
 
         while let Some(pair) = self.reader.read_pair()? {
             if pair.code == 0 && pair.value_string == "ENDSEC" {
@@ -1430,6 +1434,16 @@ impl<'a> SectionReader<'a> {
                 "$ACADVER" => {
                     if let Some(p) = self.reader.read_pair()? {
                         document.version = DxfVersion::from_version_string(&p.value_string);
+                        version_seen = true;
+                        // $DWGCODEPAGE may have come first (ACadSharp writes it
+                        // before $ACADVER): it counts once the version is known.
+                        if !code_page_name.is_empty() && document.version < DxfVersion::AC1021 {
+                            if let Some(cp) =
+                                crate::io::dxf::code_page::legacy_code_page(&code_page_name)
+                            {
+                                self.reader.set_code_page(cp);
+                            }
+                        }
                     }
                 }
                 "$ACADMAINTVER" => {
@@ -1449,12 +1463,13 @@ impl<'a> SectionReader<'a> {
                 "$DWGCODEPAGE" => {
                     if let Some(p) = self.reader.read_pair()? {
                         hdr.code_page = p.value_string.clone();
-                        // Set encoding immediately for pre-2007 files
-                        if document.version < DxfVersion::AC1021 {
-                            if let Some(enc) =
-                                crate::io::dxf::code_page::encoding_from_code_page(&hdr.code_page)
+                        code_page_name = p.value_string.clone();
+                        // Set the code page immediately for pre-2007 files
+                        if version_seen && document.version < DxfVersion::AC1021 {
+                            if let Some(cp) =
+                                crate::io::dxf::code_page::legacy_code_page(&hdr.code_page)
                             {
-                                self.reader.set_encoding(enc);
+                                self.reader.set_code_page(cp);
                             }
                         }
                     }
