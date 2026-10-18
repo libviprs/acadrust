@@ -13,6 +13,8 @@ pub struct DxfTextReader<R: Read + Seek> {
     peeked_pair: Option<DxfCodePair>,
     /// Non-UTF8 fallback encoding.  `None` means use Latin-1 (byte-to-char).
     encoding: Option<&'static Encoding>,
+    /// The drawing's legacy code page, for MIF escapes.
+    code_page: Option<crate::io::dxf::code_page::LegacyCodePage>,
     /// Reusable buffer for line reading to avoid per-line allocation.
     line_buf: Vec<u8>,
     context: DxfStreamContext,
@@ -27,6 +29,7 @@ impl<R: Read + Seek> DxfTextReader<R> {
             stream_offset: 0,
             peeked_pair: None,
             encoding: None,
+            code_page: None,
             line_buf: Vec::with_capacity(256),
             context: DxfStreamContext::default(),
         })
@@ -82,7 +85,12 @@ impl<R: Read + Seek> DxfTextReader<R> {
             }
         };
 
-        Ok(Some(line))
+        match self.code_page {
+            Some(cp) if line.contains("\\U+") => Ok(Some(
+                crate::io::dxf::code_page::decode_mif_escapes(&line, cp),
+            )),
+            _ => Ok(Some(line)),
+        }
     }
 
     /// Read a line into the reusable `line_buf` without allocating a String.
@@ -216,6 +224,11 @@ impl<R: Read + Seek> DxfStreamReader for DxfTextReader<R> {
 
     fn set_encoding(&mut self, encoding: &'static Encoding) {
         self.encoding = Some(encoding);
+    }
+
+    fn set_code_page(&mut self, code_page: crate::io::dxf::code_page::LegacyCodePage) {
+        self.encoding = Some(code_page.encoding());
+        self.code_page = Some(code_page);
     }
 
     fn diagnostic_context(&self) -> DxfStreamContext {

@@ -13,6 +13,8 @@ pub struct DxfTextWriter<W: Write> {
     writer: W,
     /// Reusable stack buffer for formatting numbers without heap allocation.
     fmt_buf: [u8; 64],
+    /// The legacy code page a pre-2007 file is written in. `None` writes UTF-8.
+    legacy: Option<&'static encoding_rs::Encoding>,
 }
 
 impl<W: Write> DxfTextWriter<W> {
@@ -21,6 +23,27 @@ impl<W: Write> DxfTextWriter<W> {
         Self {
             writer,
             fmt_buf: [0u8; 64],
+            legacy: None,
+        }
+    }
+
+    /// Write strings in `encoding`, with MIF `\U+XXXX` for what it cannot hold,
+    /// as a pre-2007 file declares in `$DWGCODEPAGE`.
+    pub fn with_legacy_encoding(
+        mut self,
+        encoding: Option<&'static encoding_rs::Encoding>,
+    ) -> Self {
+        self.legacy = encoding;
+        self
+    }
+
+    /// The bytes of a string value in the file's encoding.
+    fn encode<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, [u8]> {
+        match self.legacy {
+            Some(enc) if !s.is_ascii() => {
+                std::borrow::Cow::Owned(crate::io::dxf::code_page::encode_legacy_string(s, enc))
+            }
+            _ => std::borrow::Cow::Borrowed(s.as_bytes()),
         }
     }
 
@@ -151,9 +174,11 @@ impl<W: Write> DxfStreamWriter for DxfTextWriter<W> {
                 .replace("\r\n", "\\P")
                 .replace('\r', "\\P")
                 .replace('\n', "\\P");
-            self.write_value_crlf(sanitized.as_bytes())?;
+            let bytes = self.encode(&sanitized);
+            self.write_value_crlf(&bytes)?;
         } else {
-            self.write_value_crlf(value.as_bytes())?;
+            let bytes = self.encode(value);
+            self.write_value_crlf(&bytes)?;
         }
         Ok(())
     }
@@ -166,7 +191,8 @@ impl<W: Write> DxfStreamWriter for DxfTextWriter<W> {
             .replace('\r', "^M")
             .replace('\n', "^J")
             .replace('\t', "^I");
-        self.write_value_crlf(escaped.as_bytes())?;
+        let bytes = self.encode(&escaped);
+        self.write_value_crlf(&bytes)?;
         Ok(())
     }
 
