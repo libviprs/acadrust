@@ -26,20 +26,15 @@ pub mod tables;
 use crate::error::{DxfError, Result};
 use crate::io::dwg::dwg_stream_readers::merged_reader::DwgMergedReader;
 use crate::io::dwg::dwg_version::DwgVersion;
+use crate::io::dwg::mesh_budget::MeshFaceBudget;
 use crate::types::{Color, DxfVersion, Transparency};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Maximum number of items in any array read from the stream.
-/// Prevents infinite loops when reading corrupt data.
-const MAX_ARRAY_COUNT: i32 = 100_000;
-const MAX_MESH_FACES: usize = 250_000;
-const MAX_MESH_FACE_INDICES: usize = 1_000_000;
-
-/// Cap a loop count read from the stream to a safe maximum.
+/// Reject counts that cannot be represented by the remaining record bits.
 #[inline]
-fn safe_count(raw: i32) -> i32 {
-    raw.max(0).min(MAX_ARRAY_COUNT)
+fn safe_count(raw: i32, reader: &DwgMergedReader) -> i32 {
+    reader.checked_count(i64::from(raw)) as i32
 }
 
 /// Result of reading a single object record's common data.
@@ -145,11 +140,19 @@ pub struct DwgObjectReader {
     dxf_version: DxfVersion,
     /// Handle → byte-offset map (from handle section)
     handle_map: HashMap<u64, i64>,
-    /// Document code page used by pre-R2007 object strings. Carries the
-    /// declared code page, not just its encoding, because the MIF gate in
-    /// `DwgBitReader::decode_legacy_text` cannot be right from the encoding
-    /// alone — see [`crate::io::dxf::code_page::LegacyCodePage`].
-    encoding: crate::io::dxf::code_page::LegacyCodePage,
+    /// Document code page used by pre-R2007 object strings.
+    encoding: crate::io::dxf::code_page::LegacyEncoding,
+    /// Faces and face-corner indices retained from one MESH record.
+    mesh_budget: MeshFaceBudget,
+}
+
+/// Entity visibility in the DWG common-entity bit-short.
+///
+/// Bit 0 is the visibility flag (DXF group 60). AutoCAD stores other bits
+/// on visible entities — value 2 is common on attributes — and still draws
+/// them. DXF group 60 is not this field: any non-zero group is invisible.
+pub(crate) fn dwg_entity_invisible(raw: i16) -> bool {
+    raw & 1 != 0
 }
 
 impl DwgObjectReader {
@@ -164,14 +167,14 @@ impl DwgObjectReader {
         dxf_version: DxfVersion,
         handle_map: HashMap<u64, i64>,
     ) -> Result<Self> {
-        Self::with_encoding(data, dxf_version, handle_map, crate::io::dxf::code_page::LegacyCodePage::unknown(encoding_rs::WINDOWS_1252))
+        Self::with_encoding(data, dxf_version, handle_map, encoding_rs::WINDOWS_1252)
     }
 
     pub fn with_encoding(
         data: Vec<u8>,
         dxf_version: DxfVersion,
         handle_map: HashMap<u64, i64>,
-        encoding: crate::io::dxf::code_page::LegacyCodePage,
+        encoding: impl Into<crate::io::dxf::code_page::LegacyEncoding>,
     ) -> Result<Self> {
         let version = DwgVersion::from_dxf_version(dxf_version)?;
         Ok(DwgObjectReader {
@@ -179,8 +182,22 @@ impl DwgObjectReader {
             version,
             dxf_version,
             handle_map,
-            encoding,
+            encoding: encoding.into(),
+            mesh_budget: MeshFaceBudget::from_system(),
         })
+    }
+
+    /// Replace the MESH face budget.
+    ///
+    /// [`DwgReader`](crate::DwgReader) sets this from [`DwgReadOptions`](crate::DwgReadOptions).
+    /// [`Self::new`] otherwise keeps [`MeshFaceBudget::from_system`].
+    pub fn set_mesh_budget(&mut self, budget: MeshFaceBudget) {
+        self.mesh_budget = budget;
+    }
+
+    /// Faces and face-corner indices retained from one MESH record.
+    pub fn mesh_budget(&self) -> MeshFaceBudget {
+        self.mesh_budget
     }
 
     /// Read only the type prefix of an object record.
@@ -194,13 +211,13 @@ impl DwgObjectReader {
                 self.data.len()
             )));
         }
-        let (size, ms_len) = read_modular_short(&self.data[offset..]);
+        let (size, ms_len) = read_modular_short(&self.data[offset..])?;
         let mut pos = offset + ms_len;
         if self.version.r2010_plus() {
-            let (_, mc_len) = read_modular_char(&self.data[pos..]);
+            let (_, mc_len) = read_modular_char(&self.data[pos..])?;
             pos += mc_len;
         }
-        if size == 0 || pos >= self.data.len() {
+        if size == 0 || pos >= self.data.len() || size > self.data.len() - pos {
             return Err(DxfError::Parse(format!(
                 "Object record at {} has no type prefix",
                 offset
@@ -232,12 +249,12 @@ impl DwgObjectReader {
         let mut pos = offset;
 
         // 1. Read ModularShort (MS) — object size in bytes
-        let (size, ms_len) = read_modular_short(&self.data[pos..]);
+        let (size, ms_len) = read_modular_short(&self.data[pos..])?;
         pos += ms_len;
 
         // 2. R2010+: Read ModularChar (MC) — handle stream bit count
         let handle_bits = if self.version.r2010_plus() {
-            let (hb, mc_len) = read_modular_char(&self.data[pos..]);
+            let (hb, mc_len) = read_modular_char(&self.data[pos..])?;
             pos += mc_len;
             hb as i64
         } else {
@@ -245,7 +262,7 @@ impl DwgObjectReader {
         };
 
         // 3. Extract merged data
-        if pos + size > self.data.len() {
+        if size > self.data.len().saturating_sub(pos) {
             return Err(DxfError::Parse(format!(
                 "Object record extends past data: offset={}, size={}, data_len={}",
                 offset,
@@ -253,7 +270,17 @@ impl DwgObjectReader {
                 self.data.len()
             )));
         }
-        let merged_data: Arc<[u8]> = Arc::from(&self.data[pos..pos + size]);
+        self.read_raw_record(&self.data[pos..pos + size], handle_bits)
+    }
+
+    /// Decode an already captured merged record without adding file framing.
+    pub(crate) fn read_raw_record(
+        &self,
+        data: &[u8],
+        handle_bits: i64,
+    ) -> Result<(i16, DwgMergedReader)> {
+        let size = data.len();
+        let merged_data: Arc<[u8]> = Arc::from(data);
 
         // 4. For R2007+ (ThreeStream): read type_code from a temp reader,
         //    then manually construct the three sub-readers with correct
@@ -302,6 +329,11 @@ impl DwgObjectReader {
             }
 
             // Main reader: starts at data_start_bits (after type_code [+ RL])
+            if handle_start <= data_start_bits || handle_start > size as i64 * 8 {
+                return Err(DxfError::Parse(
+                    "Invalid DWG object handle-stream boundary".into(),
+                ));
+            }
             let mut main_reader = crate::io::dwg::dwg_stream_readers::bit_reader::DwgBitReader::from_shared_with_encoding(
                 Arc::clone(&merged_data),
                 dwg,
@@ -318,6 +350,12 @@ impl DwgObjectReader {
                 self.encoding,
             );
             let main_data_end = text_reader.set_position_by_flag(flag_position);
+            text_reader.check_error()?;
+            if main_data_end < data_start_bits {
+                return Err(DxfError::Parse(
+                    "DWG text stream overlaps object prefix".into(),
+                ));
+            }
 
             // Handle reader: starts at bit position handle_start (NOT byte-aligned).
             let mut handle_reader =
@@ -372,6 +410,11 @@ impl DwgObjectReader {
         };
 
         // Create main reader (reads from bit 0)
+        if handle_start_bits < 0 || handle_start_bits > size as i64 * 8 {
+            return Err(DxfError::Parse(
+                "Invalid DWG object handle-stream boundary".into(),
+            ));
+        }
         let main_reader =
             crate::io::dwg::dwg_stream_readers::bit_reader::DwgBitReader::from_shared_with_encoding(
                 Arc::clone(&merged_data),
@@ -457,11 +500,8 @@ impl DwgObjectReader {
             } else {
                 reader.read_raw_long() as i64
             };
-            let mut gdata = Vec::with_capacity(graphic_size.max(0) as usize);
-            for _ in 0..graphic_size.max(0) {
-                gdata.push(reader.read_byte());
-            }
-            Some(gdata)
+            let size = reader.checked_main_count(graphic_size, 8) as usize;
+            Some(reader.read_bytes(size))
         } else {
             None
         };
@@ -483,7 +523,7 @@ impl DwgObjectReader {
         };
 
         // Reactor count + handles
-        let reactor_count = safe_count(reader.read_bit_long());
+        let reactor_count = safe_count(reader.read_bit_long(), reader);
         let mut reactors = Vec::new();
         for _ in 0..reactor_count {
             reactors.push(reader.read_handle());
@@ -557,11 +597,11 @@ impl DwgObjectReader {
         // Linetype scale
         let linetype_scale = reader.read_bit_double();
 
-        // R13-R14: invisibility + return early
-        // DXF group 60 convention (all DWG versions): 0 = visible, non-zero = invisible
+        // R13-R14: invisibility + return early.
+        // Only bit 0 hides the entity (issue #175).
         let invisible;
         if self.version.r13_14_only() {
-            invisible = reader.read_bit_short() != 0;
+            invisible = dwg_entity_invisible(reader.read_bit_short());
             return EntityCommonData {
                 common,
                 has_graphic,
@@ -606,7 +646,9 @@ impl DwgObjectReader {
             linetype_handle = reader.read_handle();
         }
 
-        // R2007+: material flags + shadow flags
+        // Native reC/b2007..b2018: material BB + shadow RC precede plotstyle
+        // BB in DATA. ODA §20.4.1 lists plotstyle earlier; its §20.4.2 handle
+        // order (material then plotstyle) agrees with these native records.
         let mut material_flags = 0u8;
         let mut material_handle: Option<u64> = None;
         let mut shadow_flags = 0u8;
@@ -646,8 +688,8 @@ impl DwgObjectReader {
             }
         }
 
-        // Invisibility
-        invisible = reader.read_bit_short() != 0;
+        // Invisibility. Only bit 0 hides the entity (issue #175).
+        invisible = dwg_entity_invisible(reader.read_bit_short());
 
         // R2000+: Lineweight (5-bit DWG index → raw byte value)
         let line_weight = if self.version.r2000_plus() {
@@ -706,7 +748,7 @@ impl DwgObjectReader {
         let owner_handle = reader.read_handle();
 
         // Reactor count + handles
-        let reactor_count = safe_count(reader.read_bit_long());
+        let reactor_count = safe_count(reader.read_bit_long(), reader);
         let mut reactors = Vec::new();
         for _ in 0..reactor_count {
             reactors.push(reader.read_handle());
@@ -751,6 +793,9 @@ impl DwgObjectReader {
         let mut result: Vec<(u64, Vec<u8>)> = Vec::new();
         loop {
             let size = reader.read_bit_short();
+            if size < 0 {
+                reader.invalidate("Negative DWG extended-data length");
+            }
             if size <= 0 {
                 break;
             }
@@ -760,10 +805,7 @@ impl DwgObjectReader {
             // Raw xdata bytes (from main stream, one byte at a time).
             // These bytes are NOT bit-packed; read them through the bit
             // reader to respect any outstanding bit shift.
-            let mut data = Vec::with_capacity(size_u);
-            for _ in 0..size_u {
-                data.push(reader.read_byte());
-            }
+            let data = reader.read_bytes(size_u);
             result.push((app_handle, data));
         }
         result
@@ -853,52 +895,40 @@ impl<'a> PrefixBitReader<'a> {
 
 /// Read a ModularShort (MS) from a byte slice.
 /// Returns (value, bytes_consumed).
-fn read_modular_short(data: &[u8]) -> (usize, usize) {
-    let mut value: usize = 0;
-    let mut shift = 0;
-    let mut i = 0;
-
-    loop {
-        if i + 1 >= data.len() {
-            break;
-        }
-        let word = u16::from_le_bytes([data[i], data[i + 1]]);
-        i += 2;
-
-        value |= ((word & 0x7FFF) as usize) << shift;
-        shift += 15;
-
-        if (word & 0x8000) == 0 {
-            break;
-        }
-    }
-
-    (value, i)
+fn read_modular_short(data: &[u8]) -> Result<(usize, usize)> {
+    read_modular_unsigned(data, 2, 15)
 }
 
-/// Read a ModularChar (MC) from a byte slice.
-/// Returns (value, bytes_consumed).
-fn read_modular_char(data: &[u8]) -> (usize, usize) {
-    let mut value: usize = 0;
+fn read_modular_char(data: &[u8]) -> Result<(usize, usize)> {
+    read_modular_unsigned(data, 1, 7)
+}
+
+fn read_modular_unsigned(data: &[u8], width: usize, payload_bits: u32) -> Result<(usize, usize)> {
+    let mut value = 0usize;
     let mut shift = 0;
-    let mut i = 0;
-
+    let mut offset = 0;
     loop {
-        if i >= data.len() {
-            break;
+        let chunk = data
+            .get(offset..offset + width)
+            .ok_or_else(|| DxfError::Parse("Truncated DWG record framing".into()))?;
+        let word = if width == 2 {
+            u16::from_le_bytes([chunk[0], chunk[1]]) as usize
+        } else {
+            chunk[0] as usize
+        };
+        let payload = word & ((1 << payload_bits) - 1);
+        if shift >= usize::BITS || payload > (usize::MAX >> shift) {
+            return Err(DxfError::Parse(
+                "DWG record framing integer overflow".into(),
+            ));
         }
-        let b = data[i];
-        i += 1;
-
-        value |= ((b & 0x7F) as usize) << shift;
-        shift += 7;
-
-        if (b & 0x80) == 0 {
-            break;
+        value |= payload << shift;
+        offset += width;
+        if word & (1 << payload_bits) == 0 {
+            return Ok((value, offset));
         }
+        shift += payload_bits;
     }
-
-    (value, i)
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -910,10 +940,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dwg_invisibility_uses_only_bit_0() {
+        assert!(!dwg_entity_invisible(0));
+        assert!(dwg_entity_invisible(1));
+        // AutoCAD sample drawings store 2 on entities they still display.
+        assert!(!dwg_entity_invisible(2));
+        assert!(dwg_entity_invisible(3));
+    }
+
+    #[test]
     fn test_modular_short_read() {
         // Single word: value 42 (0x002A), no continuation
         let data = [0x2A, 0x00];
-        let (val, len) = read_modular_short(&data);
+        let (val, len) = read_modular_short(&data).unwrap();
         assert_eq!(val, 42);
         assert_eq!(len, 2);
     }
@@ -922,7 +961,7 @@ mod tests {
     fn test_modular_short_multi_word() {
         // Two words: 0x8001 0x0001 → (1) | (1 << 15) = 1 + 32768 = 32769
         let data = [0x01, 0x80, 0x01, 0x00];
-        let (val, len) = read_modular_short(&data);
+        let (val, len) = read_modular_short(&data).unwrap();
         assert_eq!(val, 32769);
         assert_eq!(len, 4);
     }
@@ -931,7 +970,7 @@ mod tests {
     fn test_modular_char_read() {
         // Single byte: value 42 (no continuation)
         let data = [42u8];
-        let (val, len) = read_modular_char(&data);
+        let (val, len) = read_modular_char(&data).unwrap();
         assert_eq!(val, 42);
         assert_eq!(len, 1);
     }
@@ -940,7 +979,7 @@ mod tests {
     fn test_modular_char_multi_byte() {
         // Two bytes: 0x81 0x01 → (1) | (1 << 7) = 1 + 128 = 129
         let data = [0x81, 0x01];
-        let (val, len) = read_modular_char(&data);
+        let (val, len) = read_modular_char(&data).unwrap();
         assert_eq!(val, 129);
         assert_eq!(len, 2);
     }
@@ -955,14 +994,14 @@ mod tests {
         for &val in &[0, 1, 42, 127, 128, 255, 1000, 32767, 32768, 65535, 100000] {
             let mut buf = Vec::new();
             write_modular_short_bytes(&mut buf, val);
-            let (read_val, _) = read_modular_short(&buf);
+            let (read_val, _) = read_modular_short(&buf).unwrap();
             assert_eq!(read_val, val, "MS roundtrip failed for {}", val);
         }
 
         for &val in &[0, 1, 42, 127, 128, 255, 1000, 32767, 65535, 100000] {
             let mut buf = Vec::new();
             write_modular_char_bytes(&mut buf, val);
-            let (read_val, _) = read_modular_char(&buf);
+            let (read_val, _) = read_modular_char(&buf).unwrap();
             assert_eq!(read_val, val, "MC roundtrip failed for {}", val);
         }
     }

@@ -4,7 +4,7 @@
 //! styles, caps, and joints.
 
 use crate::entities::{Entity, EntityCommon};
-use crate::types::{BoundingBox3D, Color, Handle, LineWeight, Transparency, Vector3};
+use crate::types::{BoundingBox3D, Color, Handle, Vector3};
 
 use bitflags::bitflags;
 use std::f64::consts::PI;
@@ -535,6 +535,19 @@ impl MLine {
         }
     }
 
+    /// Return the flags that should be serialized for this entity.
+    ///
+    /// `HAS_VERTICES` is a derived bit (DXF group 71 bit 1); its value must
+    /// agree with the vertex count written as group 72.
+    pub(crate) fn serialized_flags(&self) -> MLineFlags {
+        let has_vertices = if self.vertices.is_empty() {
+            MLineFlags::empty()
+        } else {
+            MLineFlags::HAS_VERTICES
+        };
+        (self.flags & !MLineFlags::HAS_VERTICES) | has_vertices
+    }
+
     /// Moves one vertex and rebuilds the dependent direction/miter data.
     pub fn set_vertex_position(&mut self, index: usize, position: Vector3) -> bool {
         let Some(vertex) = self.vertices.get_mut(index) else {
@@ -679,52 +692,12 @@ impl Default for MLine {
 }
 
 impl Entity for MLine {
-    fn handle(&self) -> Handle {
-        self.common.handle
+    fn common(&self) -> &super::EntityCommon {
+        &self.common
     }
 
-    fn set_handle(&mut self, handle: Handle) {
-        self.common.handle = handle;
-    }
-
-    fn layer(&self) -> &str {
-        &self.common.layer
-    }
-
-    fn set_layer(&mut self, layer: String) {
-        self.common.layer = layer;
-    }
-
-    fn color(&self) -> Color {
-        self.common.color
-    }
-
-    fn set_color(&mut self, color: Color) {
-        self.common.color = color;
-    }
-
-    fn line_weight(&self) -> LineWeight {
-        self.common.line_weight
-    }
-
-    fn set_line_weight(&mut self, line_weight: LineWeight) {
-        self.common.line_weight = line_weight;
-    }
-
-    fn transparency(&self) -> Transparency {
-        self.common.transparency
-    }
-
-    fn set_transparency(&mut self, transparency: Transparency) {
-        self.common.transparency = transparency;
-    }
-
-    fn is_invisible(&self) -> bool {
-        self.common.invisible
-    }
-
-    fn set_invisible(&mut self, invisible: bool) {
-        self.common.invisible = invisible;
+    fn common_mut(&mut self) -> &mut super::EntityCommon {
+        &mut self.common
     }
 
     fn bounding_box(&self) -> BoundingBox3D {
@@ -758,6 +731,10 @@ impl Entity for MLine {
 
     fn apply_transform(&mut self, transform: &crate::types::Transform) {
         super::transform::transform_mline(self, transform);
+    }
+
+    fn apply_mirror(&mut self, transform: &crate::types::Transform) {
+        super::mirror::mirror_mline(self, transform);
     }
 }
 
@@ -857,6 +834,17 @@ mod tests {
         assert_eq!(mline.scale_factor, 1.0);
         assert_eq!(mline.vertex_count(), 0);
         assert!(!mline.is_closed());
+    }
+
+    #[test]
+    fn serialized_flags_derive_vertex_presence() {
+        let mut empty = MLine::new();
+        empty.flags = MLineFlags::CLOSED | MLineFlags::NO_START_CAPS;
+        assert_eq!(empty.serialized_flags().bits(), 6);
+
+        let mut populated = MLine::from_points(&[Vector3::ZERO, Vector3::new(1.0, 0.0, 0.0)]);
+        populated.flags.remove(MLineFlags::HAS_VERTICES);
+        assert_eq!(populated.serialized_flags().bits(), 1);
     }
 
     #[test]

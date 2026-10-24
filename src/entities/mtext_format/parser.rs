@@ -1,6 +1,6 @@
 //! MTEXT format string parser.
 //!
-//! Parses AutoCAD MTEXT formatted strings into structured [`MTextDocument`]
+//! Parses ACAD MTEXT formatted strings into structured [`MTextDocument`]
 //! containing paragraphs and styled spans.
 //!
 //! For the full specification of supported control codes, see the [`mtext_format`] module.
@@ -12,7 +12,7 @@ use super::types::*;
 /// Parse an MTEXT format string into a structured document.
 ///
 /// Recognizes all control codes whether or not the content is wrapped in
-/// `{...}`. Matches the behavior of AutoCAD MTEXT and MLEADER entities.
+/// `{...}`. Matches the behavior of ACAD MTEXT and MLEADER entities.
 ///
 /// # Arguments
 ///
@@ -345,6 +345,9 @@ impl MTextParser {
                     self.text_buf.push(code_char);
                     self.pos += 1;
                 }
+            } else {
+                // A trailing `%%` has no code yet (an editor mid-typing): keep it.
+                self.text_buf.push_str("%%");
             }
         } else {
             // Not a %% code, just a regular '%' character
@@ -414,8 +417,8 @@ impl MTextParser {
             // Unicode escape: \U+XXXX
             'U' if self.pos + 1 < self.chars.len() && self.chars[self.pos + 1] == '+' => {
                 // AutoCAD's `\U+XXXX` takes exactly four hex digits, which is
-                // what `decode_mif_escapes` enforces at the transport layer
-                // (`src/io/dxf/code_page.rs:392`). Consuming every following
+                // what `decode_cif_escapes_in` enforces at the transport layer
+                // (`src/io/dxf/code_page.rs`). Consuming every following
                 // hex digit instead turns `20\U+00B0C` into U+0B0C, and a code
                 // point that is not a scalar must come back out as the text the
                 // file holds rather than disappear.
@@ -450,6 +453,29 @@ impl MTextParser {
                         self.text_buf.push_str("\\U+");
                         self.pos = start;
                     }
+                }
+            }
+
+            // Legacy MIF escape: \M+nxxyy. The code-page selector is part of
+            // the escape, so it can be decoded before the text reaches the
+            // structured span model.
+            'M' if self.pos + 1 < self.chars.len() && self.chars[self.pos + 1] == '+' => {
+                let end = self.pos + 6;
+                if end < self.chars.len() {
+                    let token: String = self.chars[self.pos - 1..=end].iter().collect();
+                    let decoded = crate::io::dxf::code_page::decode_legacy_escapes(&token);
+                    if decoded != token {
+                        self.text_buf.push_str(&decoded);
+                        self.pos = end + 1;
+                    } else {
+                        self.text_buf.push('\\');
+                        self.text_buf.push(code);
+                        self.pos += 1;
+                    }
+                } else {
+                    self.text_buf.push('\\');
+                    self.text_buf.push(code);
+                    self.pos += 1;
                 }
             }
 
@@ -1042,8 +1068,10 @@ impl MTextParser {
                 }
                 let segment: String = chars[start..k].iter().collect();
                 let mut tab_stops = self.current_paragraph.properties.tab_stops.clone();
-                for part in segment.split(',') {
-                    let part = part.trim();
+                let parts: Vec<_> = segment.split(',').map(str::trim).collect();
+                let mut part_index = 0;
+                while part_index < parts.len() {
+                    let part = parts[part_index];
                     let (prefix, num) = match part.chars().next() {
                         Some('c') | Some('C') => (b'c', &part[1..]),
                         Some('r') | Some('R') => (b'r', &part[1..]),
@@ -1052,11 +1080,17 @@ impl MTextParser {
                         // `D.2` is a decimal stop at 2 (aligning on `.`), not 0.2.
                         Some('d') | Some('D') => {
                             let rest = &part[1..];
-                            (
-                                b'D',
-                                rest.strip_prefix(|c: char| c == '.' || c == ',')
-                                    .unwrap_or(rest),
-                            )
+                            if rest.is_empty()
+                                && part_index + 1 < parts.len()
+                                && parts[part_index + 1].parse::<f64>().is_ok()
+                            {
+                                part_index += 1;
+                                (b',', parts[part_index])
+                            } else if let Some(num) = rest.strip_prefix('.') {
+                                (b'.', num)
+                            } else {
+                                (b'D', rest.strip_prefix(',').unwrap_or(rest))
+                            }
                         }
                         _ => (0, part),
                     };
@@ -1065,9 +1099,14 @@ impl MTextParser {
                             b'c' => TabStop::Center(v),
                             b'r' => TabStop::Right(v),
                             b'D' => TabStop::Decimal(v),
+                            b'.' | b',' => TabStop::DecimalWithCharacter {
+                                position: v,
+                                character: prefix as char,
+                            },
                             _ => TabStop::Left(v),
                         });
                     }
+                    part_index += 1;
                 }
                 self.current_paragraph.properties.tab_stops = tab_stops;
                 i = k;
@@ -1961,8 +2000,31 @@ mod tests {
         let doc = parse_mtext("{\\ptD.2;Text}", false);
         assert_eq!(
             doc.paragraphs[0].properties.tab_stops,
+            vec![TabStop::DecimalWithCharacter {
+                position: 2.0,
+                character: '.',
+            }]
+        );
+    }
+
+    #[test]
+    fn test_parse_and_serialize_decimal_tab_characters() {
+        let comma = parse_mtext("{\\ptD,2;Comma}", false);
+        assert_eq!(
+            comma.paragraphs[0].properties.tab_stops,
+            vec![TabStop::DecimalWithCharacter {
+                position: 2.0,
+                character: ',',
+            }]
+        );
+        assert!(comma.to_mtext_string().contains(",tD,2"));
+
+        let legacy = parse_mtext("{\\ptD2;Dot}", false);
+        assert_eq!(
+            legacy.paragraphs[0].properties.tab_stops,
             vec![TabStop::Decimal(2.0)]
         );
+        assert!(legacy.to_mtext_string().contains(",tD2"));
     }
 
     #[test]
@@ -2109,6 +2171,11 @@ mod tests {
     fn test_parse_only_special_chars() {
         let doc = parse_mtext("{%%d%%p%%c}", false);
         assert_eq!(doc.paragraphs[0].to_plain_text(), "°±Ø");
+    }
+
+    #[test]
+    fn test_parse_trailing_double_percent_is_kept() {
+        assert_eq!(parse_mtext("x%%", true).to_plain_text(), "x%%");
     }
 
     #[test]

@@ -11,11 +11,11 @@ fn v(n: f64) -> Vector3 {
 
 fn set(doc: &mut CadDocument) {
     let h = &mut doc.header;
-    h.polyline_ellipse = true;
+    h.create_ellipse_as_polyline = true;
     h.unit_mode = 1;
     h.dim_unit = 4;
-    h.dim_fixed_ext_length = 1.5;
-    h.dim_fixed_ext_length_on = true;
+    h.dim_fixed_ext_line_length = 1.5;
+    h.dim_fixed_ext_line_on = true;
     h.dim_jog_angle = 0.5;
     h.dim_text_fill = 2;
     h.dim_text_fill_color = Color::from_index(5);
@@ -33,7 +33,7 @@ fn set(doc: &mut CadDocument) {
     h.dwf_frame = 2;
     h.dgn_frame = 1;
     h.cast_shadow = 3;
-    h.interfere_color = Color::from_index(3);
+    h.interference_color = Color::from_index(3);
     for (i, o) in h.ucs_ortho_origins.iter_mut().enumerate() {
         *o = v(10.0 * (i as f64 + 1.0));
     }
@@ -52,7 +52,7 @@ fn roundtrip(version: DxfVersion) -> CadDocument {
 }
 
 fn check_common(h: &acadrust::document::HeaderVariables, version: DxfVersion) {
-    assert!(h.polyline_ellipse, "{version:?} PELLIPSE");
+    assert!(h.create_ellipse_as_polyline, "{version:?} PELLIPSE");
     assert_eq!(h.unit_mode, 1, "{version:?} UNITMODE");
     for (i, o) in h.ucs_ortho_origins.iter().enumerate() {
         assert_eq!(*o, v(10.0 * (i as f64 + 1.0)), "{version:?} UCSORG #{i}");
@@ -73,8 +73,8 @@ fn ac1021_dimension_and_graphics_variables() {
     let doc = roundtrip(DxfVersion::AC1021);
     let h = &doc.header;
     check_common(h, DxfVersion::AC1021);
-    assert_eq!(h.dim_fixed_ext_length, 1.5);
-    assert!(h.dim_fixed_ext_length_on);
+    assert_eq!(h.dim_fixed_ext_line_length, 1.5);
+    assert!(h.dim_fixed_ext_line_on);
     assert_eq!(h.dim_jog_angle, 0.5);
     assert_eq!(h.dim_text_fill, 2);
     assert_eq!(h.dim_text_fill_color, Color::from_index(5));
@@ -87,7 +87,7 @@ fn ac1021_dimension_and_graphics_variables() {
     assert_eq!(h.dwf_frame, 2);
     assert_eq!(h.dgn_frame, 1);
     assert_eq!(h.cast_shadow, 3);
-    assert_eq!(h.interfere_color, Color::from_index(3));
+    assert_eq!(h.interference_color, Color::from_index(3));
 }
 
 #[test]
@@ -115,14 +115,14 @@ fn the_dxf_reader_takes_them_too() {
         .read()
         .expect("read")
         .header;
-    assert_eq!(h.dim_fixed_ext_length, 2.5);
-    assert!(h.dim_fixed_ext_length_on);
+    assert_eq!(h.dim_fixed_ext_line_length, 2.5);
+    assert!(h.dim_fixed_ext_line_on);
     assert_eq!(h.dim_text_style_name, "MyDimText");
     assert_eq!(h.dim_linetype_name, "BATTING");
     assert_eq!(h.dim_linetype1_name, "TRACKS");
     assert_eq!(h.dim_mzs, "xx");
     assert_eq!(h.dim_text_fill_color, Color::from_index(6));
-    assert!(h.polyline_ellipse);
+    assert!(h.create_ellipse_as_polyline);
     assert_eq!(h.cast_shadow, 2);
     assert_eq!(h.ucs_ortho_origins[0], Vector3::new(1.0, 2.0, 3.0));
     assert_eq!(h.paper_ucs_ortho_origins[5], Vector3::new(4.0, 5.0, 6.0));

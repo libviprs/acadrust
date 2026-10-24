@@ -49,7 +49,10 @@ struct SectionWriter {
 }
 
 impl SectionWriter {
-    fn with_encoding(version: DxfVersion, encoding: &'static encoding_rs::Encoding) -> Self {
+    fn with_encoding(
+        version: DxfVersion,
+        encoding: crate::io::dxf::code_page::LegacyEncoding,
+    ) -> Self {
         let dwg = DwgVersion::from_dxf_version(version).unwrap_or(DwgVersion::AC15);
 
         let inner = if version >= DxfVersion::AC1021 {
@@ -223,9 +226,9 @@ pub fn write_header_with_encoding(
     version: DxfVersion,
     header: &HeaderVariables,
     maintenance_version: u8,
-    encoding: &'static encoding_rs::Encoding,
+    encoding: impl Into<crate::io::dxf::code_page::LegacyEncoding>,
 ) -> Vec<u8> {
-    let mut w = SectionWriter::with_encoding(version, encoding);
+    let mut w = SectionWriter::with_encoding(version, encoding.into());
     write_header_fields(&mut w, version, header);
     let section_data = w.finalize();
     wrap_with_sentinels_and_crc(version, maintenance_version, &section_data)
@@ -410,7 +413,7 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
     }
 
     w.write_bit(h.display_silhouette);
-    w.write_bit(h.polyline_ellipse); // PELLIPSE
+    w.write_bit(h.create_ellipse_as_polyline); // PELLIPSE
     w.write_bit_short(h.proxy_graphics);
 
     if r13_14_only(v) {
@@ -493,9 +496,10 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
     w.write_variable_text(&h.menu_name);
 
     // ── Date/time (Common) ──
-    let (cd, cms) = julian_to_day_ms(h.create_date_julian);
+    // DWG stores universal time.
+    let (cd, cms) = julian_to_day_ms(h.universal_create_or_local());
     w.write_datetime(cd, cms);
-    let (ud, ums) = julian_to_day_ms(h.update_date_julian);
+    let (ud, ums) = julian_to_day_ms(h.universal_update_or_local());
     w.write_datetime(ud, ums);
 
     if r2004_plus(v) {
@@ -641,7 +645,7 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
 
     // R2007+ dimension extras
     if r2007_plus(v) {
-        w.write_bit_double(h.dim_fixed_ext_length); // DIMFXL
+        w.write_bit_double(h.dim_fixed_ext_line_length); // DIMFXL
         w.write_bit_double(h.dim_jog_angle); // DIMJOGANG
         w.write_bit_short(h.dim_text_fill); // DIMTFILL
         w.write_cm_color(&h.dim_text_fill_color); // DIMTFILLCLR
@@ -724,7 +728,7 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
 
     // R2007+: DIMFXLON
     if r2007_plus(v) {
-        w.write_bit(h.dim_fixed_ext_length_on); // DIMFXLON
+        w.write_bit(h.dim_fixed_ext_line_on); // DIMFXLON
     }
 
     // R2010+: extra dimension fields
@@ -739,7 +743,11 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
     // R2000+ dimension handles
     if r2000_plus(v) {
         w.write_handle_ref(DwgReferenceType::HardPointer, h.dim_text_style_handle);
-        w.write_handle_ref(DwgReferenceType::HardPointer, h.dim_leader_arrow_block_handle);
+        // DIMLDRBLK, DIMBLK, DIMBLK1, DIMBLK2
+        w.write_handle_ref(
+            DwgReferenceType::HardPointer,
+            h.dim_leader_arrow_block_handle,
+        );
         w.write_handle_ref(DwgReferenceType::HardPointer, h.dim_arrow_block_handle);
         w.write_handle_ref(DwgReferenceType::HardPointer, h.dim_arrow_block1_handle);
         w.write_handle_ref(DwgReferenceType::HardPointer, h.dim_arrow_block2_handle);
@@ -903,9 +911,9 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
         w.write_byte(h.dwf_frame as u8); // DWFFRAME
         w.write_byte(h.dgn_frame as u8); // DGNFRAME
 
-        w.write_bit(false); // unknown
+        w.write_bit(h.real_world_scale);
 
-        w.write_cm_color(&h.interfere_color);
+        w.write_cm_color(&h.interference_color);
 
         w.write_handle_ref(DwgReferenceType::HardPointer, Handle::NULL); // INTERFEREOBJVS
         w.write_handle_ref(DwgReferenceType::HardPointer, Handle::NULL); // INTERFEREVPVS

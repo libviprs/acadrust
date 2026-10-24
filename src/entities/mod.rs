@@ -22,7 +22,6 @@ pub mod circle;
 pub mod dimension;
 pub mod ellipse;
 pub mod embedded_entity;
-pub mod explode;
 pub mod extended_entity;
 pub mod face3d;
 pub mod hatch;
@@ -33,8 +32,8 @@ pub mod light;
 pub mod line;
 pub mod lwpolyline;
 pub mod mesh;
-pub mod mirror;
 pub mod mline;
+pub mod modification;
 pub mod mtext;
 pub mod mtext_format;
 pub mod multileader;
@@ -58,14 +57,18 @@ pub mod surface;
 pub mod table;
 pub mod text;
 pub mod tolerance;
-pub mod transform;
-pub mod translate;
 pub mod underlay;
 pub mod unknown_entity;
 pub mod view_border;
 pub mod viewport;
 pub mod wipeout;
 pub mod xline;
+
+// Preserve existing module paths for callers of the modification tools.
+pub use modification::mirror::MirrorOptions;
+pub use modification::mirror3d::MirrorPlane;
+pub use modification::rotate::RotationAxis;
+pub use modification::{explode, mirror, mirror3d, rotate, rotate3d, transform, translate};
 
 pub use arc::Arc;
 pub use attribute_definition::{
@@ -105,7 +108,7 @@ pub use multileader::{
     TextAttachmentDirectionType, TextAttachmentPointType, TextAttachmentType,
 };
 pub use ole2frame::{Ole2Frame, OleFrameEnvelope, OleObjectType};
-pub use ole_presentation::{extract_presentation, OlePresentation};
+pub use ole_presentation::{extract_presentation, ole_user_type, OlePresentation};
 pub use point::Point;
 pub use polyface_mesh::{
     PolyfaceFace, PolyfaceMesh, PolyfaceMeshFlags, PolyfaceSmoothType, PolyfaceVertex,
@@ -153,43 +156,77 @@ pub use viewport::{GridFlags, StandardView, Viewport, ViewportRenderMode, Viewpo
 pub use wipeout::{Wipeout, WipeoutClipMode, WipeoutClipType, WipeoutDisplayFlags};
 pub use xline::XLine;
 
-/// Base trait for all CAD entities
+/// Base trait for all CAD entities.
+///
+/// Common fields live on [`EntityCommon`]. Implement [`Self::common`] and
+/// [`Self::common_mut`]; the handle, layer, color, line weight, transparency,
+/// and visibility methods forward to those.
 pub trait Entity {
+    /// Common entity fields.
+    fn common(&self) -> &EntityCommon;
+
+    /// Mutable common entity fields.
+    fn common_mut(&mut self) -> &mut EntityCommon;
+
     /// Get the entity's unique handle
-    fn handle(&self) -> Handle;
+    fn handle(&self) -> Handle {
+        self.common().handle
+    }
 
     /// Set the entity's handle
-    fn set_handle(&mut self, handle: Handle);
+    fn set_handle(&mut self, handle: Handle) {
+        self.common_mut().handle = handle;
+    }
 
     /// Get the entity's layer name
-    fn layer(&self) -> &str;
+    fn layer(&self) -> &str {
+        &self.common().layer
+    }
 
     /// Set the entity's layer name
-    fn set_layer(&mut self, layer: String);
+    fn set_layer(&mut self, layer: String) {
+        self.common_mut().layer = layer;
+    }
 
     /// Get the entity's color
-    fn color(&self) -> Color;
+    fn color(&self) -> Color {
+        self.common().color
+    }
 
     /// Set the entity's color
-    fn set_color(&mut self, color: Color);
+    fn set_color(&mut self, color: Color) {
+        self.common_mut().color = color;
+    }
 
     /// Get the entity's line weight
-    fn line_weight(&self) -> LineWeight;
+    fn line_weight(&self) -> LineWeight {
+        self.common().line_weight
+    }
 
     /// Set the entity's line weight
-    fn set_line_weight(&mut self, weight: LineWeight);
+    fn set_line_weight(&mut self, weight: LineWeight) {
+        self.common_mut().line_weight = weight;
+    }
 
     /// Get the entity's transparency
-    fn transparency(&self) -> Transparency;
+    fn transparency(&self) -> Transparency {
+        self.common().transparency
+    }
 
     /// Set the entity's transparency
-    fn set_transparency(&mut self, transparency: Transparency);
+    fn set_transparency(&mut self, transparency: Transparency) {
+        self.common_mut().transparency = transparency;
+    }
 
     /// Check if the entity is invisible
-    fn is_invisible(&self) -> bool;
+    fn is_invisible(&self) -> bool {
+        self.common().invisible
+    }
 
     /// Set the entity's visibility
-    fn set_invisible(&mut self, invisible: bool);
+    fn set_invisible(&mut self, invisible: bool) {
+        self.common_mut().invisible = invisible;
+    }
 
     /// Get the bounding box of the entity
     fn bounding_box(&self) -> BoundingBox3D;
@@ -216,6 +253,102 @@ pub trait Entity {
         self.apply_transform(&Transform::from_rotation(axis, angle));
     }
 
+    /// Rotate around `center` in the world XY plane.
+    fn rotate(&mut self, center: Vector3, angle: f64) {
+        self.rotate_about_axis(center, Vector3::UNIT_Z, angle);
+    }
+
+    /// Rotate around the world-space line through `center` parallel to `axis`.
+    fn rotate_about_axis(&mut self, center: Vector3, axis: Vector3, angle: f64) {
+        if !center.x.is_finite()
+            || !center.y.is_finite()
+            || !center.z.is_finite()
+            || !axis.x.is_finite()
+            || !axis.y.is_finite()
+            || !axis.z.is_finite()
+            || !angle.is_finite()
+            || axis.length_squared() <= f64::EPSILON
+            || angle == 0.0
+        {
+            return;
+        }
+        self.apply_transform(&Transform::from_rotation_with_origin(axis, angle, center));
+    }
+
+    /// Rotate around the 3D line passing through `first` and `second`.
+    fn rotate_about_line(&mut self, first: Vector3, second: Vector3, angle: f64) {
+        let axis = second - first;
+        if first.x.is_finite()
+            && first.y.is_finite()
+            && first.z.is_finite()
+            && second.x.is_finite()
+            && second.y.is_finite()
+            && second.z.is_finite()
+            && angle.is_finite()
+            && axis.length_squared() > f64::EPSILON
+        {
+            self.rotate_about_axis(first, axis, angle);
+        }
+    }
+
+    /// Rotate using one of the CAD axis-selection modes.
+    fn rotate_with_axis(&mut self, axis: crate::entities::rotate::RotationAxis, angle: f64) {
+        match axis {
+            crate::entities::rotate::RotationAxis::TwoPoint { first, second } => {
+                self.rotate_about_line(first, second, angle)
+            }
+            crate::entities::rotate::RotationAxis::Entity { origin, direction }
+            | crate::entities::rotate::RotationAxis::Last { origin, direction }
+            | crate::entities::rotate::RotationAxis::View { origin, direction } => {
+                self.rotate_about_axis(origin, direction, angle)
+            }
+            crate::entities::rotate::RotationAxis::XAxis { origin } => {
+                self.rotate_about_axis(origin, Vector3::UNIT_X, angle)
+            }
+            crate::entities::rotate::RotationAxis::YAxis { origin } => {
+                self.rotate_about_axis(origin, Vector3::UNIT_Y, angle)
+            }
+            crate::entities::rotate::RotationAxis::ZAxis { origin } => {
+                self.rotate_about_axis(origin, Vector3::UNIT_Z, angle)
+            }
+        }
+    }
+
+    /// Apply the 3D CAD rotation axis selector.
+    fn rotate3d(&mut self, axis: crate::entities::rotate::RotationAxis, angle: f64) {
+        self.rotate_with_axis(axis, angle);
+    }
+
+    /// Apply a rotation around `axis` through `origin`.
+    fn apply_rotation_with_origin(&mut self, axis: Vector3, angle: f64, origin: Vector3) {
+        self.rotate_about_axis(origin, axis, angle);
+    }
+
+    /// Rotate from a reference point to a target point around `center` in the
+    /// world XY plane.
+    fn rotate_by_points(&mut self, center: Vector3, reference: Vector3, target: Vector3) {
+        if let Some(angle) =
+            crate::entities::rotate::angle_from_points(center, Vector3::UNIT_Z, reference, target)
+        {
+            self.rotate_about_axis(center, Vector3::UNIT_Z, angle);
+        }
+    }
+
+    /// Rotate from a reference point to a target point around an arbitrary axis.
+    fn rotate_about_axis_by_points(
+        &mut self,
+        center: Vector3,
+        axis: Vector3,
+        reference: Vector3,
+        target: Vector3,
+    ) {
+        if let Some(angle) =
+            crate::entities::rotate::angle_from_points(center, axis, reference, target)
+        {
+            self.rotate_about_axis(center, axis, angle);
+        }
+    }
+
     /// Apply uniform scaling
     fn apply_scaling(&mut self, scale: f64) {
         self.apply_transform(&Transform::from_scale(scale));
@@ -236,7 +369,14 @@ pub trait Entity {
     /// Override this for entities that need post-processing after mirroring
     /// (e.g., arc angle swaps, bulge negation, face winding reversal).
     fn apply_mirror(&mut self, transform: &Transform) {
-        self.apply_transform(transform);
+        if mirror::valid_transform(transform) {
+            self.apply_transform(transform);
+        }
+    }
+
+    /// Apply a reflection with explicit text and hatch policies.
+    fn apply_mirror_with_options(&mut self, transform: &Transform, _options: MirrorOptions) {
+        self.apply_mirror(transform);
     }
 
     /// Mirror the entity across the YZ plane (negate X coordinates)
@@ -256,12 +396,32 @@ pub trait Entity {
 
     /// Mirror the entity across a line defined by two points (in the XY plane)
     fn mirror_about_line(&mut self, p1: Vector3, p2: Vector3) {
-        self.apply_mirror(&Transform::from_mirror_line(p1, p2));
+        self.mirror(p1, p2);
+    }
+
+    /// Planar MIRROR through the points' XY projections, preserving height.
+    fn mirror(&mut self, first: Vector3, second: Vector3) {
+        self.mirror_with_options(first, second, MirrorOptions::default());
+    }
+
+    /// Planar MIRROR with explicit text and hatch policies.
+    fn mirror_with_options(&mut self, first: Vector3, second: Vector3, options: MirrorOptions) {
+        self.apply_mirror_with_options(&Transform::from_mirror_line(first, second), options);
+    }
+
+    /// MIRROR3D across the selected world-space plane.
+    fn mirror3d(&mut self, plane: MirrorPlane) {
+        self.mirror3d_with_options(plane, MirrorOptions::default());
+    }
+
+    /// MIRROR3D with explicit text and hatch policies.
+    fn mirror3d_with_options(&mut self, plane: MirrorPlane, options: MirrorOptions) {
+        self.apply_mirror_with_options(&plane.transform(), options);
     }
 
     /// Mirror the entity across an arbitrary plane
     fn mirror_about_plane(&mut self, point: Vector3, normal: Vector3) {
-        self.apply_mirror(&Transform::from_mirror_plane(point, normal));
+        self.mirror3d(MirrorPlane::PointNormal { point, normal });
     }
 }
 
@@ -276,7 +436,24 @@ pub struct RawRecord {
     pub version: crate::types::DxfVersion,
 }
 
-/// Common entity data shared by all entities
+/// Native AC1009 fields which do not have a corresponding DXF entity field.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct R12EntityMetadata {
+    /// Unsigned native viewport reference, including an explicitly stored zero.
+    pub viewport: Option<u16>,
+    /// Viewport references of ordered VERTEX/ATTRIB children followed by SEQEND.
+    /// The final entry belongs to SEQEND and remains last when children are added.
+    pub child_viewports: Vec<Option<u16>>,
+}
+
+/// Common entity data shared by all entities.
+///
+/// With the `serde` feature, native references and flags are retained alongside
+/// the public appearance fields. Older field-named input (such as JSON) without
+/// these fields defaults optional references and `entity_mode` to `None`, and
+/// flags to zero. Positional formats require a separate compatibility strategy.
+/// Raw DWG records, graphic bytes and the derived data-store bit remain excluded.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EntityCommon {
@@ -284,6 +461,11 @@ pub struct EntityCommon {
     pub handle: Handle,
     /// Layer name
     pub layer: String,
+    /// DWG layer handle as read from the file. Preserved so consumers can tell
+    /// an entity on layer "0" from one whose layer reference did not resolve
+    /// (the DWG reader falls back to `layer = "0"` in that case).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub layer_handle: Option<Handle>,
     /// Color
     pub color: Color,
     /// Line weight
@@ -292,7 +474,7 @@ pub struct EntityCommon {
     pub linetype: String,
     /// DWG linetype handle. Preserved so R13/R14 entities can round-trip
     /// non-ByLayer linetypes even when the table name cannot be resolved.
-    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub linetype_handle: Option<Handle>,
     /// Linetype scale factor (default 1.0)
     pub linetype_scale: f64,
@@ -318,34 +500,37 @@ pub struct EntityCommon {
 
     // ── Native reference/round-trip fields ──
     /// AcDbColor object handle for a color-book color — R2004+.
-    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub color_book_handle: Option<Handle>,
     /// Full visual-style override handle — R2010+; DXF code 348.
     pub full_visual_style_handle: Option<Handle>,
     /// Face visual-style override handle — R2010+.
-    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub face_visual_style_handle: Option<Handle>,
     /// Edge visual-style override handle — R2010+.
-    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub edge_visual_style_handle: Option<Handle>,
     /// Material flags (BB: 00=bylayer, 01=byblock, 10=reserved, 11=handle) — R2007+
-    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub material_flags: u8,
     /// Material handle (only valid when material_flags == 0b11) — R2007+
-    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub material_handle: Option<Handle>,
     /// Shadow flags (RC) — R2007+
-    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub shadow_flags: u8,
     /// Plotstyle flags (BB: 00=bylayer, 01=byblock, 10=reserved, 11=handle) — R2000+
-    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub plotstyle_flags: u8,
     /// Plotstyle handle (only valid when plotstyle_flags == 0b11) — R2000+
-    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub plotstyle_handle: Option<Handle>,
     /// Entity mode (0=owned, 1=paper, 2=model) — raw DWG value for round-trip
-    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub entity_mode: Option<u8>,
+    /// Native AC1009 viewport references retained across edits and DWG writes.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub r12_metadata: Option<R12EntityMetadata>,
     /// R2013+ `has_ds_data` bit: the entity's modeler geometry (3DSOLID/REGION/
     /// BODY/SURFACE) is stored as a SAB blob in the `AcDb:AcDsPrototype_1b`
     /// data-store section rather than inline. Set by the DWG reader; the writer
@@ -365,17 +550,8 @@ pub struct EntityCommon {
 
 impl EntityCommon {
     fn preserve_storage_data_from(&mut self, source: &Self) {
-        self.linetype_handle = source.linetype_handle;
         self.graphic_data = source.graphic_data.clone();
-        self.color_book_handle = source.color_book_handle;
-        self.face_visual_style_handle = source.face_visual_style_handle;
-        self.edge_visual_style_handle = source.edge_visual_style_handle;
-        self.material_flags = source.material_flags;
-        self.material_handle = source.material_handle;
-        self.shadow_flags = source.shadow_flags;
-        self.plotstyle_flags = source.plotstyle_flags;
-        self.plotstyle_handle = source.plotstyle_handle;
-        self.entity_mode = source.entity_mode;
+        self.r12_metadata = source.r12_metadata.clone();
         self.has_ds_data = source.has_ds_data;
     }
 
@@ -385,6 +561,7 @@ impl EntityCommon {
             raw_record: None,
             handle: Handle::NULL,
             layer: "0".to_string(),
+            layer_handle: None,
             color: Color::ByLayer,
             line_weight: LineWeight::ByLayer,
             linetype: String::new(),
@@ -408,6 +585,7 @@ impl EntityCommon {
             plotstyle_flags: 0,
             plotstyle_handle: None,
             entity_mode: None,
+            r12_metadata: None,
             has_ds_data: false,
         }
     }
@@ -457,15 +635,15 @@ pub enum EntityType {
     /// Text entity
     Text(Text),
     /// Multi-line text entity
-    MText(MText),
+    MText(Box<MText>),
     /// Spline entity
     Spline(Spline),
     /// Helix entity (spline-derived 3D spiral)
-    Helix(Helix),
+    Helix(Box<Helix>),
     /// Dimension entity
-    Dimension(Dimension),
+    Dimension(Box<Dimension>),
     /// Hatch entity
-    Hatch(Hatch),
+    Hatch(Box<Hatch>),
     /// Solid entity
     Solid(Solid),
     /// 3D Face entity
@@ -481,7 +659,7 @@ pub enum EntityType {
     /// XLine entity (construction line, infinite)
     XLine(XLine),
     /// Viewport entity (paper space viewport)
-    Viewport(Viewport),
+    Viewport(Box<Viewport>),
     /// Attribute definition entity
     AttributeDefinition(AttributeDefinition),
     /// Attribute entity (block attribute instance)
@@ -489,7 +667,7 @@ pub enum EntityType {
     /// Leader entity
     Leader(Leader),
     /// MultiLeader entity
-    MultiLeader(MultiLeader),
+    MultiLeader(Box<MultiLeader>),
     /// MLine (multiline) entity
     MLine(MLine),
     /// Mesh entity
@@ -503,9 +681,9 @@ pub enum EntityType {
     /// Body entity
     Body(Body),
     /// Surface entity (ACAD_SURFACE family: lofted/swept/extruded/etc.)
-    Surface(Surface),
+    Surface(Box<Surface>),
     /// Table entity
-    Table(Table),
+    Table(Box<Table>),
     /// Tolerance entity (geometric tolerancing)
     Tolerance(Tolerance),
     /// PolyfaceMesh entity
@@ -519,23 +697,27 @@ pub enum EntityType {
     /// End-of-sequence marker
     Seqend(Seqend),
     /// OLE2 embedded object
-    Ole2Frame(Ole2Frame),
+    Ole2Frame(Box<Ole2Frame>),
     /// Polygon mesh (3D surface mesh)
     PolygonMesh(PolygonMeshEntity),
     /// Light entity (point / spot / distant light source)
-    Light(Light),
+    Light(Box<Light>),
     SectionSymbol(SectionSymbol),
     ViewBorder(ViewBorder),
     /// Structured class-based and legacy entities.
-    Extended(ExtendedEntity),
+    Extended(Box<ExtendedEntity>),
     /// Unknown / unsupported entity type (common fields only)
     Unknown(UnknownEntity),
 }
 
 impl EntityType {
     /// Restore storage-only data omitted from serde after editing the public
-    /// representation of an entity. The source and destination must have the
-    /// same variant and identity; callers remain responsible for that check.
+    /// representation of an entity. Serialized common references and flags keep
+    /// their edited values, including `None` and zero. For legacy R12 editing,
+    /// source `r12_metadata` is still restored even though it is serialized.
+    /// The source `raw_record` replay cache is not restored.
+    /// The source and destination must have the same variant and identity;
+    /// callers remain responsible for that check.
     pub fn preserve_storage_data_from(&mut self, source: &Self) {
         self.common_mut()
             .preserve_storage_data_from(source.common());
@@ -565,11 +747,11 @@ impl EntityType {
             EntityType::Polyline3D(e) => e,
             EntityType::LwPolyline(e) => e,
             EntityType::Text(e) => e,
-            EntityType::MText(e) => e,
+            EntityType::MText(e) => e.as_ref(),
             EntityType::Spline(e) => e,
-            EntityType::Helix(e) => e,
-            EntityType::Dimension(e) => e,
-            EntityType::Hatch(e) => e,
+            EntityType::Helix(e) => e.as_ref(),
+            EntityType::Dimension(e) => e.as_ref(),
+            EntityType::Hatch(e) => e.as_ref(),
             EntityType::Solid(e) => e,
             EntityType::Face3D(e) => e,
             EntityType::Insert(e) => e,
@@ -577,31 +759,31 @@ impl EntityType {
             EntityType::BlockEnd(e) => e,
             EntityType::Ray(e) => e,
             EntityType::XLine(e) => e,
-            EntityType::Viewport(e) => e,
+            EntityType::Viewport(e) => e.as_ref(),
             EntityType::AttributeDefinition(e) => e,
             EntityType::AttributeEntity(e) => e,
             EntityType::Leader(e) => e,
-            EntityType::MultiLeader(e) => e,
+            EntityType::MultiLeader(e) => e.as_ref(),
             EntityType::MLine(e) => e,
             EntityType::Mesh(e) => e,
             EntityType::RasterImage(e) => e,
             EntityType::Solid3D(e) => e,
             EntityType::Region(e) => e,
             EntityType::Body(e) => e,
-            EntityType::Surface(e) => e,
-            EntityType::Table(e) => e,
+            EntityType::Surface(e) => e.as_ref(),
+            EntityType::Table(e) => e.as_ref(),
             EntityType::Tolerance(e) => e,
             EntityType::PolyfaceMesh(e) => e,
             EntityType::Wipeout(e) => e,
             EntityType::Shape(e) => e,
             EntityType::Underlay(e) => e,
             EntityType::Seqend(e) => e,
-            EntityType::Ole2Frame(e) => e,
+            EntityType::Ole2Frame(e) => e.as_ref(),
             EntityType::PolygonMesh(e) => e,
-            EntityType::Light(e) => e,
+            EntityType::Light(e) => e.as_ref(),
             EntityType::SectionSymbol(e) => e,
             EntityType::ViewBorder(e) => e,
-            EntityType::Extended(e) => e,
+            EntityType::Extended(e) => e.as_ref(),
             EntityType::Unknown(e) => e,
         }
     }
@@ -618,12 +800,12 @@ impl EntityType {
             EntityType::Polyline2D(e) => e,
             EntityType::Polyline3D(e) => e,
             EntityType::LwPolyline(e) => e,
-            EntityType::MText(e) => e,
+            EntityType::MText(e) => e.as_mut(),
             EntityType::Text(e) => e,
             EntityType::Spline(e) => e,
-            EntityType::Helix(e) => e,
-            EntityType::Dimension(e) => e,
-            EntityType::Hatch(e) => e,
+            EntityType::Helix(e) => e.as_mut(),
+            EntityType::Dimension(e) => e.as_mut(),
+            EntityType::Hatch(e) => e.as_mut(),
             EntityType::Solid(e) => e,
             EntityType::Face3D(e) => e,
             EntityType::Insert(e) => e,
@@ -631,141 +813,43 @@ impl EntityType {
             EntityType::BlockEnd(e) => e,
             EntityType::Ray(e) => e,
             EntityType::XLine(e) => e,
-            EntityType::Viewport(e) => e,
+            EntityType::Viewport(e) => e.as_mut(),
             EntityType::AttributeDefinition(e) => e,
             EntityType::AttributeEntity(e) => e,
             EntityType::Leader(e) => e,
-            EntityType::MultiLeader(e) => e,
+            EntityType::MultiLeader(e) => e.as_mut(),
             EntityType::MLine(e) => e,
             EntityType::Mesh(e) => e,
             EntityType::RasterImage(e) => e,
             EntityType::Solid3D(e) => e,
             EntityType::Region(e) => e,
             EntityType::Body(e) => e,
-            EntityType::Surface(e) => e,
-            EntityType::Table(e) => e,
+            EntityType::Surface(e) => e.as_mut(),
+            EntityType::Table(e) => e.as_mut(),
             EntityType::Tolerance(e) => e,
             EntityType::PolyfaceMesh(e) => e,
             EntityType::Wipeout(e) => e,
             EntityType::Shape(e) => e,
             EntityType::Underlay(e) => e,
             EntityType::Seqend(e) => e,
-            EntityType::Ole2Frame(e) => e,
+            EntityType::Ole2Frame(e) => e.as_mut(),
             EntityType::PolygonMesh(e) => e,
-            EntityType::Light(e) => e,
+            EntityType::Light(e) => e.as_mut(),
             EntityType::SectionSymbol(e) => e,
             EntityType::ViewBorder(e) => e,
-            EntityType::Extended(e) => e,
+            EntityType::Extended(e) => e.as_mut(),
             EntityType::Unknown(e) => e,
         }
     }
 
     /// Get a reference to the entity's common data
     pub fn common(&self) -> &EntityCommon {
-        match self {
-            EntityType::Point(e) => &e.common,
-            EntityType::Line(e) => &e.common,
-            EntityType::Circle(e) => &e.common,
-            EntityType::Arc(e) => &e.common,
-            EntityType::Ellipse(e) => &e.common,
-            EntityType::Polyline(e) => &e.common,
-            EntityType::Polyline2D(e) => &e.common,
-            EntityType::Polyline3D(e) => &e.common,
-            EntityType::LwPolyline(e) => &e.common,
-            EntityType::Text(e) => &e.common,
-            EntityType::MText(e) => &e.common,
-            EntityType::Spline(e) => &e.common,
-            EntityType::Helix(e) => &e.common,
-            EntityType::Dimension(e) => &e.base().common,
-            EntityType::Hatch(e) => &e.common,
-            EntityType::Solid(e) => &e.common,
-            EntityType::Face3D(e) => &e.common,
-            EntityType::Insert(e) => &e.common,
-            EntityType::Block(e) => &e.common,
-            EntityType::BlockEnd(e) => &e.common,
-            EntityType::Ray(e) => &e.common,
-            EntityType::XLine(e) => &e.common,
-            EntityType::Viewport(e) => &e.common,
-            EntityType::AttributeDefinition(e) => &e.common,
-            EntityType::AttributeEntity(e) => &e.common,
-            EntityType::Leader(e) => &e.common,
-            EntityType::MultiLeader(e) => &e.common,
-            EntityType::MLine(e) => &e.common,
-            EntityType::Mesh(e) => &e.common,
-            EntityType::RasterImage(e) => &e.common,
-            EntityType::Solid3D(e) => &e.common,
-            EntityType::Region(e) => &e.common,
-            EntityType::Body(e) => &e.common,
-            EntityType::Surface(e) => &e.common,
-            EntityType::Table(e) => &e.common,
-            EntityType::Tolerance(e) => &e.common,
-            EntityType::PolyfaceMesh(e) => &e.common,
-            EntityType::Wipeout(e) => &e.common,
-            EntityType::Shape(e) => &e.common,
-            EntityType::Underlay(e) => &e.common,
-            EntityType::Seqend(e) => &e.common,
-            EntityType::Ole2Frame(e) => &e.common,
-            EntityType::PolygonMesh(e) => &e.common,
-            EntityType::Light(e) => &e.common,
-            EntityType::SectionSymbol(e) => &e.common,
-            EntityType::ViewBorder(e) => &e.common,
-            EntityType::Extended(e) => &e.common,
-            EntityType::Unknown(e) => &e.common,
-        }
+        self.as_entity().common()
     }
 
     /// Get a mutable reference to the entity's common data
     pub fn common_mut(&mut self) -> &mut EntityCommon {
-        match self {
-            EntityType::Point(e) => &mut e.common,
-            EntityType::Line(e) => &mut e.common,
-            EntityType::Circle(e) => &mut e.common,
-            EntityType::Arc(e) => &mut e.common,
-            EntityType::Ellipse(e) => &mut e.common,
-            EntityType::Polyline(e) => &mut e.common,
-            EntityType::Polyline2D(e) => &mut e.common,
-            EntityType::Polyline3D(e) => &mut e.common,
-            EntityType::LwPolyline(e) => &mut e.common,
-            EntityType::Text(e) => &mut e.common,
-            EntityType::MText(e) => &mut e.common,
-            EntityType::Spline(e) => &mut e.common,
-            EntityType::Helix(e) => &mut e.common,
-            EntityType::Dimension(e) => &mut e.base_mut().common,
-            EntityType::Hatch(e) => &mut e.common,
-            EntityType::Solid(e) => &mut e.common,
-            EntityType::Face3D(e) => &mut e.common,
-            EntityType::Insert(e) => &mut e.common,
-            EntityType::Block(e) => &mut e.common,
-            EntityType::BlockEnd(e) => &mut e.common,
-            EntityType::Ray(e) => &mut e.common,
-            EntityType::XLine(e) => &mut e.common,
-            EntityType::Viewport(e) => &mut e.common,
-            EntityType::AttributeDefinition(e) => &mut e.common,
-            EntityType::AttributeEntity(e) => &mut e.common,
-            EntityType::Leader(e) => &mut e.common,
-            EntityType::MultiLeader(e) => &mut e.common,
-            EntityType::MLine(e) => &mut e.common,
-            EntityType::Mesh(e) => &mut e.common,
-            EntityType::RasterImage(e) => &mut e.common,
-            EntityType::Solid3D(e) => &mut e.common,
-            EntityType::Region(e) => &mut e.common,
-            EntityType::Body(e) => &mut e.common,
-            EntityType::Surface(e) => &mut e.common,
-            EntityType::Table(e) => &mut e.common,
-            EntityType::Tolerance(e) => &mut e.common,
-            EntityType::PolyfaceMesh(e) => &mut e.common,
-            EntityType::Wipeout(e) => &mut e.common,
-            EntityType::Shape(e) => &mut e.common,
-            EntityType::Underlay(e) => &mut e.common,
-            EntityType::Seqend(e) => &mut e.common,
-            EntityType::Ole2Frame(e) => &mut e.common,
-            EntityType::PolygonMesh(e) => &mut e.common,
-            EntityType::Light(e) => &mut e.common,
-            EntityType::SectionSymbol(e) => &mut e.common,
-            EntityType::ViewBorder(e) => &mut e.common,
-            EntityType::Extended(e) => &mut e.common,
-            EntityType::Unknown(e) => &mut e.common,
-        }
+        self.as_entity_mut().common_mut()
     }
 }
 
@@ -797,5 +881,11 @@ mod storage_data_tests {
         assert_eq!(edited.common.graphic_data, Some(vec![1, 2, 3]));
         assert_eq!(edited.raw_dwg_data, Some(vec![4, 5, 6]));
         assert_eq!(edited.raw_dxf_codes, Some(vec![(100, "payload".into())]));
+    }
+
+    #[test]
+    fn entity_type_stays_narrow() {
+        let size = std::mem::size_of::<EntityType>();
+        assert!(size <= 856, "EntityType is {size} bytes");
     }
 }

@@ -120,6 +120,25 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 self.writer.write_bool(290, *is_implied)?;
                 self.writer.write_bool(290, *is_active)?;
             }
+            AssocConstraintNodeData::Composite {
+                owner_id,
+                is_implied,
+                is_active,
+                owned_constraint_ids,
+            } => {
+                self.writer.write_i32(90, *owner_id)?;
+                self.writer.write_bool(290, *is_implied)?;
+                self.writer.write_bool(290, *is_active)?;
+                self.writer
+                    .write_i32(90, owned_constraint_ids.len() as i32)?;
+                for constraint_id in owned_constraint_ids {
+                    self.writer.write_i32(90, *constraint_id)?;
+                }
+            }
+            AssocConstraintNodeData::HelpParameter { value, reserved } => {
+                self.writer.write_double(40, *value)?;
+                self.writer.write_bool(290, *reserved)?;
+            }
             AssocConstraintNodeData::Angle {
                 owner_id,
                 is_implied,
@@ -210,6 +229,24 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                     self.writer.write_point3d(10, *point)?;
                 }
             }
+            AssocConstraintNodeData::RigidSet {
+                geometry_dependency,
+                geometry_node_id,
+                reserved,
+                transform,
+                geometry_ids,
+            } => {
+                self.writer.write_handle(330, *geometry_dependency)?;
+                self.writer.write_i32(90, *geometry_node_id)?;
+                self.writer.write_bool(290, *reserved)?;
+                for value in transform {
+                    self.writer.write_double(40, *value)?;
+                }
+                self.writer.write_i32(90, geometry_ids.len() as i32)?;
+                for geometry_id in geometry_ids {
+                    self.writer.write_i32(90, *geometry_id)?;
+                }
+            }
             AssocConstraintNodeData::Line {
                 geometry_dependency,
                 geometry_node_id,
@@ -257,7 +294,9 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 self.writer.write_double(40, *radius)?;
                 self.writer.write_double(40, *start_parameter)?;
                 self.writer.write_double(40, *end_parameter)?;
-                self.writer.write_double(40, *reserved)?;
+                if self.dxf_version >= crate::types::DxfVersion::AC1027 {
+                    self.writer.write_double(40, *reserved)?;
+                }
             }
             AssocConstraintNodeData::Arc {
                 geometry_dependency,
@@ -280,43 +319,88 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 self.writer.write_double(40, *radius)?;
                 self.writer.write_double(40, *start_parameter)?;
                 self.writer.write_double(40, *end_parameter)?;
-                self.writer.write_double(40, *reserved)?;
+                if self.dxf_version >= crate::types::DxfVersion::AC1027 {
+                    self.writer.write_double(40, *reserved)?;
+                }
                 self.writer.write_point3d(10, *start_point)?;
                 self.writer.write_point3d(11, *end_point)?;
             }
             AssocConstraintNodeData::Ellipse {
-                owner_id,
-                is_implied,
-                is_active,
+                geometry_dependency,
+                geometry_node_id,
                 center,
-                short_axis,
+                major_axis,
                 axis_ratio,
             } => {
-                self.writer.write_i32(90, *owner_id)?;
-                self.writer.write_bool(290, *is_implied)?;
-                self.writer.write_bool(290, *is_active)?;
+                self.writer.write_handle(330, *geometry_dependency)?;
+                self.writer.write_i32(90, *geometry_node_id)?;
                 self.writer.write_point3d(10, *center)?;
-                self.writer.write_point3d(11, *short_axis)?;
+                self.writer.write_point3d(11, *major_axis)?;
                 self.writer.write_double(40, *axis_ratio)?;
             }
             AssocConstraintNodeData::BoundedEllipse {
-                owner_id,
-                is_implied,
-                is_active,
+                geometry_dependency,
+                geometry_node_id,
                 center,
-                short_axis,
+                major_axis,
                 axis_ratio,
                 start_point,
                 end_point,
             } => {
-                self.writer.write_i32(90, *owner_id)?;
-                self.writer.write_bool(290, *is_implied)?;
-                self.writer.write_bool(290, *is_active)?;
+                self.writer.write_handle(330, *geometry_dependency)?;
+                self.writer.write_i32(90, *geometry_node_id)?;
                 self.writer.write_point3d(10, *center)?;
-                self.writer.write_point3d(11, *short_axis)?;
+                self.writer.write_point3d(11, *major_axis)?;
                 self.writer.write_double(40, *axis_ratio)?;
                 self.writer.write_point3d(10, *start_point)?;
                 self.writer.write_point3d(11, *end_point)?;
+            }
+            AssocConstraintNodeData::Spline {
+                geometry_dependency,
+                geometry_node_id,
+                rational,
+                periodic,
+                degree,
+                knot_tolerance,
+                knot_physical_length,
+                knot_grow_length,
+                knots,
+                weight_physical_length,
+                weight_grow_length,
+                weights,
+                control_point_physical_length,
+                control_point_grow_length,
+                control_points,
+                implicit_point_ids,
+            } => {
+                self.writer.write_handle(330, *geometry_dependency)?;
+                self.writer.write_i32(90, *geometry_node_id)?;
+                self.writer.write_bool(70, *rational)?;
+                self.writer.write_bool(70, *periodic)?;
+                self.writer.write_i32(90, *degree)?;
+                self.writer.write_double(40, *knot_tolerance)?;
+                self.writer.write_i32(90, knots.len() as i32)?;
+                self.writer.write_i32(90, *knot_physical_length)?;
+                self.writer.write_i32(90, *knot_grow_length)?;
+                for knot in knots {
+                    self.writer.write_double(40, *knot)?;
+                }
+                self.writer.write_i32(90, weights.len() as i32)?;
+                self.writer.write_i32(90, *weight_physical_length)?;
+                self.writer.write_i32(90, *weight_grow_length)?;
+                for weight in weights {
+                    self.writer.write_double(40, *weight)?;
+                }
+                self.writer.write_i32(90, control_points.len() as i32)?;
+                self.writer.write_i32(90, *control_point_physical_length)?;
+                self.writer.write_i32(90, *control_point_grow_length)?;
+                for point in control_points {
+                    self.writer.write_point3d(10, *point)?;
+                }
+                self.writer.write_i32(90, implicit_point_ids.len() as i32)?;
+                for point_id in implicit_point_ids {
+                    self.writer.write_i32(90, *point_id)?;
+                }
             }
         }
         Ok(())
@@ -557,8 +641,43 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.writer.write_subclass("AcDbAssocArrayActionBody")?;
         self.writer.write_i32(90, value.version)?;
         self.writer.write_string(1, &value.parameter_block)?;
+        self.writer.write_i32(90, value.item_list_version)?;
+        self.writer.write_i32(90, value.items.len() as i32)?;
+        self.writer.write_string(1, &value.item_class)?;
+        for item in &value.items {
+            self.writer.write_subclass("AcDbAssocArrayItem")?;
+            self.write_assoc_array_item(item)?;
+        }
         for item in value.transform {
             self.writer.write_double(40, item)?;
+        }
+        Ok(())
+    }
+
+    fn write_assoc_array_item(&mut self, item: &AssocArrayItem) -> Result<()> {
+        self.writer.write_i32(90, item.class_version)?;
+        for location in item.location {
+            self.writer.write_i32(90, location)?;
+        }
+        self.writer.write_i32(90, item.flags)?;
+        if item.uses_default_transform {
+            self.writer.write_point3d(11, item.x_direction)?;
+        } else {
+            for value in item.transform {
+                self.writer.write_double(40, value)?;
+            }
+        }
+        if let Some(matrix) = item.relative_transform {
+            for value in matrix {
+                self.writer.write_double(40, value)?;
+            }
+        }
+        if let Some(first) = item.first_handle {
+            self.writer.write_handle(330, first)?;
+        }
+        if item.flags & 0x10 != 0 {
+            self.writer
+                .write_handle(330, item.second_handle.unwrap_or(Handle::NULL))?;
         }
         Ok(())
     }
@@ -570,30 +689,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.writer.write_i32(90, value.items.len() as i32)?;
         self.writer.write_string(1, &value.class_name)?;
         for item in &value.items {
-            self.writer.write_i32(90, item.class_version)?;
-            for location in item.location {
-                self.writer.write_i32(90, location)?;
-            }
-            self.writer.write_i32(90, item.flags)?;
-            if item.uses_default_transform {
-                self.writer.write_point3d(11, item.x_direction)?;
-            } else {
-                for matrix_value in item.transform {
-                    self.writer.write_double(40, matrix_value)?;
-                }
-            }
-            if let Some(matrix) = item.relative_transform {
-                for matrix_value in matrix {
-                    self.writer.write_double(40, matrix_value)?;
-                }
-            }
-            if let Some(first) = item.first_handle {
-                self.writer.write_handle(330, first)?;
-            }
-            if item.flags & 0x10 != 0 {
-                self.writer
-                    .write_handle(330, item.second_handle.unwrap_or(Handle::NULL))?;
-            }
+            self.write_assoc_array_item(item)?;
         }
         self.writer.write_i32(90, value.item_count)?;
         self.writer.write_i32(90, value.row_count)?;
@@ -628,7 +724,10 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 for xref in &reference.xrefs {
                     self.writer.write_handle(331, *xref)?;
                 }
-                if reference.osnap_type != 0 {
+                if AssocDimensionReference::stores_main_subentity(
+                    reference.osnap_type,
+                    reference.xrefs.len(),
+                ) {
                     self.writer.write_i32(73, reference.main_subent_type)?;
                     self.writer.write_i32(91, reference.main_gs_marker)?;
                     for path in &reference.xref_paths {
@@ -662,15 +761,8 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.writer.write_i32(90, value.marker_two)?;
         self.writer.write_i32(90, value.associative_step_count)?;
         self.writer.write_i32(90, value.associative_subent_count)?;
-        self.writer.write_i32(90, value.steps.len() as i32)?;
-        for step in &value.steps {
-            self.writer.write_i32(90, *step)?;
-        }
-        if value.associative_subent_count != 0 || !value.subents.is_empty() {
-            self.writer.write_i32(90, value.subents.len() as i32)?;
-            for subent in &value.subents {
-                self.writer.write_i32(90, *subent)?;
-            }
+        for item in &value.values {
+            self.writer.write_i32(90, *item)?;
         }
         Ok(())
     }
@@ -695,11 +787,19 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 self.writer.write_subclass("AcDbAssocGeomDependency")?;
                 self.writer.write_i16(90, value.class_version)?;
                 self.writer.write_bool(290, value.enabled)?;
-                self.writer.write_subclass("AcDbAssocPersSubentId")?;
+                let subent = &value.persistent_subent;
+                let class_name = if subent.class_name.is_empty() {
+                    AssocPersistentSubentId::class_name_for_code(subent.class_code)
+                        .unwrap_or_default()
+                } else {
+                    subent.class_name.as_str()
+                };
+                self.writer.write_string(1, class_name)?;
+                for item in &subent.values {
+                    self.writer.write_i32(90, *item)?;
+                }
                 self.writer
-                    .write_string(1, &value.persistent_subent.class_name)?;
-                self.writer
-                    .write_bool(290, value.persistent_subent.dependent_on_compound_object)?;
+                    .write_bool(290, subent.dependent_on_compound_object)?;
             }
             AssociativeData::SurfaceActionBody(value) => self.write_assoc_surface(value)?,
             AssociativeData::Action(value) => self.write_assoc_action(value)?,
@@ -726,12 +826,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 for marker in value.markers {
                     self.writer.write_i32(90, marker)?;
                 }
-                self.writer.write_i32(90, value.steps.len() as i32)?;
-                for step in &value.steps {
-                    self.writer.write_i32(90, *step)?;
-                }
-                self.writer.write_i32(90, value.subent_count)?;
-                for item in &value.subent_data {
+                for item in &value.values {
                     self.writer.write_i32(90, *item)?;
                 }
                 self.writer.write_bool(290, value.final_flag)?;
@@ -744,11 +839,23 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 self.writer.write_handle(330, value.parameter)?;
                 self.writer.write_bool(290, value.has_action)?;
                 self.writer.write_i32(90, value.action_type)?;
+                for item in &value.curve {
+                    match item {
+                        AssocCurveValue::Bool(value) => self.writer.write_bool(70, *value)?,
+                        AssocCurveValue::Int(value) => self.writer.write_i32(90, *value)?,
+                        AssocCurveValue::Real(value) => self.writer.write_double(40, *value)?,
+                        AssocCurveValue::Point(value) => {
+                            self.writer.write_double(10, value.x)?;
+                            self.writer.write_double(20, value.y)?;
+                            self.writer.write_double(30, value.z)?;
+                        }
+                    }
+                }
             }
             AssociativeData::ConstraintGroup(value) => {
                 self.write_assoc_action(&value.action)?;
-                self.writer.write_subclass("AcDbAssoc2dConstraintGroup")?;
-                self.writer.write_i32(90, value.version)?;
+                self.writer
+                    .write_i32(90, if value.version == 0 { 2 } else { value.version })?;
                 self.writer.write_bool(70, value.flag)?;
                 for point in value.work_plane {
                     self.writer.write_point3d(10, point)?;
@@ -764,7 +871,19 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                     .iter()
                     .filter(|node| !node.class_name.is_empty())
                     .collect();
-                self.writer.write_i32(90, registered.len() as i32 + 1)?;
+                self.writer.write_i32(90, value.effective_next_node_id())?;
+                if self.dxf_version < crate::types::DxfVersion::AC1027 {
+                    // R2010 keeps nodes inline in AcDbAssocAction, with the
+                    // group handle before each common node header.
+                    self.writer.write_i32(90, registered.len() as i32)?;
+                    for node in registered {
+                        self.writer.write_string(1, &node.class_name)?;
+                        self.writer.write_handle(330, object.handle)?;
+                        self.write_constraint_common(node)?;
+                        self.write_constraint_data(&node.data)?;
+                    }
+                    return Ok(());
+                }
                 if let Some(root) = root {
                     self.writer.write_i32(90, root.node_id)?;
                     self.writer.write_i32(90, root.connections.len() as i32)?;
@@ -801,7 +920,11 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                     self.writer.write_string(1, &value.cached_value)?;
                 }
                 self.writer.write_bool(290, value.flag)?;
-                self.writer.write_i32(90, value.reserved)?;
+                self.writer.write_i32(90, value.dependencies.len() as i32)?;
+                for dependency in &value.dependencies {
+                    self.writer.write_handle(360, dependency.dependency)?;
+                    self.writer.write_i32(90, dependency.flags)?;
+                }
             }
             AssociativeData::ActionParam(value) => self.write_assoc_action_param(value)?,
             AssociativeData::CompoundActionParam(value)
@@ -923,6 +1046,12 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 self.writer.write_point3d(210, value.normal)?;
                 self.writer.write_i32(90, value.hatch_index)?;
                 self.writer.write_i32(90, value.flags)?;
+            }
+            AssociativeData::SmartCenterActionBody(value) => {
+                self.write_assoc_action_body(&value.action_body)?;
+                self.write_assoc_parameter_body(&value.parameter_body)?;
+                self.writer.write_subclass("AcDbSmartCenterActionBody")?;
+                self.writer.write_i32(90, value.version)?;
             }
             AssociativeData::ViewLabelActionParam(value) => {
                 self.write_assoc_single_dependency(

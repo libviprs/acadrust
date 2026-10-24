@@ -2,7 +2,7 @@
 
 use super::stream_reader::{DxfCodePair, DxfStreamContext, DxfStreamReader};
 use crate::error::{DxfError, Result};
-use encoding_rs::Encoding;
+use crate::io::dxf::code_page::LegacyEncoding;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
 /// DXF ASCII text file reader
@@ -11,10 +11,8 @@ pub struct DxfTextReader<R: Read + Seek> {
     line_number: usize,
     stream_offset: u64,
     peeked_pair: Option<DxfCodePair>,
-    /// Non-UTF8 fallback encoding.  `None` means use Latin-1 (byte-to-char).
-    encoding: Option<&'static Encoding>,
-    /// The drawing's legacy code page, for MIF escapes.
-    code_page: Option<crate::io::dxf::code_page::LegacyCodePage>,
+    /// Declared legacy encoding. `None` uses UTF-8 with Latin-1 fallback.
+    encoding: Option<LegacyEncoding>,
     /// Reusable buffer for line reading to avoid per-line allocation.
     line_buf: Vec<u8>,
     context: DxfStreamContext,
@@ -29,7 +27,6 @@ impl<R: Read + Seek> DxfTextReader<R> {
             stream_offset: 0,
             peeked_pair: None,
             encoding: None,
-            code_page: None,
             line_buf: Vec::with_capacity(256),
             context: DxfStreamContext::default(),
         })
@@ -60,37 +57,40 @@ impl<R: Read + Seek> DxfTextReader<R> {
             buf.pop();
         }
 
-        // Try UTF-8 first (takes ownership to avoid copy), then use configured encoding or Latin-1 fallback
-        let line = match String::from_utf8(buf) {
-            Ok(s) => {
-                // Reclaim the allocation for next time
-                self.line_buf = Vec::with_capacity(256);
-                s
-            }
-            Err(e) => {
-                let bytes = e.into_bytes();
-                let result = if let Some(enc) = self.encoding {
-                    let (decoded, _, malformed) = enc.decode(&bytes);
-                    if malformed {
-                        // If we had a specific encoding but it's malformed, we might want to know.
-                        // However, DXF sometimes has junk. For now, we still return what we can.
-                    }
-                    decoded.into_owned()
-                } else {
-                    // Fallback to Latin-1
-                    bytes.iter().map(|&b| b as char).collect()
-                };
-                self.line_buf = bytes; // reclaim Vec allocation
-                result
+        // Copy into an exactly sized String and keep `buf` for the next line. Handing `buf`
+        // itself to the String gave every value its 256-byte buffer and cost one fresh
+        // 256-byte allocation per line; in the browser (wasm dlmalloc) that dominated
+        // reading a DXF.
+        let line = if let Some(encoding) = self.encoding {
+            let text = encoding.decode(&buf).0.into_owned();
+            self.line_buf = buf;
+            text
+        } else {
+            match std::str::from_utf8(&buf) {
+                Ok(s) => {
+                    let line = s.to_owned();
+                    self.line_buf = buf;
+                    line
+                }
+                Err(_) => {
+                    let result = buf.iter().map(|&b| b as char).collect();
+                    self.line_buf = buf; // reclaim Vec allocation
+                    result
+                }
             }
         };
+        // Characters outside the code page arrive as escapes; one naming a
+        // character the declared code page can hold is content and stays.
+        let line = if crate::io::dxf::code_page::has_legacy_escape(&line) {
+            match self.encoding {
+                Some(encoding) => encoding.decode_escapes(&line),
+                None => crate::io::dxf::code_page::decode_legacy_escapes(&line),
+            }
+        } else {
+            line
+        };
 
-        match self.code_page {
-            Some(cp) if line.contains("\\U+") => Ok(Some(
-                crate::io::dxf::code_page::decode_mif_escapes(&line, cp),
-            )),
-            _ => Ok(Some(line)),
-        }
+        Ok(Some(line))
     }
 
     /// Read a line into the reusable `line_buf` without allocating a String.
@@ -222,13 +222,8 @@ impl<R: Read + Seek> DxfStreamReader for DxfTextReader<R> {
         Ok(())
     }
 
-    fn set_encoding(&mut self, encoding: &'static Encoding) {
+    fn set_encoding(&mut self, encoding: LegacyEncoding) {
         self.encoding = Some(encoding);
-    }
-
-    fn set_code_page(&mut self, code_page: crate::io::dxf::code_page::LegacyCodePage) {
-        self.encoding = Some(code_page.encoding());
-        self.code_page = Some(code_page);
     }
 
     fn diagnostic_context(&self) -> DxfStreamContext {

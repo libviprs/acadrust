@@ -155,7 +155,7 @@ impl<'a> DwgObjectWriter<'a> {
     /// ```
     ///
     /// **CRC-16** (seed `0xC0C1`) covers everything from the ModularShort
-    /// through the end of `merged_data`.  AutoCAD validates this checksum
+    /// through the end of `merged_data`.  ACAD validates this checksum
     /// on every object load ("Level 3" check).
     ///
     /// **Byte alignment**: The merged data from `merge()` is guaranteed
@@ -166,7 +166,7 @@ impl<'a> DwgObjectWriter<'a> {
         // Duplicate-handle guard: a handle must appear in the object map exactly
         // once. If this one was already emitted (e.g. an xdictionary XRECORD
         // reached from two paths), drop this repeat — duplicate handles are a
-        // hard integrity error AutoCAD's audit rejects.
+        // hard integrity error ACAD's audit rejects.
         if !handle.is_null() && !self.registered_handles.insert(handle.value()) {
             self.writer.reset();
             self.pending_type_code = None;
@@ -179,7 +179,7 @@ impl<'a> DwgObjectWriter<'a> {
 
         // Verify the merged data is byte-aligned.  If this fires, the
         // merge function has a bug — partial bytes would corrupt the
-        // CRC-16 and cause "Invalid Input" in AutoCAD.
+        // CRC-16 and cause "Invalid Input" in ACAD.
         debug_assert!(
             !data.is_empty() || handle.is_null(),
             "register_object: merged data is empty for handle {:#X}",
@@ -222,7 +222,7 @@ impl<'a> DwgObjectWriter<'a> {
         // 4. CRC-16 over everything from `pos`:
         //    [MS(size)] [MC(handle_bits)] [merged_data]
         //    Seed 0xC0C1, no final XOR.  This is the per-object checksum
-        //    that AutoCAD validates ("Level 3" object integrity check).
+        //    that ACAD validates ("Level 3" object integrity check).
         let crc_val = crc::crc16(crc::CRC16_SEED, &self.output[pos as usize..]);
         self.output.extend_from_slice(&crc_val.to_le_bytes());
 
@@ -309,8 +309,8 @@ impl<'a> DwgObjectWriter<'a> {
 
     /// Resolve an entity's layer name to the handle to write.
     ///
-    /// An entity's layer is a *required* hard pointer: AutoCAD reports a NULL
-    /// one as a damaged drawing and offers recovery (issue #80). A name can
+    /// An entity's layer is a *required* hard pointer: a NULL value leaves an
+    /// invalid drawing (issue #80). A name can
     /// fail to resolve when the caller set `common.layer` to a layer that was
     /// never added, or renamed a layer in place so the entities still carry the
     /// old name. Fall back to layer "0", which every drawing has and which
@@ -389,7 +389,13 @@ impl<'a> DwgObjectWriter<'a> {
         }
 
         // ── MAIN: entity mode (2 bits) ──
-        let entmode = entity_mode_override.unwrap_or_else(|| self.get_entity_mode(&owner_handle));
+        // Explicit ownership (0) stays 0 so an ATTRIB under a paper-space
+        // INSERT keeps its owner. Implicit modes must match that owner.
+        let entmode = match entity_mode_override {
+            Some(0) => 0,
+            Some(mode) if owner_handle.is_null() => mode,
+            _ => self.get_entity_mode(&owner_handle),
+        };
         self.writer.write_2bits(entmode);
 
         // ── HANDLE: owner (if entmode == 0) ──
@@ -410,7 +416,7 @@ impl<'a> DwgObjectWriter<'a> {
         // Filter entity xdic handle: only keep it if the referenced dictionary
         // is actually WRITTEN. `contains_key` is not enough — a dictionary that
         // is present in the document but dropped on this save (e.g. an AEC/
-        // version-locked object) would leave a dangling handle that AutoCAD's
+        // version-locked object) would leave a dangling handle that ACAD's
         // reader rejects (the object reads as improperly read / erased).
         let effective_entity_xdic =
             xdictionary_handle.filter(|xdic| !xdic.is_null() && self.is_writable_object(xdic));
@@ -522,7 +528,7 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_bit_double(linetype_scale);
 
         // ── R13-R14 only: invisibility + early return ──
-        // DXF group 60 convention (all DWG versions): 0 = visible, non-zero = invisible
+        // Bit 0 is entity visibility. The bool does not carry the other bits.
         if self.version.r13_14_only() {
             self.writer.write_bit_short(if invisible { 1 } else { 0 });
             return;
@@ -568,7 +574,9 @@ impl<'a> DwgObjectWriter<'a> {
                 .write_handle(DwgReferenceType::HardPointer, lt_handle.value());
         }
 
-        // ── R2007+: material flags + shadow flags ──
+        // Native reC/b2007..b2018 DATA order: material BB, shadow RC,
+        // plotstyle BB. Use the native order where ODA §20.4.1 differs;
+        // handle references still follow ODA §20.4.2.
         if self.version.r2007_plus() {
             let material_handle = material_handle.filter(|handle| self.is_writable_object(handle));
             let material_flags = if material_flags == 0b11 && material_handle.is_none() {
@@ -660,10 +668,64 @@ impl<'a> DwgObjectWriter<'a> {
         Some((app.handle.value(), bytes))
     }
 
+    pub(super) fn annotative_eed_block_for_handle(
+        &self,
+        handle: Handle,
+        annotative: bool,
+    ) -> Option<(u64, Vec<u8>)> {
+        let had_marker = self
+            .existing_xdata_values(handle, "AcadAnnotative")
+            .is_some_and(|values| {
+                values.iter().any(|value| {
+                    matches!(value, crate::xdata::XDataValue::String(label) if label == "AnnotativeData")
+                })
+            });
+        if !annotative && !had_marker {
+            return None;
+        }
+        let app = self.document.app_ids.get("AcadAnnotative")?;
+        let bytes = crate::io::dwg::annotative_eed::encode(self.version.r2007_plus(), annotative);
+        Some((app.handle.value(), bytes))
+    }
+
+    pub(super) fn existing_xdata_values(
+        &self,
+        handle: Handle,
+        application: &str,
+    ) -> Option<Vec<crate::xdata::XDataValue>> {
+        if let Some(record) = self
+            .document
+            .object_xdata
+            .get(&handle)
+            .and_then(|data| data.get_record(application))
+        {
+            return Some(record.values.clone());
+        }
+        let app = self.document.app_ids.get(application)?;
+        let (_, raw) = self
+            .document
+            .eed_by_handle
+            .get(&handle)?
+            .iter()
+            .find(|(app_handle, _)| *app_handle == app.handle.value())?;
+        let source_version = self.document.dwg_source_version.unwrap_or(self.dxf_version);
+        crate::io::dwg::eed_codec::decode_values(
+            raw,
+            source_version >= crate::types::DxfVersion::AC1021,
+            |handle| {
+                self.document
+                    .layers
+                    .iter()
+                    .find(|layer| layer.handle.value() == handle)
+                    .map(|layer| layer.name.clone())
+            },
+        )
+    }
+
     /// As [`write_common_non_entity_data`], but merges one extra EED block
     /// (e.g. the annotative marker) with any raw EED preserved by handle.
-    /// An existing block for the same application is replaced, so the marker
-    /// is written exactly once.
+    /// Modeled values replace their source group, preserving other values in
+    /// the same application payload.
     pub fn write_common_non_entity_data_eed(
         &mut self,
         type_code: i16,
@@ -681,6 +743,8 @@ impl<'a> DwgObjectWriter<'a> {
             xdictionary_handle,
             extra_eed,
             false,
+            false,
+            None,
         );
     }
 
@@ -700,6 +764,32 @@ impl<'a> DwgObjectWriter<'a> {
             xdictionary_handle,
             Vec::new(),
             true,
+            false,
+            None,
+        );
+    }
+
+    /// Write common fields that are fully represented by the typed object.
+    pub(super) fn write_complete_non_entity_data(
+        &mut self,
+        type_code: i16,
+        handle: Handle,
+        owner_handle: Handle,
+        reactors: &[Handle],
+        xdictionary_handle: &Option<Handle>,
+        extra_eed: Vec<(u64, Vec<u8>)>,
+        has_ds_data: bool,
+    ) {
+        self.write_common_non_entity_data_eed_internal(
+            type_code,
+            handle,
+            owner_handle,
+            reactors,
+            xdictionary_handle,
+            extra_eed,
+            false,
+            true,
+            Some(has_ds_data),
         );
     }
 
@@ -712,6 +802,8 @@ impl<'a> DwgObjectWriter<'a> {
         xdictionary_handle: &Option<Handle>,
         extra_eed: Vec<(u64, Vec<u8>)>,
         relative_owner: bool,
+        complete_common: bool,
+        has_ds_data_override: Option<bool>,
     ) {
         // ── writeCommonData portion ──
 
@@ -736,11 +828,49 @@ impl<'a> DwgObjectWriter<'a> {
         if let Some(raw) = self.document.eed_by_handle.get(&handle) {
             eed.raw_dwg_eed = raw.clone();
         }
-        for (app, bytes) in extra_eed {
-            eed.raw_dwg_eed.retain(|(a, _)| *a != app);
-            eed.raw_dwg_eed.push((app, bytes));
+        // XDATA records (from DXF) are encoded for applications that have no
+        // verbatim block.
+        if let Some(xdata) = self.document.object_xdata.get(&handle) {
+            for record in xdata.records() {
+                eed.add_record(record.clone());
+            }
         }
-        self.write_extended_data(&eed);
+        let mut opaque_extra = Vec::new();
+        for (app_handle, bytes) in extra_eed {
+            let application = self
+                .document
+                .app_ids
+                .iter()
+                .find(|app| app.handle.value() == app_handle);
+            let values = crate::io::dwg::eed_codec::decode_values(
+                &bytes,
+                self.version.r2007_plus(),
+                |handle| {
+                    self.document
+                        .layers
+                        .iter()
+                        .find(|layer| layer.handle.value() == handle)
+                        .map(|layer| layer.name.clone())
+                },
+            );
+            if let (Some(application), Some(values)) = (application, values) {
+                if eed.get_record(&application.name).is_none() {
+                    if let Some(values) = self.existing_xdata_values(handle, &application.name) {
+                        let mut source = crate::xdata::ExtendedDataRecord::new(&application.name);
+                        source.values = values;
+                        eed.add_record(source);
+                    }
+                }
+                let mut replacement = crate::xdata::ExtendedDataRecord::new(&application.name);
+                replacement.values = values;
+                eed.merge_modeled_record(&replacement);
+                eed.raw_dwg_eed.retain(|(app, _)| *app != app_handle);
+            } else {
+                eed.raw_dwg_eed.retain(|(app, _)| *app != app_handle);
+                opaque_extra.push((app_handle, bytes));
+            }
+        }
+        self.write_extended_data_with(&eed, &opaque_extra);
 
         // ── R13-R14 Only: size placeholder (after xdata, before owner) ──
         if self.version.r13_14_only() {
@@ -767,7 +897,7 @@ impl<'a> DwgObjectWriter<'a> {
 
         // Use side-channel reactors if struct reactors are empty (roundtrip preservation)
         let effective_reactors: Vec<Handle>;
-        let reactors_to_write: &[Handle] = if reactors.is_empty() {
+        let reactors_to_write: &[Handle] = if reactors.is_empty() && !complete_common {
             if let Some(saved) = self.document.reactors_by_handle.get(&handle) {
                 effective_reactors = saved.clone();
                 &effective_reactors
@@ -789,8 +919,8 @@ impl<'a> DwgObjectWriter<'a> {
 
         // Use side-channel xdictionary if struct value is None (roundtrip preservation)
         // Only use it if the xdictionary object actually exists in document.objects,
-        // otherwise BricsCAD reports "Object was erased" for the dangling reference.
-        let effective_xdic = if xdictionary_handle.is_none() {
+        // otherwise strict readers report an erased object for the dangling reference.
+        let effective_xdic = if xdictionary_handle.is_none() && !complete_common {
             self.extension_dictionary_handle(handle)
                 .filter(|xdic| self.document.objects.contains_key(xdic))
         } else {
@@ -824,8 +954,10 @@ impl<'a> DwgObjectWriter<'a> {
 
         // R2013+: retain data-store links while reusing the source section.
         if self.version.r2013_plus(self.dxf_version) {
-            let has_ds_data = self.document.dwg_source_version == Some(self.dxf_version)
-                && self.document.dwg_data_store_handles.contains(&handle);
+            let has_ds_data = has_ds_data_override.unwrap_or_else(|| {
+                self.document.dwg_source_version == Some(self.dxf_version)
+                    && self.document.dwg_data_store_handles.contains(&handle)
+            });
             self.writer.write_bit(has_ds_data);
         }
     }
@@ -850,7 +982,7 @@ impl<'a> DwgObjectWriter<'a> {
         if self.version.r2007_plus() {
             // R2007+: is_xref_resolved BS — only 0 (not xref-dependent) or
             // 256 (0x100, xref-resolved) are valid; the reader derives
-            // is_xref_dep from `== 256`. Writing 0x10 makes AutoCAD reject the
+            // is_xref_dep from `== 256`. Writing 0x10 makes ACAD reject the
             // record (eDwgObjectImproperlyRead) on xref-dependent table entries.
             let combined: i16 = if xref_resolved || xref_dependent {
                 0x100
@@ -876,7 +1008,41 @@ impl<'a> DwgObjectWriter<'a> {
     /// are encoded into EED bytes and appended for any application not already
     /// carried verbatim, so they survive a save instead of being dropped.
     /// When neither is present a lone BS 0 terminator is written (no EED).
+    pub fn encode_xdata_record(
+        &self,
+        rec: &crate::xdata::ExtendedDataRecord,
+    ) -> Option<(u64, Vec<u8>)> {
+        let app = self.document.app_ids.get(&rec.application_name)?;
+        let code_page =
+            crate::io::dxf::code_page::dwg_code_page_index(&self.document.header.code_page);
+        // The declared DWG page decides the bytes, including its fallback for
+        // pages without a decoder here.
+        let encoding = crate::io::dxf::code_page::encoding_from_dwg_code_page(code_page);
+        let bytes = crate::io::dwg::eed_codec::encode_values_with_encoding(
+            self.version.r2007_plus(),
+            &rec.values,
+            encoding,
+            code_page,
+            |name| {
+                self.document
+                    .layers
+                    .get(name)
+                    .map(|l| l.handle.value())
+                    .unwrap_or(0)
+            },
+        );
+        (bytes.len() <= i16::MAX as usize).then_some((app.handle.value(), bytes))
+    }
+
     pub fn write_extended_data(&mut self, xdata: &crate::xdata::ExtendedData) {
+        self.write_extended_data_with(xdata, &[]);
+    }
+
+    pub fn write_extended_data_with(
+        &mut self,
+        xdata: &crate::xdata::ExtendedData,
+        extra: &[(u64, Vec<u8>)],
+    ) {
         // EED string entries (code 0) are code-page encoded pre-R2007 and
         // UTF-16 in R2007+, so verbatim `raw_dwg_eed` bytes captured from a
         // different encoding family garble and desync the record. Drop them on
@@ -892,10 +1058,25 @@ impl<'a> DwgObjectWriter<'a> {
         // Verbatim blobs captured on read. Dropped on a cross-version save whose
         // string encoding family differs (they'd garble); freshly-encoded
         // records below are always emitted in the target version's encoding.
-        let raw_blocks: &[(u64, Vec<u8>)] = if eed_compatible {
-            &xdata.raw_dwg_eed
+        // A block names its application by APPID handle. One carried over
+        // from another drawing names a handle that is no APPID here, and the
+        // reference program rejects the whole file (eInvalidInput); it is
+        // dropped instead.
+        let registered = |app: u64| {
+            self.document
+                .app_ids
+                .iter()
+                .any(|a| a.handle.value() == app)
+        };
+        let raw_blocks: Vec<(u64, Vec<u8>)> = if eed_compatible {
+            xdata
+                .raw_dwg_eed
+                .iter()
+                .filter(|(app, _)| registered(*app))
+                .cloned()
+                .collect()
         } else {
-            &[]
+            Vec::new()
         };
 
         // Encode structured records (e.g. plugin XDATA via write_record) into
@@ -904,41 +1085,13 @@ impl<'a> DwgObjectWriter<'a> {
         // unregistered app is skipped rather than emitting a dangling handle.
         // An app already present verbatim in `raw_blocks` wins, so a clean DWG
         // round-trip stays byte-for-byte and we never double-write one app.
-        let wide = self.version.r2007_plus();
-        let mut record_blocks: Vec<(u64, Vec<u8>)> = Vec::new();
-        for rec in xdata.records() {
-            let Some(app) = self.document.app_ids.get(&rec.application_name) else {
-                continue;
-            };
-            let app_handle = app.handle.value();
-            if raw_blocks.iter().any(|(a, _)| *a == app_handle) {
-                continue;
-            }
-            let code_page =
-                crate::io::dxf::code_page::dwg_code_page_index(&self.document.header.code_page);
-            let encoding =
-                crate::io::dxf::code_page::encoding_from_code_page(&self.document.header.code_page)
-                    .unwrap_or(encoding_rs::WINDOWS_1252);
-            let bytes = crate::io::dwg::eed_codec::encode_values_with_encoding(
-                wide,
-                &rec.values,
-                encoding,
-                code_page,
-                |name| {
-                    self.document
-                        .layers
-                        .get(name)
-                        .map(|l| l.handle.value())
-                        .unwrap_or(0)
-                },
-            );
-            // The block length is framed as a BS (i16); skip a pathologically
-            // large record rather than overflow and desync the object stream.
-            if bytes.len() > i16::MAX as usize {
-                continue;
-            }
-            record_blocks.push((app_handle, bytes));
-        }
+        let record_blocks: Vec<(u64, Vec<u8>)> = xdata
+            .records()
+            .iter()
+            .filter_map(|rec| self.encode_xdata_record(rec))
+            .filter(|(app, _)| !raw_blocks.iter().chain(extra).any(|(a, _)| a == app))
+            .chain(extra.iter().cloned())
+            .collect();
 
         if raw_blocks.is_empty() && record_blocks.is_empty() {
             // No EED: write BS 0 terminator
@@ -990,33 +1143,37 @@ impl<'a> DwgObjectWriter<'a> {
     /// Returns the 2-bit entity-mode value (per ODA spec §19.4.4):
     /// - 0 = owned (owner handle present) — VERTEX, ATTRIB, SEQEND,
     ///       or entity inside a named block
-    /// - 1 = paper-space entity (BB 01 → any *Paper_Space block)
+    /// - 1 = paper-space entity (BB 01 -> the active paper-space block)
     /// - 2 = model-space entity (BB 10 → *Model_Space)
     ///
-    /// AutoCAD uses entmode=1 for entities in ALL paper-space blocks,
-    /// not just the canonical `*Paper_Space`.  Additional layouts like
-    /// `*Paper_Space0`, `*Paper_Space1`, … also get entmode=1.  The
-    /// correct owner is determined by the BLOCK_HEADER's entity_handles
-    /// list, not by the entity's owner handle (which is omitted for
-    /// entmode != 0).
+    /// Other paper-space layouts retain an explicit owner handle.
     fn get_entity_mode(&self, owner_handle: &Handle) -> u8 {
-        for br in self.document.block_records.iter() {
-            if br.handle == *owner_handle {
-                let upper = br.name.to_ascii_uppercase();
-                if upper == "*MODEL_SPACE" {
-                    return 2; // model space (BB 10)
-                }
-                if upper == "*PAPER_SPACE"
-                    || (upper.starts_with("*PAPER_SPACE")
-                        && upper.len() > 12
-                        && upper[12..].bytes().all(|b| b.is_ascii_digit()))
-                {
-                    return 1; // paper space (BB 01)
-                }
-                return 0; // named block → owned
-            }
+        self.entity_modes.get(owner_handle).copied().unwrap_or(0)
+    }
+
+    /// The entity mode of each block record's entities, by the record's
+    /// handle, built once per writer: searching the block records for every
+    /// entity made writing a drawing with many blocks quadratic. The first
+    /// record with a handle decides, as a search of the table in order would.
+    pub(super) fn build_entity_modes(
+        document: &crate::document::CadDocument,
+        paper_space_block_handle: Handle,
+    ) -> std::collections::HashMap<Handle, u8> {
+        let mut modes = std::collections::HashMap::with_capacity(document.block_records.len());
+        for br in document.block_records.iter() {
+            let mode = if br.name.eq_ignore_ascii_case("*MODEL_SPACE") {
+                2 // model space (BB 10)
+            } else if br.handle == paper_space_block_handle {
+                // Paper-space mode names the active layout's *Paper_Space;
+                // the other layouts' *Paper_SpaceN records, like named
+                // blocks, store their owner.
+                1 // paper space (BB 01)
+            } else {
+                0 // owner handle follows
+            };
+            modes.entry(br.handle).or_insert(mode);
         }
-        0
+        modes
     }
 }
 

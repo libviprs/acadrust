@@ -4,7 +4,7 @@
 //! records, where each face references vertices by 1-based indices.
 
 use crate::entities::{Entity, EntityCommon};
-use crate::types::{BoundingBox3D, Color, Handle, LineWeight, Transparency, Vector3};
+use crate::types::{BoundingBox3D, Color, Handle, Vector3};
 
 use bitflags::bitflags;
 
@@ -337,14 +337,23 @@ impl PolyfaceFace {
         }
     }
 
-    /// Reverses the winding order of the face.
+    /// Reverses the winding order while keeping visibility on each edge.
     pub fn reverse(&mut self) {
-        if self.is_triangle() {
-            std::mem::swap(&mut self.index1, &mut self.index3);
-        } else {
-            std::mem::swap(&mut self.index1, &mut self.index4);
-            std::mem::swap(&mut self.index2, &mut self.index3);
+        let indices = [self.index1, self.index2, self.index3, self.index4];
+        let count = self.vertex_count();
+        let mut reversed = [0; 4];
+        for (index, value) in reversed.iter_mut().take(count).enumerate() {
+            let old_index = count - 1 - index;
+            // A reversed outgoing edge was the preceding vertex's outgoing
+            // edge before reversal; its visibility follows that edge.
+            let hidden = indices[(old_index + count - 1) % count] < 0;
+            *value = if hidden {
+                -indices[old_index].abs()
+            } else {
+                indices[old_index].abs()
+            };
         }
+        [self.index1, self.index2, self.index3, self.index4] = reversed;
     }
 }
 
@@ -725,52 +734,12 @@ impl Default for PolyfaceMesh {
 }
 
 impl Entity for PolyfaceMesh {
-    fn handle(&self) -> Handle {
-        self.common.handle
+    fn common(&self) -> &super::EntityCommon {
+        &self.common
     }
 
-    fn set_handle(&mut self, handle: Handle) {
-        self.common.handle = handle;
-    }
-
-    fn layer(&self) -> &str {
-        &self.common.layer
-    }
-
-    fn set_layer(&mut self, layer: String) {
-        self.common.layer = layer;
-    }
-
-    fn color(&self) -> Color {
-        self.common.color
-    }
-
-    fn set_color(&mut self, color: Color) {
-        self.common.color = color;
-    }
-
-    fn line_weight(&self) -> LineWeight {
-        self.common.line_weight
-    }
-
-    fn set_line_weight(&mut self, weight: LineWeight) {
-        self.common.line_weight = weight;
-    }
-
-    fn transparency(&self) -> Transparency {
-        self.common.transparency
-    }
-
-    fn set_transparency(&mut self, transparency: Transparency) {
-        self.common.transparency = transparency;
-    }
-
-    fn is_invisible(&self) -> bool {
-        self.common.invisible
-    }
-
-    fn set_invisible(&mut self, invisible: bool) {
-        self.common.invisible = invisible;
+    fn common_mut(&mut self) -> &mut super::EntityCommon {
+        &mut self.common
     }
 
     fn bounding_box(&self) -> BoundingBox3D {
