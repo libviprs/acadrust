@@ -23,7 +23,7 @@ fn document(version: DxfVersion, rotation: f64) -> CadDocument {
     m.column_data.gutter = 110.0;
     m.column_data.heights = vec![-2.9];
     let mut doc = CadDocument::with_version(version);
-    doc.add_entity(EntityType::MText(m)).unwrap();
+    doc.add_entity(EntityType::MText(Box::new(m))).unwrap();
     doc
 }
 
@@ -58,7 +58,7 @@ fn read_back(doc: &CadDocument) -> MText {
         .read()
         .unwrap();
     let found = doc.entities().find_map(|e| match e {
-        EntityType::MText(m) => Some(m.clone()),
+        EntityType::MText(m) => Some((**m).clone()),
         _ => None,
     });
     found.expect("the MTEXT survived")
@@ -87,15 +87,15 @@ fn r2018_columns_are_an_embedded_object_and_no_group_50() {
 }
 
 #[test]
-fn a_rotation_is_the_only_group_50() {
+fn a_rotation_is_the_x_direction_and_never_group_50() {
+    // Upstream writes an MTEXT's rotation as its X-axis direction (group 11)
+    // and not as group 50, so a column height can never be taken for it.
     let p = mtext_pairs(&document(DxfVersion::AC1032, 0.5));
-    let fifties: Vec<f64> = p
-        .iter()
-        .filter(|(c, _)| *c == 50)
-        .map(|(_, v)| v.parse().unwrap())
-        .collect();
-    assert_eq!(fifties.len(), 1, "{p:?}");
-    assert!((fifties[0] - 0.5f64.to_degrees()).abs() < 1e-9);
+    assert_eq!(count(&p, 50), 0, "{p:?}");
+    let at = p.iter().position(|(c, _)| *c == 11).expect("group 11");
+    let x: f64 = p[at].1.parse().unwrap();
+    let y: f64 = p[at + 1].1.parse().unwrap();
+    assert!((x - 0.5f64.cos()).abs() < 1e-9 && (y - 0.5f64.sin()).abs() < 1e-9);
 }
 
 #[test]

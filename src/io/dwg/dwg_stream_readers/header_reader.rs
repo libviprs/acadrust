@@ -84,7 +84,7 @@ impl SectionReader {
     fn with_encoding(
         data: Vec<u8>,
         version: DxfVersion,
-        encoding: crate::io::dxf::code_page::LegacyCodePage,
+        encoding: crate::io::dxf::code_page::LegacyEncoding,
     ) -> Result<Self> {
         if version >= DxfVersion::AC1021 {
             // R2007+: three-stream merge.
@@ -125,6 +125,12 @@ impl SectionReader {
         match &mut self.inner {
             SectionReaderInner::BitReader(r) => r.read_bit_short(),
             SectionReaderInner::MergedReader(r) => r.read_bit_short(),
+        }
+    }
+    fn try_read_bit_short(&mut self) -> Option<i16> {
+        match &mut self.inner {
+            SectionReaderInner::BitReader(r) => r.try_read_bit_short(),
+            SectionReaderInner::MergedReader(r) => r.try_read_bit_short(),
         }
     }
     fn read_bit_long(&mut self) -> i32 {
@@ -215,7 +221,7 @@ pub fn read_header(
         data,
         version,
         maintenance_version,
-        crate::io::dxf::code_page::LegacyCodePage::unknown(encoding_rs::WINDOWS_1252),
+        encoding_rs::WINDOWS_1252,
     )
 }
 
@@ -223,7 +229,7 @@ pub fn read_header_with_encoding(
     data: &[u8],
     version: DxfVersion,
     maintenance_version: u8,
-    encoding: crate::io::dxf::code_page::LegacyCodePage,
+    encoding: impl Into<crate::io::dxf::code_page::LegacyEncoding>,
 ) -> Result<HeaderVariables> {
     // ── Verify start sentinel ──
     if data.len() < 36 {
@@ -242,7 +248,13 @@ pub fn read_header_with_encoding(
         data[size_offset + 1],
         data[size_offset + 2],
         data[size_offset + 3],
-    ]) as usize;
+    ]);
+    if section_size < 0 {
+        return Err(DxfError::Parse(
+            "Header section has a negative size".to_string(),
+        ));
+    }
+    let section_size = section_size as usize;
     size_offset += 4;
 
     // Extra 4 zero bytes when: (AC1024+ && maintenance > 3) || AC1032+
@@ -250,12 +262,26 @@ pub fn read_header_with_encoding(
         size_offset += 4;
     }
 
-    let section_data = &data[size_offset..size_offset + section_size];
+    let section_end = size_offset
+        .checked_add(section_size)
+        .ok_or_else(|| DxfError::Parse("Header section size overflows input bounds".to_string()))?;
+    let section_data = data.get(size_offset..section_end).ok_or_else(|| {
+        DxfError::Parse(format!(
+            "Header section extends past input: offset={}, size={}, data_len={}",
+            size_offset,
+            section_size,
+            data.len()
+        ))
+    })?;
 
-    let mut r = SectionReader::with_encoding(section_data.to_vec(), version, encoding)?;
+    let mut r = SectionReader::with_encoding(section_data.to_vec(), version, encoding.into())?;
     let mut h = HeaderVariables::default();
 
     read_header_fields(&mut r, version, &mut h);
+    match &r.inner {
+        SectionReaderInner::BitReader(reader) => reader.check_error()?,
+        SectionReaderInner::MergedReader(reader) => reader.check_error()?,
+    }
 
     Ok(h)
 }
@@ -344,7 +370,7 @@ fn read_header_fields(r: &mut SectionReader, v: DxfVersion, h: &mut HeaderVariab
     }
 
     h.display_silhouette = r.read_bit();
-    h.polyline_ellipse = r.read_bit(); // PELLIPSE
+    h.create_ellipse_as_polyline = r.read_bit(); // PELLIPSE
     h.proxy_graphics = r.read_bit_short();
 
     if r13_14_only(v) {
@@ -427,10 +453,14 @@ fn read_header_fields(r: &mut SectionReader, v: DxfVersion, h: &mut HeaderVariab
     h.menu_name = r.read_variable_text();
 
     // ── Date/time (Common) ──
+    // DWG stores universal time (TDUCREATE / TDUUPDATE); the file has no time
+    // zone, so the local values start out equal to them.
     let (cd, cms) = r.read_datetime();
-    h.create_date_julian = day_ms_to_julian(cd, cms);
+    h.universal_create_date_julian = day_ms_to_julian(cd, cms);
+    h.create_date_julian = h.universal_create_date_julian;
     let (ud, ums) = r.read_datetime();
-    h.update_date_julian = day_ms_to_julian(ud, ums);
+    h.universal_update_date_julian = day_ms_to_julian(ud, ums);
+    h.update_date_julian = h.universal_update_date_julian;
 
     if r2004_plus(v) {
         let _ = r.read_bit_long(); // unknown
@@ -571,7 +601,7 @@ fn read_header_fields(r: &mut SectionReader, v: DxfVersion, h: &mut HeaderVariab
 
     // R2007+ dimension extras
     if r2007_plus(v) {
-        h.dim_fixed_ext_length = r.read_bit_double(); // DIMFXL
+        h.dim_fixed_ext_line_length = r.read_bit_double(); // DIMFXL
         h.dim_jog_angle = r.read_bit_double(); // DIMJOGANG
         h.dim_text_fill = r.read_bit_short(); // DIMTFILL
         h.dim_text_fill_color = r.read_cm_color(); // DIMTFILLCLR
@@ -654,7 +684,7 @@ fn read_header_fields(r: &mut SectionReader, v: DxfVersion, h: &mut HeaderVariab
 
     // R2007+: DIMFXLON
     if r2007_plus(v) {
-        h.dim_fixed_ext_length_on = r.read_bit(); // DIMFXLON
+        h.dim_fixed_ext_line_on = r.read_bit(); // DIMFXLON
     }
 
     // R2010+: extra dimension fields
@@ -669,10 +699,10 @@ fn read_header_fields(r: &mut SectionReader, v: DxfVersion, h: &mut HeaderVariab
     // R2000+ dimension handles
     if r2000_plus(v) {
         h.dim_text_style_handle = Handle::new(r.read_handle());
-        h.dim_leader_arrow_block_handle = Handle::new(r.read_handle());
-        h.dim_arrow_block_handle = Handle::new(r.read_handle());
-        h.dim_arrow_block1_handle = Handle::new(r.read_handle());
-        h.dim_arrow_block2_handle = Handle::new(r.read_handle());
+        h.dim_leader_arrow_block_handle = Handle::new(r.read_handle()); // DIMLDRBLK
+        h.dim_arrow_block_handle = Handle::new(r.read_handle()); // DIMBLK
+        h.dim_arrow_block1_handle = Handle::new(r.read_handle()); // DIMBLK1
+        h.dim_arrow_block2_handle = Handle::new(r.read_handle()); // DIMBLK2
     }
 
     // R2007+ dimension linetype handles
@@ -808,14 +838,14 @@ fn read_header_fields(r: &mut SectionReader, v: DxfVersion, h: &mut HeaderVariab
         h.longitude = r.read_bit_double();
         h.north_direction = r.read_bit_double();
         h.timezone = r.read_bit_long();
-        h.light_glyph_display = r.read_byte() as i16; // LIGHTGLYPHDISPLAY
-        h.tile_model_light_synch = r.read_byte() as i16; // TILEMODELIGHTSYNCH
+        h.light_glyph_display = r.read_byte(); // LIGHTGLYPHDISPLAY
+        h.tile_model_light_synch = r.read_byte(); // TILEMODELIGHTSYNCH
         h.dwf_frame = r.read_byte() as i16; // DWFFRAME
         h.dgn_frame = r.read_byte() as i16; // DGNFRAME
 
-        let _ = r.read_bit(); // unknown
+        h.real_world_scale = r.read_bit();
 
-        h.interfere_color = r.read_cm_color(); // INTERFERECOLOR
+        h.interference_color = r.read_cm_color(); // INTERFERECOLOR
 
         let _ = r.read_handle(); // INTERFEREOBJVS
         let _ = r.read_handle(); // INTERFEREVPVS
@@ -826,11 +856,22 @@ fn read_header_fields(r: &mut SectionReader, v: DxfVersion, h: &mut HeaderVariab
     }
 
     // ── R14+ trailing fields ──
+    // IntelliCAD's AC1014 writer can omit the final undocumented BS value.
+    // Keep the values that are present, but treat a partial/missing AC1014
+    // tail as valid so the preceding header fields remain usable. Later
+    // versions retain the strict four-value layout.
     if v >= DxfVersion::AC1014 {
-        let _ = r.read_bit_short(); // -1
-        let _ = r.read_bit_short(); // -1
-        let _ = r.read_bit_short(); // -1
-        let _ = r.read_bit_short(); // -1
+        if v == DxfVersion::AC1014 {
+            for _ in 0..4 {
+                if r.try_read_bit_short().is_none() {
+                    break;
+                }
+            }
+        } else {
+            for _ in 0..4 {
+                let _ = r.read_bit_short();
+            }
+        }
 
         if r2004_plus(v) {
             let _ = r.read_bit_long();
@@ -864,6 +905,21 @@ mod tests {
         assert!((read.text_height - original.text_height).abs() < 1e-10);
         assert!((read.dim_scale - original.dim_scale).abs() < 1e-10);
         assert!((read.dim_arrow_size - original.dim_arrow_size).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_r14_accepts_optional_trailer_with_only_three_values() {
+        let mut truncated =
+            header_writer::write_header(DxfVersion::AC1014, &HeaderVariables::default(), 0);
+        let section_size = i32::from_le_bytes(truncated[16..20].try_into().unwrap());
+
+        // The four undocumented R14 BS values occupy nine bytes in the
+        // default stream. Removing two bytes leaves three complete values and
+        // the two-bit prefix of the fourth, matching IntelliCAD's AC1014
+        // trailer. The reader must preserve the valid header prefix.
+        let truncated_size = section_size - 2;
+        truncated[16..20].copy_from_slice(&truncated_size.to_le_bytes());
+        assert!(read_header(&truncated, DxfVersion::AC1014, 0).is_ok());
     }
 
     #[test]
@@ -949,5 +1005,18 @@ mod tests {
         bad_data[..16].fill(0xFF);
         let result = read_header(&bad_data, DxfVersion::AC1015, 0);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_header_invalid_section_sizes_fail_without_panicking() {
+        let mut negative = vec![0u8; 64];
+        negative[..16].copy_from_slice(&start_sentinels::HEADER);
+        negative[16..20].copy_from_slice(&(-1i32).to_le_bytes());
+        assert!(read_header(&negative, DxfVersion::AC1015, 0).is_err());
+
+        let mut oversized = vec![0u8; 64];
+        oversized[..16].copy_from_slice(&start_sentinels::HEADER);
+        oversized[16..20].copy_from_slice(&(10_000i32).to_le_bytes());
+        assert!(read_header(&oversized, DxfVersion::AC1015, 0).is_err());
     }
 }

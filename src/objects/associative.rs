@@ -1,6 +1,6 @@
 //! Semantic model for associative-network objects.
 //!
-//! AutoCAD stores most associative objects as short inheritance chains.  The
+//! ACAD stores most associative objects as short inheritance chains.  The
 //! shared structs below mirror those chains so DWG and DXF use one lossless
 //! representation instead of class-specific byte blobs.
 
@@ -17,7 +17,9 @@ pub struct AssociativeObject {
     pub dxf_name: String,
     pub cpp_class_name: String,
     pub data: AssociativeData,
-    #[cfg_attr(feature = "serde", serde(skip))]
+    /// Known source version, retained as provenance without raw-record storage.
+    /// Missing values in field-named Serde input default to `None`.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub source_version: Option<DxfVersion>,
 }
 
@@ -90,6 +92,7 @@ pub enum AssociativeData {
     ViewRepHatchManager(AssocViewRepHatchManager),
     ViewRepHatchActionParam(AssocViewRepHatchActionParam),
     ViewLabelActionParam(AssocViewLabelActionParam),
+    SmartCenterActionBody(AssocSmartCenterActionBody),
 }
 
 impl AssociativeData {
@@ -178,12 +181,33 @@ impl AssociativeData {
                         | AssocConstraintNodeData::Arc {
                             geometry_dependency,
                             ..
+                        }
+                        | AssocConstraintNodeData::Ellipse {
+                            geometry_dependency,
+                            ..
+                        }
+                        | AssocConstraintNodeData::BoundedEllipse {
+                            geometry_dependency,
+                            ..
+                        }
+                        | AssocConstraintNodeData::RigidSet {
+                            geometry_dependency,
+                            ..
+                        }
+                        | AssocConstraintNodeData::Spline {
+                            geometry_dependency,
+                            ..
                         } => *geometry_dependency == target,
                         _ => false,
                     })
             }
             Self::Variable(value) => {
-                action_references(&value.action, target) || eval_references(&value.value, target)
+                action_references(&value.action, target)
+                    || eval_references(&value.value, target)
+                    || value
+                        .dependencies
+                        .iter()
+                        .any(|item| item.dependency == target)
             }
             Self::CompoundActionParam(value)
             | Self::PointRefActionParam(value)
@@ -204,14 +228,14 @@ impl AssociativeData {
                 single_dependency_references(&value.single_dependency, target)
                     || value.history == target
             }
-            Self::ArrayParameters(value) => value.items.iter().any(|item| {
-                item.first_handle == Some(target) || item.second_handle == Some(target)
-            }),
+            Self::ArrayParameters(value) => array_items_reference(&value.items, target),
             Self::ArrayActionBody(value) => {
                 parameter_body_references(&value.parameter_body, target)
+                    || array_items_reference(&value.items, target)
             }
             Self::ArrayModifyActionBody(value) => {
                 parameter_body_references(&value.body.parameter_body, target)
+                    || array_items_reference(&value.body.items, target)
             }
             Self::DimensionAssociation(value) => {
                 value.dimension == target
@@ -233,6 +257,9 @@ impl AssociativeData {
             }
             Self::ViewLabelActionParam(value) => {
                 single_dependency_references(&value.single_dependency, target)
+            }
+            Self::SmartCenterActionBody(value) => {
+                parameter_body_references(&value.parameter_body, target)
             }
         }
     }
@@ -330,6 +357,22 @@ impl AssociativeData {
                         | AssocConstraintNodeData::Arc {
                             geometry_dependency,
                             ..
+                        }
+                        | AssocConstraintNodeData::Ellipse {
+                            geometry_dependency,
+                            ..
+                        }
+                        | AssocConstraintNodeData::BoundedEllipse {
+                            geometry_dependency,
+                            ..
+                        }
+                        | AssocConstraintNodeData::RigidSet {
+                            geometry_dependency,
+                            ..
+                        }
+                        | AssocConstraintNodeData::Spline {
+                            geometry_dependency,
+                            ..
                         } => visit(geometry_dependency),
                         _ => {}
                     }
@@ -338,6 +381,9 @@ impl AssociativeData {
             Self::Variable(value) => {
                 visit_action(&mut value.action, visit);
                 visit_eval(&mut value.value, visit);
+                for item in &mut value.dependencies {
+                    visit(&mut item.dependency);
+                }
             }
             Self::CompoundActionParam(value)
             | Self::PointRefActionParam(value)
@@ -361,20 +407,15 @@ impl AssociativeData {
                 ..
             }) => visit_single_dependency(value, visit),
             Self::ArrayParameters(value) => {
-                for item in &mut value.items {
-                    if let Some(handle) = item.first_handle.as_mut() {
-                        visit(handle);
-                    }
-                    if let Some(handle) = item.second_handle.as_mut() {
-                        visit(handle);
-                    }
-                }
+                visit_array_items(&mut value.items, visit);
             }
             Self::ArrayActionBody(value) => {
                 visit_parameter_body(&mut value.parameter_body, visit);
+                visit_array_items(&mut value.items, visit);
             }
             Self::ArrayModifyActionBody(value) => {
                 visit_parameter_body(&mut value.body.parameter_body, visit);
+                visit_array_items(&mut value.body.items, visit);
             }
             Self::DimensionAssociation(value) => {
                 visit(&mut value.dimension);
@@ -403,6 +444,9 @@ impl AssociativeData {
             Self::ViewLabelActionParam(value) => {
                 visit_single_dependency(&mut value.single_dependency, visit);
             }
+            Self::SmartCenterActionBody(value) => {
+                visit_parameter_body(&mut value.parameter_body, visit);
+            }
         }
         if let Self::AsmBodyActionParam(value) = self {
             visit(&mut value.history);
@@ -412,6 +456,24 @@ impl AssociativeData {
 
 fn eval_references(value: &AssocEvalVariant, target: Handle) -> bool {
     matches!(value.value, AssocEvalValue::Handle(handle) if handle == target)
+}
+
+fn array_items_reference(items: &[AssocArrayItem], target: Handle) -> bool {
+    items
+        .iter()
+        .any(|item| item.first_handle == Some(target) || item.second_handle == Some(target))
+}
+
+fn visit_array_items(items: &mut [AssocArrayItem], visit: &mut impl FnMut(&mut Handle)) {
+    for item in items {
+        for handle in item
+            .first_handle
+            .iter_mut()
+            .chain(item.second_handle.iter_mut())
+        {
+            visit(handle);
+        }
+    }
 }
 
 fn value_param_references(value: &AssocValueParam, target: Handle) -> bool {
@@ -563,6 +625,51 @@ pub struct AssocValueDependency {
 pub struct AssocPersistentSubentId {
     pub class_name: String,
     pub dependent_on_compound_object: bool,
+    pub class_code: i32,
+    pub values: Vec<i32>,
+    pub leading_flag: bool,
+}
+
+/// Subentity id classes: R2013+ DWG class code, class name and the number of
+/// class fields (a BS class version, then BL indexes; DXF writes each as a
+/// 90). `None` marks classes whose fields are not known.
+const PERS_SUBENT_CLASSES: [(i32, &str, Option<usize>); 3] = [
+    (1, "AcDbAssocSingleEdgePersSubentId", Some(0)),
+    (3, "AcDbAssocEdgePersSubentId", Some(3)),
+    (5, "AcDbAssocAsmBasedEntityPersSubentId", None),
+];
+
+impl AssocPersistentSubentId {
+    pub fn class_name_for_code(code: i32) -> Option<&'static str> {
+        PERS_SUBENT_CLASSES
+            .iter()
+            .find(|(value, ..)| *value == code)
+            .map(|(_, name, _)| *name)
+    }
+
+    pub fn code_for_class_name(name: &str) -> Option<i32> {
+        PERS_SUBENT_CLASSES
+            .iter()
+            .find(|(_, value, _)| value.eq_ignore_ascii_case(name))
+            .map(|(code, ..)| *code)
+    }
+
+    /// Number of fields the named class stores, if its layout is known.
+    pub fn field_count_for_class_name(name: &str) -> Option<usize> {
+        PERS_SUBENT_CLASSES
+            .iter()
+            .find(|(_, value, _)| value.eq_ignore_ascii_case(name))
+            .and_then(|(.., count)| *count)
+    }
+
+    /// The class name, falling back to the name registered for the code.
+    pub fn resolved_class_name(&self) -> &str {
+        if self.class_name.is_empty() {
+            Self::class_name_for_code(self.class_code).unwrap_or_default()
+        } else {
+            &self.class_name
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -765,10 +872,7 @@ pub struct AssocAnnotationActionBody {
 pub struct AssocPersSubentManager {
     pub class_version: i32,
     pub markers: [i32; 3],
-    pub steps: Vec<i32>,
-    pub subent_count: i32,
-    /// Fixed semantic tail currently documented as 34 integer slots.
-    pub subent_data: Vec<i32>,
+    pub values: Vec<i32>,
     pub final_flag: bool,
 }
 
@@ -779,6 +883,14 @@ pub struct AssocSingleDependencyActionParam {
     pub dependency_class_version: i32,
     pub dependency: Handle,
     pub class_version: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AssocSmartCenterActionBody {
+    pub action_body: AssocActionBody,
+    pub parameter_body: AssocParamBasedActionBody,
+    pub version: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -867,6 +979,16 @@ pub struct AssocEdgeActionParam {
     pub has_action: bool,
     pub action_type: i32,
     pub subcurve_kind: AssocSubcurveKind,
+    pub curve: Vec<AssocCurveValue>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum AssocCurveValue {
+    Bool(bool),
+    Int(i32),
+    Real(f64),
+    Point(Vector3),
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -889,6 +1011,16 @@ pub enum AssocConstraintNodeData {
         owner_id: i32,
         is_implied: bool,
         is_active: bool,
+    },
+    Composite {
+        owner_id: i32,
+        is_implied: bool,
+        is_active: bool,
+        owned_constraint_ids: Vec<i32>,
+    },
+    HelpParameter {
+        value: f64,
+        reserved: bool,
     },
     Angle {
         owner_id: i32,
@@ -934,6 +1066,13 @@ pub enum AssocConstraintNodeData {
         geometry_node_id: i32,
         point: Option<Vector3>,
     },
+    RigidSet {
+        geometry_dependency: Handle,
+        geometry_node_id: i32,
+        reserved: bool,
+        transform: [f64; 16],
+        geometry_ids: Vec<i32>,
+    },
     Line {
         geometry_dependency: Handle,
         geometry_node_id: i32,
@@ -974,22 +1113,38 @@ pub enum AssocConstraintNodeData {
         end_point: Vector3,
     },
     Ellipse {
-        owner_id: i32,
-        is_implied: bool,
-        is_active: bool,
+        geometry_dependency: Handle,
+        geometry_node_id: i32,
         center: Vector3,
-        short_axis: Vector3,
+        major_axis: Vector3,
         axis_ratio: f64,
     },
     BoundedEllipse {
-        owner_id: i32,
-        is_implied: bool,
-        is_active: bool,
+        geometry_dependency: Handle,
+        geometry_node_id: i32,
         center: Vector3,
-        short_axis: Vector3,
+        major_axis: Vector3,
         axis_ratio: f64,
         start_point: Vector3,
         end_point: Vector3,
+    },
+    Spline {
+        geometry_dependency: Handle,
+        geometry_node_id: i32,
+        rational: bool,
+        periodic: bool,
+        degree: i32,
+        knot_tolerance: f64,
+        knot_physical_length: i32,
+        knot_grow_length: i32,
+        knots: Vec<f64>,
+        weight_physical_length: i32,
+        weight_grow_length: i32,
+        weights: Vec<f64>,
+        control_point_physical_length: i32,
+        control_point_grow_length: i32,
+        control_points: Vec<Vector3>,
+        implicit_point_ids: Vec<i32>,
     },
 }
 
@@ -1002,7 +1157,20 @@ pub struct Assoc2dConstraintGroup {
     pub work_plane: [Vector3; 3],
     pub dependency: Handle,
     pub actions: Vec<Handle>,
+    /// Id the group gives its next new node; above every id in use, deleted
+    /// ones included. Writers raise it past the largest id in `nodes`.
+    pub next_node_id: i32,
     pub nodes: Vec<AssocConstraintNode>,
+}
+
+impl Assoc2dConstraintGroup {
+    /// `next_node_id`, raised past every node id the group holds.
+    pub fn effective_next_node_id(&self) -> i32 {
+        self.nodes
+            .iter()
+            .map(|node| node.node_id.saturating_add(1))
+            .fold(self.next_node_id, i32::max)
+    }
 }
 
 impl Default for Assoc2dConstraintGroup {
@@ -1014,6 +1182,7 @@ impl Default for Assoc2dConstraintGroup {
             work_plane: [Vector3::ZERO; 3],
             dependency: Handle::NULL,
             actions: Vec::new(),
+            next_node_id: 0,
             nodes: Vec::new(),
         }
     }
@@ -1032,7 +1201,19 @@ pub struct AssocVariable {
     pub has_cached_value: bool,
     pub cached_value: String,
     pub flag: bool,
-    pub reserved: i32,
+    /// The value dependencies the variable owns, one per variable its
+    /// expression reads (an unnamed variable holding `k1*45` owns one on
+    /// `k1`).
+    pub dependencies: Vec<AssocVariableDependency>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AssocVariableDependency {
+    /// The owned AcDbAssocValueDependency.
+    pub dependency: Handle,
+    /// The integer written after each dependency (0 in every file seen).
+    pub flags: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -1154,6 +1335,9 @@ pub struct AssocArrayActionBody {
     pub parameter_body: AssocParamBasedActionBody,
     pub version: i32,
     pub parameter_block: String,
+    pub item_list_version: i32,
+    pub item_class: String,
+    pub items: Vec<AssocArrayItem>,
     pub transform: [f64; 16],
 }
 
@@ -1164,6 +1348,9 @@ impl Default for AssocArrayActionBody {
             parameter_body: AssocParamBasedActionBody::default(),
             version: 0,
             parameter_block: String::new(),
+            item_list_version: 0,
+            item_class: String::new(),
+            items: Vec::new(),
             transform: [0.0; 16],
         }
     }
@@ -1195,6 +1382,18 @@ pub struct AssocDimensionReference {
     pub has_last_point_reference: bool,
 }
 
+impl AssocDimensionReference {
+    /// Whether a reference with this osnap type and number of referenced
+    /// objects stores its main sub-entity (subent type, GS marker, xref
+    /// paths). A reference that snaps to no object has none to describe:
+    /// AutoCAD writes an `_End` "last point" reference with no objects as
+    /// class name, osnap type, object count, distance, point and the
+    /// continuation bit only, in DWG and DXF alike.
+    pub fn stores_main_subentity(osnap_type: u8, object_count: usize) -> bool {
+        osnap_type != 0 && object_count > 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AssocDimensionAssociation {
@@ -1216,8 +1415,7 @@ pub struct PersSubentManager {
     pub marker_two: i32,
     pub associative_step_count: i32,
     pub associative_subent_count: i32,
-    pub steps: Vec<i32>,
-    pub subents: Vec<i32>,
+    pub values: Vec<i32>,
 }
 
 pub fn associative_canonical_name(name: &str) -> String {
@@ -1228,7 +1426,7 @@ pub fn associative_canonical_name(name: &str) -> String {
         upper
     };
     match canonical.as_str() {
-        // Seen in Autodesk/LibreDWG class tables without the second `D`.
+        // Native class tables include this spelling without the second `D`.
         "ASSOCALIGNEDIMACTIONBODY" => "ASSOCALIGNEDDIMACTIONBODY".to_string(),
         "ACDBPERSSUBENTMANAGER" => "PERSUBENTMGR".to_string(),
         "ACDBDIMASSOC" => "DIMASSOC".to_string(),
@@ -1294,6 +1492,8 @@ pub fn is_associative_object_name(name: &str) -> bool {
             | "ASSOCVIEWSYMBOLACTIONPARAM"
             | "ASSOCVIEWSTYLEACTIONPARAM"
             | "ASSOCVIEWLABELACTIONPARAM"
+            | "ACDBCENTERMARKACTIONBODY"
+            | "ACDBCENTERLINEACTIONBODY"
     )
 }
 
@@ -1354,6 +1554,8 @@ pub fn associative_cpp_class_name(name: &str) -> Option<&'static str> {
         "ASSOCVIEWSYMBOLACTIONPARAM" => "AcDbAssocViewSymbolActionParam",
         "ASSOCVIEWSTYLEACTIONPARAM" => "AcDbAssocViewStyleActionParam",
         "ASSOCVIEWLABELACTIONPARAM" => "AcDbAssocViewLabelActionParam",
+        "ACDBCENTERMARKACTIONBODY" => "AcDbCenterMarkActionBody",
+        "ACDBCENTERLINEACTIONBODY" => "AcDbCenterLineActionBody",
         _ => return None,
     })
 }

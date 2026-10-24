@@ -3,10 +3,10 @@
 use super::aci_table;
 use std::fmt;
 
-/// Represents a color in AutoCAD
+/// Represents a color in ACAD
 ///
 /// Colors can be represented in multiple ways:
-/// - By index (0-256): AutoCAD Color Index (ACI)
+/// - By index (0-256): ACAD Color Index (ACI)
 /// - By RGB values: True color
 /// - By layer: Use the layer's color
 /// - By block: Use the block's color
@@ -20,22 +20,22 @@ pub enum Color {
     None,
     /// Color by block (index 0)
     ByBlock,
-    /// AutoCAD Color Index (1-255)
+    /// ACAD Color Index (1-255)
     Index(u8),
     /// True color with RGB values
     Rgb { r: u8, g: u8, b: u8 },
 }
 
 impl Color {
-    /// Create a color from an AutoCAD Color Index
+    /// Create a color from an ACAD Color Index
     pub fn from_index(index: i16) -> Self {
         match index {
             0 => Color::ByBlock,
             256 => Color::ByLayer,
             257 => Color::None,
             1..=255 => Color::Index(index as u8),
-            _ if index < 0 => Color::Index((-index).min(255) as u8), // Negative means layer is off
-            _ => Color::Index(7),                                    // Default to white
+            _ if index < 0 => Color::Index(index.unsigned_abs().min(255) as u8), // Negative means layer is off
+            _ => Color::Index(7),                                                // Default to white
         }
     }
 
@@ -149,6 +149,13 @@ mod tests {
         assert_eq!(Color::from_index(0), Color::ByBlock);
         assert_eq!(Color::from_index(256), Color::ByLayer);
         assert_eq!(Color::from_index(1), Color::Index(1));
+    }
+
+    #[test]
+    fn test_color_from_negative_index() {
+        assert_eq!(Color::from_index(-5), Color::Index(5));
+        assert_eq!(Color::from_index(-300), Color::Index(255));
+        assert_eq!(Color::from_index(i16::MIN), Color::Index(255));
     }
 
     #[test]

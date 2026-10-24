@@ -59,14 +59,14 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_bit(value.is_attached_to_object);
         self.writer.write_bit(value.is_delegating_to_owning_action);
         self.writer.write_bit_long(value.order);
-        self.write_assoc_handle(DwgReferenceType::HardOwnership, value.dependent_on);
+        self.write_assoc_handle(DwgReferenceType::SoftPointer, value.dependent_on);
         self.writer.write_bit(value.name.is_some());
         if let Some(name) = &value.name {
             self.writer.write_variable_text(name);
         }
         self.write_assoc_handle(DwgReferenceType::SoftPointer, value.read_dependency);
-        self.write_assoc_handle(DwgReferenceType::HardOwnership, value.node);
-        self.write_assoc_handle(DwgReferenceType::SoftPointer, value.dependency_body);
+        self.write_assoc_handle(DwgReferenceType::SoftPointer, value.node);
+        self.write_assoc_handle(DwgReferenceType::HardOwnership, value.dependency_body);
         self.writer.write_bit_long(value.dependency_body_id);
     }
 
@@ -253,8 +253,44 @@ impl<'a> DwgObjectWriter<'a> {
         self.write_assoc_parameter_body(&value.parameter_body);
         self.writer.write_bit_long(value.version);
         self.writer.write_variable_text(&value.parameter_block);
+        self.writer.write_bit_long(value.item_list_version);
+        self.writer.write_bit_long(value.items.len() as i32);
+        self.writer.write_variable_text(&value.item_class);
+        for item in &value.items {
+            self.write_assoc_array_item(item);
+        }
         for item in value.transform {
             self.writer.write_bit_double(item);
+        }
+    }
+
+    fn write_assoc_array_item(&mut self, item: &AssocArrayItem) {
+        self.writer.write_bit_long(item.class_version);
+        for location in item.location {
+            self.writer.write_bit_long(location);
+        }
+        self.writer.write_bit_long(item.flags);
+        if item.uses_default_transform {
+            self.writer.write_3bit_double(item.x_direction);
+        } else {
+            for value in item.transform {
+                self.writer.write_bit_double(value);
+            }
+        }
+        if let Some(matrix) = item.relative_transform {
+            for value in matrix {
+                self.writer.write_bit_double(value);
+            }
+        }
+        self.write_assoc_handle(
+            DwgReferenceType::SoftPointer,
+            item.first_handle.unwrap_or(Handle::NULL),
+        );
+        if item.flags & 0x10 != 0 {
+            self.write_assoc_handle(
+                DwgReferenceType::SoftPointer,
+                item.second_handle.unwrap_or(Handle::NULL),
+            );
         }
     }
 
@@ -320,7 +356,10 @@ impl<'a> DwgObjectWriter<'a> {
                 self.writer.write_byte(reference.osnap_type);
                 self.writer.write_bit_long(reference.xrefs.len() as i32);
                 self.write_assoc_handles(DwgReferenceType::SoftPointer, &reference.xrefs);
-                if reference.osnap_type != 0 {
+                if AssocDimensionReference::stores_main_subentity(
+                    reference.osnap_type,
+                    reference.xrefs.len(),
+                ) {
                     self.writer.write_bit_long(reference.main_subent_type);
                     self.writer.write_bit_long(reference.main_gs_marker);
                     self.writer
@@ -358,15 +397,8 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_bit_long(value.marker_two);
         self.writer.write_bit_long(value.associative_step_count);
         self.writer.write_bit_long(value.associative_subent_count);
-        self.writer.write_bit_long(value.steps.len() as i32);
-        for step in &value.steps {
-            self.writer.write_bit_long(*step);
-        }
-        if value.associative_subent_count != 0 || !value.subents.is_empty() {
-            self.writer.write_bit_long(value.subents.len() as i32);
-            for subent in &value.subents {
-                self.writer.write_bit_long(*subent);
-            }
+        for item in &value.values {
+            self.writer.write_bit_long(*item);
         }
     }
 
@@ -399,8 +431,8 @@ impl<'a> DwgObjectWriter<'a> {
         dimension_dependency: Handle,
     ) {
         self.write_geometrical_constraint(owner_id, is_implied, is_active);
-        self.write_assoc_handle(DwgReferenceType::HardOwnership, value_dependency);
-        self.write_assoc_handle(DwgReferenceType::HardOwnership, dimension_dependency);
+        self.write_assoc_handle(DwgReferenceType::HardPointer, value_dependency);
+        self.write_assoc_handle(DwgReferenceType::HardPointer, dimension_dependency);
     }
 
     fn write_constraint_node_data(&mut self, data: &AssocConstraintNodeData) {
@@ -411,6 +443,23 @@ impl<'a> DwgObjectWriter<'a> {
                 is_implied,
                 is_active,
             } => self.write_geometrical_constraint(*owner_id, *is_implied, *is_active),
+            AssocConstraintNodeData::Composite {
+                owner_id,
+                is_implied,
+                is_active,
+                owned_constraint_ids,
+            } => {
+                self.write_geometrical_constraint(*owner_id, *is_implied, *is_active);
+                self.writer
+                    .write_bit_long(owned_constraint_ids.len() as i32);
+                for constraint_id in owned_constraint_ids {
+                    self.writer.write_bit_long(*constraint_id);
+                }
+            }
+            AssocConstraintNodeData::HelpParameter { value, reserved } => {
+                self.writer.write_bit_double(*value);
+                self.writer.write_bit(*reserved);
+            }
             AssocConstraintNodeData::Angle {
                 owner_id,
                 is_implied,
@@ -508,6 +557,24 @@ impl<'a> DwgObjectWriter<'a> {
                         .write_3bit_double(point.unwrap_or(crate::types::Vector3::ZERO));
                 }
             }
+            AssocConstraintNodeData::RigidSet {
+                geometry_dependency,
+                geometry_node_id,
+                reserved,
+                transform,
+                geometry_ids,
+            } => {
+                self.write_assoc_handle(DwgReferenceType::SoftPointer, *geometry_dependency);
+                self.writer.write_bit_long(*geometry_node_id);
+                self.writer.write_bit(*reserved);
+                for value in transform {
+                    self.writer.write_bit_double(*value);
+                }
+                self.writer.write_bit_long(geometry_ids.len() as i32);
+                for geometry_id in geometry_ids {
+                    self.writer.write_bit_long(*geometry_id);
+                }
+            }
             AssocConstraintNodeData::Line {
                 geometry_dependency,
                 geometry_node_id,
@@ -555,7 +622,9 @@ impl<'a> DwgObjectWriter<'a> {
                 self.writer.write_bit_double(*radius);
                 self.writer.write_bit_double(*start_parameter);
                 self.writer.write_bit_double(*end_parameter);
-                self.writer.write_bit_double(*reserved);
+                if self.version.r2013_plus(self.dxf_version) {
+                    self.writer.write_bit_double(*reserved);
+                }
             }
             AssocConstraintNodeData::Arc {
                 geometry_dependency,
@@ -578,39 +647,88 @@ impl<'a> DwgObjectWriter<'a> {
                 self.writer.write_bit_double(*radius);
                 self.writer.write_bit_double(*start_parameter);
                 self.writer.write_bit_double(*end_parameter);
-                self.writer.write_bit_double(*reserved);
+                if self.version.r2013_plus(self.dxf_version) {
+                    self.writer.write_bit_double(*reserved);
+                }
                 self.writer.write_3bit_double(*start_point);
                 self.writer.write_3bit_double(*end_point);
             }
             AssocConstraintNodeData::Ellipse {
-                owner_id,
-                is_implied,
-                is_active,
+                geometry_dependency,
+                geometry_node_id,
                 center,
-                short_axis,
+                major_axis,
                 axis_ratio,
             } => {
-                self.write_geometrical_constraint(*owner_id, *is_implied, *is_active);
+                self.write_assoc_handle(DwgReferenceType::SoftPointer, *geometry_dependency);
+                self.writer.write_bit_long(*geometry_node_id);
                 self.writer.write_3bit_double(*center);
-                self.writer.write_3bit_double(*short_axis);
+                self.writer.write_3bit_double(*major_axis);
                 self.writer.write_bit_double(*axis_ratio);
             }
             AssocConstraintNodeData::BoundedEllipse {
-                owner_id,
-                is_implied,
-                is_active,
+                geometry_dependency,
+                geometry_node_id,
                 center,
-                short_axis,
+                major_axis,
                 axis_ratio,
                 start_point,
                 end_point,
             } => {
-                self.write_geometrical_constraint(*owner_id, *is_implied, *is_active);
+                self.write_assoc_handle(DwgReferenceType::SoftPointer, *geometry_dependency);
+                self.writer.write_bit_long(*geometry_node_id);
                 self.writer.write_3bit_double(*center);
-                self.writer.write_3bit_double(*short_axis);
+                self.writer.write_3bit_double(*major_axis);
                 self.writer.write_bit_double(*axis_ratio);
                 self.writer.write_3bit_double(*start_point);
                 self.writer.write_3bit_double(*end_point);
+            }
+            AssocConstraintNodeData::Spline {
+                geometry_dependency,
+                geometry_node_id,
+                rational,
+                periodic,
+                degree,
+                knot_tolerance,
+                knot_physical_length,
+                knot_grow_length,
+                knots,
+                weight_physical_length,
+                weight_grow_length,
+                weights,
+                control_point_physical_length,
+                control_point_grow_length,
+                control_points,
+                implicit_point_ids,
+            } => {
+                self.write_assoc_handle(DwgReferenceType::SoftPointer, *geometry_dependency);
+                self.writer.write_bit_long(*geometry_node_id);
+                self.writer.write_bit(*rational);
+                self.writer.write_bit(*periodic);
+                self.writer.write_bit_long(*degree);
+                self.writer.write_bit_double(*knot_tolerance);
+                self.writer.write_bit_long(knots.len() as i32);
+                self.writer.write_bit_long(*knot_physical_length);
+                self.writer.write_bit_long(*knot_grow_length);
+                for knot in knots {
+                    self.writer.write_bit_double(*knot);
+                }
+                self.writer.write_bit_long(weights.len() as i32);
+                self.writer.write_bit_long(*weight_physical_length);
+                self.writer.write_bit_long(*weight_grow_length);
+                for weight in weights {
+                    self.writer.write_bit_double(*weight);
+                }
+                self.writer.write_bit_long(control_points.len() as i32);
+                self.writer.write_bit_long(*control_point_physical_length);
+                self.writer.write_bit_long(*control_point_grow_length);
+                for point in control_points {
+                    self.writer.write_3bit_double(*point);
+                }
+                self.writer.write_bit_long(implicit_point_ids.len() as i32);
+                for point_id in implicit_point_ids {
+                    self.writer.write_bit_long(*point_id);
+                }
             }
         }
     }
@@ -655,10 +773,21 @@ impl<'a> DwgObjectWriter<'a> {
                 self.write_assoc_dependency(&value.dependency);
                 self.writer.write_bit_short(value.class_version);
                 self.writer.write_bit(value.enabled);
-                self.writer
-                    .write_variable_text(&value.persistent_subent.class_name);
-                self.writer
-                    .write_bit(value.persistent_subent.dependent_on_compound_object);
+                let subent = &value.persistent_subent;
+                if self.version.r2013_plus(self.dxf_version) {
+                    self.writer.write_bit(subent.leading_flag);
+                    self.writer.write_bit_long(
+                        AssocPersistentSubentId::code_for_class_name(&subent.class_name)
+                            .unwrap_or(subent.class_code),
+                    );
+                    for item in &subent.values {
+                        self.writer.write_bit_long(*item);
+                    }
+                } else {
+                    self.writer
+                        .write_variable_text(subent.resolved_class_name());
+                }
+                self.writer.write_bit(subent.dependent_on_compound_object);
             }
             AssociativeData::SurfaceActionBody(value) => self.write_assoc_surface(value),
             AssociativeData::Action(value) => self.write_assoc_action(value),
@@ -687,12 +816,7 @@ impl<'a> DwgObjectWriter<'a> {
                 for marker in value.markers {
                     self.writer.write_bit_long(marker);
                 }
-                self.writer.write_bit_long(value.steps.len() as i32);
-                for step in &value.steps {
-                    self.writer.write_bit_long(*step);
-                }
-                self.writer.write_bit_long(value.subent_count);
-                for item in &value.subent_data {
+                for item in &value.values {
                     self.writer.write_bit_long(*item);
                 }
                 self.writer.write_bit(value.final_flag);
@@ -702,10 +826,19 @@ impl<'a> DwgObjectWriter<'a> {
                 self.write_assoc_handle(DwgReferenceType::HardOwnership, value.parameter);
                 self.writer.write_bit(value.has_action);
                 self.writer.write_bit_long(value.action_type);
+                for item in &value.curve {
+                    match item {
+                        AssocCurveValue::Bool(value) => self.writer.write_bit(*value),
+                        AssocCurveValue::Int(value) => self.writer.write_bit_long(*value),
+                        AssocCurveValue::Real(value) => self.writer.write_bit_double(*value),
+                        AssocCurveValue::Point(value) => self.writer.write_3bit_double(*value),
+                    }
+                }
             }
             AssociativeData::ConstraintGroup(value) => {
                 self.write_assoc_action(&value.action);
-                self.writer.write_bit_long(value.version);
+                self.writer
+                    .write_bit_long(if value.version == 0 { 2 } else { value.version });
                 self.writer.write_bit(value.flag);
                 for point in value.work_plane {
                     self.writer.write_3bit_double(point);
@@ -713,20 +846,33 @@ impl<'a> DwgObjectWriter<'a> {
                 self.write_assoc_handle(DwgReferenceType::HardOwnership, value.dependency);
                 self.writer.write_bit_long(value.actions.len() as i32);
                 self.write_assoc_handles(DwgReferenceType::HardOwnership, &value.actions);
-                self.writer.write_bit_long(value.nodes.len() as i32);
-                if let Some(first) = value.nodes.first() {
-                    self.writer.write_bit_long(first.node_id);
-                    self.writer.write_bit_long(first.connections.len() as i32);
-                    for connection in &first.connections {
-                        self.writer.write_bit_long(*connection);
+                if !self.version.r2013_plus(self.dxf_version) {
+                    let registered: Vec<_> = value
+                        .nodes
+                        .iter()
+                        .filter(|node| !node.class_name.is_empty())
+                        .collect();
+                    self.writer.write_bit_long(value.effective_next_node_id());
+                    self.writer.write_bit_long(registered.len() as i32);
+                    for node in registered {
+                        self.writer.write_variable_text(&node.class_name);
+                        self.write_constraint_node_common(node);
+                        self.write_constraint_node_data(&node.data);
                     }
-                    self.writer.write_bit(first.status != 0);
+                } else if let Some(first) = value.nodes.first() {
                     let registered: Vec<&AssocConstraintNode> = value
                         .nodes
                         .iter()
                         .skip(1)
                         .filter(|node| !node.class_name.is_empty())
                         .collect();
+                    self.writer.write_bit_long(value.effective_next_node_id());
+                    self.writer.write_bit_long(first.node_id);
+                    self.writer.write_bit_long(first.connections.len() as i32);
+                    for connection in &first.connections {
+                        self.writer.write_bit_long(*connection);
+                    }
+                    self.writer.write_bit(first.status != 0);
                     let mut class_types: Vec<&str> = Vec::new();
                     for node in &registered {
                         if !class_types
@@ -755,6 +901,15 @@ impl<'a> DwgObjectWriter<'a> {
                         self.write_constraint_node_common(node);
                         self.write_constraint_node_data(&node.data);
                     }
+                } else {
+                    // R2013+ keeps the registry fields even when the group has
+                    // no nodes. BricsCAD rejects the shorter BL-only form.
+                    self.writer.write_bit_long(value.effective_next_node_id());
+                    self.writer.write_bit_long(0);
+                    self.writer.write_bit_long(0);
+                    self.writer.write_bit(false);
+                    self.writer.write_bit_long(0);
+                    self.writer.write_bit_long(0);
                 }
             }
             AssociativeData::Variable(value) => {
@@ -770,7 +925,11 @@ impl<'a> DwgObjectWriter<'a> {
                     self.writer.write_variable_text(&value.cached_value);
                 }
                 self.writer.write_bit(value.flag);
-                self.writer.write_bit_long(value.reserved);
+                self.writer.write_bit_long(value.dependencies.len() as i32);
+                for dependency in &value.dependencies {
+                    self.write_assoc_handle(DwgReferenceType::HardOwnership, dependency.dependency);
+                    self.writer.write_bit_long(dependency.flags);
+                }
             }
             AssociativeData::ActionParam(value) => self.write_assoc_action_param(value),
             AssociativeData::CompoundActionParam(value)
@@ -857,6 +1016,11 @@ impl<'a> DwgObjectWriter<'a> {
                 self.writer.write_3bit_double(value.normal);
                 self.writer.write_bit_long(value.hatch_index);
                 self.writer.write_bit_long(value.flags);
+            }
+            AssociativeData::SmartCenterActionBody(value) => {
+                self.write_assoc_action_body(&value.action_body);
+                self.write_assoc_parameter_body(&value.parameter_body);
+                self.writer.write_bit_long(value.version);
             }
             AssociativeData::ViewLabelActionParam(value) => {
                 self.write_assoc_single_dependency(&value.single_dependency);
