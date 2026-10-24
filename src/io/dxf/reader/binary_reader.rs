@@ -127,7 +127,7 @@ impl<R: Read + Seek> DxfBinaryReader<R> {
         self.str_buf.clear(); // keep the allocation for reuse
         Ok(match self.encoding {
             Some(encoding) => encoding.decode_escapes(&s),
-            None => crate::io::dxf::code_page::decode_legacy_escapes(&s),
+            None => crate::io::dxf::code_page::decode_mif_escapes(&s),
         })
     }
 

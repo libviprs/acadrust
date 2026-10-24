@@ -153,3 +153,12 @@ fn issue_154_the_page_counts_when_it_comes_before_the_version() {
     let doc = read(&minimal_dxf_ordered("ANSI_1250", b"\\U+220545,6", true));
     assert_eq!(texts_of(&doc), vec!["\u{2205}45,6".to_string()]);
 }
+
+#[test]
+fn issue_154_utf8_text_keeps_a_cif_escape_as_content() {
+    // AC1021 and later are UTF-8 and can hold any character, so `94\U+00B0`
+    // is nine characters of content, as AutoCAD keeps it in an R2018 save.
+    let doc = doc_with(&["94\\U+00B0"], "ANSI_1252", DxfVersion::AC1032);
+    let bytes = DxfWriter::new(&doc).write_to_vec().unwrap();
+    assert_eq!(texts_of(&read(&bytes)), ["94\\U+00B0"]);
+}
