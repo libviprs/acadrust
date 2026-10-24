@@ -1688,7 +1688,13 @@ impl<'a> SectionReader<'a> {
                     if let Some(p) = self.reader.read_pair()? {
                         document.version = DxfVersion::from_version_string(&p.value_string);
                         if document.version >= DxfVersion::AC1021 {
-                            self.reader.set_encoding(encoding_rs::UTF_8.into());
+                            // UTF-8 is the file's own encoding and holds every
+                            // character, so a `\U+XXXX` in it is content.
+                            self.reader.set_encoding(
+                                crate::io::dxf::code_page::LegacyEncoding::WhatwgExact(
+                                    encoding_rs::UTF_8,
+                                ),
+                            );
                         } else if code_page_seen {
                             if let Some(encoding) =
                                 crate::io::dxf::code_page::encoding_from_code_page(&hdr.code_page)
