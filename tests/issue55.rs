@@ -164,6 +164,17 @@ fn cif_escapes_in_dwg_strings_are_decoded_where_the_page_cannot_hold_them() {
 }
 
 #[test]
+fn cif_escapes_in_dwg_strings_are_decoded_for_characters_outside_the_page() {
+    // A file whose strings contain CIF \U+XXXX sequences (ASCII-safe for any
+    // code page) for characters the code page cannot hold must decode them
+    // into the actual characters. GBK holds 中文, so those would not have been
+    // escaped by a writer and stay as written (see legacy_cif_escape_content).
+    let doc = text_document("ANSI_936", "\\U+0E01\\U+0E02");
+    let rt = read_dwg(DwgWriter::write_to_vec(&doc).unwrap());
+    assert_eq!(first_text_value(&rt), "กข");
+}
+
+#[test]
 fn mif_escapes_in_dwg_strings_are_decoded() {
     let doc = text_document("ANSI_936", r"\M+5BCFE\M+5BAC5");
     let rt = read_dwg(DwgWriter::write_to_vec(&doc).unwrap());
