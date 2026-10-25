@@ -47,11 +47,9 @@ fn polyline_record(text: &str) -> &str {
 fn issue_160_a_heavy_polyline_below_r2000_keeps_its_normal() {
     for version in [DxfVersion::AC1009, DxfVersion::AC1012, DxfVersion::AC1014] {
         let (text, normals) = round_trip(flipped(), version);
-        assert!(
-            polyline_record(&text).contains("\n230\n-1.0\n")
-                || polyline_record(&text).contains("\n230\n-1\n"),
-            "{version:?}: the POLYLINE record has no 230 -1"
-        );
+        let record = polyline_record(&text);
+        let count = record.matches("\n230\n-1.0\n").count() + record.matches("\n230\n-1\n").count();
+        assert_eq!(count, 1, "{version:?}: the POLYLINE record has {count} 230 -1 groups, not one");
         assert_eq!(normals, vec![Vector3::new(0.0, 0.0, -1.0)], "{version:?}");
     }
 }
