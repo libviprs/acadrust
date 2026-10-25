@@ -97,6 +97,13 @@ impl LegacyEncoding {
         }
     }
 
+    /// Whether this encoding holds `ch`, so that [`encode_legacy_string`] writes
+    /// it as bytes instead of a `\U+XXXX` escape.
+    pub fn can_encode(self, ch: char) -> bool {
+        let mut buf = [0u8; 4];
+        !self.encode(ch.encode_utf8(&mut buf)).2
+    }
+
     pub fn decode<'a>(self, bytes: &'a [u8]) -> (Cow<'a, str>, Self, bool) {
         match self {
             Self::Whatwg(encoding) | Self::WhatwgExact(encoding) => {
@@ -323,6 +330,15 @@ pub fn dwg_code_page_name(index: u16) -> &'static str {
         44 => "ANSI_1258",
         _ => "ANSI_1252",
     }
+}
+
+/// Whether `index` is one of the compact DWG code page indices this crate maps.
+///
+/// Anything else is decoded with the ANSI_1252 fallback by
+/// [`dwg_code_page_name`], so callers can use this to tell a declared 1252
+/// file from a guessed one.
+pub fn dwg_code_page_is_known(index: u16) -> bool {
+    matches!(index, 1..=44)
 }
 
 /// Convert a DXF `$DWGCODEPAGE` name to the compact DWG metadata index.
@@ -556,8 +572,39 @@ pub fn decode_cif_escapes(text: &str) -> String {
 /// be a stand-in, every well-formed escape decodes, as before the gate
 /// existed. A lone surrogate names no scalar, so no encoder can have escaped
 /// one: it is content under any encoding and crosses verbatim.
-pub fn decode_cif_escapes_in(text: &str, encoding: LegacyEncoding) -> String {
-    decode_cif_escapes_inner(text, Some(encoding))
+pub fn decode_cif_escapes_in(text: &str, encoding: impl CodePageGate) -> String {
+    decode_cif_escapes_inner(text, Some(encoding.gate()))
+}
+
+/// [`decode_legacy_escapes`] for text read from a drawing whose code page is
+/// `encoding`: MIF escapes decode as before, CIF escapes by
+/// [`decode_cif_escapes_in`].
+pub fn decode_legacy_escapes_in(text: &str, encoding: impl CodePageGate) -> String {
+    encoding.gate().decode_escapes(text)
+}
+
+/// What [`decode_cif_escapes_in`] accepts as the code page of a drawing: a
+/// [`LegacyEncoding`] as it stands, or a bare `encoding_rs` row, which a caller
+/// names deliberately and is therefore taken as the code page itself (UTF-8
+/// excepted, which has no code page to ask and decodes every escape).
+pub trait CodePageGate {
+    fn gate(self) -> LegacyEncoding;
+}
+
+impl CodePageGate for LegacyEncoding {
+    fn gate(self) -> LegacyEncoding {
+        self
+    }
+}
+
+impl CodePageGate for &'static Encoding {
+    fn gate(self) -> LegacyEncoding {
+        if self == encoding_rs::UTF_8 {
+            LegacyEncoding::Whatwg(self)
+        } else {
+            LegacyEncoding::WhatwgExact(self)
+        }
+    }
 }
 
 fn decode_cif_escapes_inner(text: &str, gate: Option<LegacyEncoding>) -> String {
@@ -774,6 +821,38 @@ mod tests {
             "技术要求"
         );
         assert_eq!(decode_mif_escapes("\\M+48861"), "\u{AC00}");
+    }
+
+    #[test]
+    fn test_gated_cif_decode_follows_the_code_page() {
+        let w1252 = encoding_rs::WINDOWS_1252;
+        // Held by the page: content, copied as written (hex case included).
+        assert_eq!(decode_cif_escapes_in(r"94\U+00B0", w1252), r"94\U+00B0");
+        assert_eq!(decode_cif_escapes_in(r"94\U+00b0", w1252), r"94\U+00b0");
+        assert_eq!(
+            decode_cif_escapes_in(r"\U+0041\U+0042", w1252),
+            r"\U+0041\U+0042"
+        );
+        // Not held: transport escape, decoded, surrogate pairs as one scalar.
+        assert_eq!(decode_cif_escapes_in(r"\U+2205 x", w1252), "\u{2205} x");
+        assert_eq!(decode_cif_escapes_in(r"\U+D83D\U+DE00", w1252), "\u{1F600}");
+        assert_eq!(
+            decode_cif_escapes_in(r"\U+D83D\U+DE00", encoding_rs::SHIFT_JIS),
+            "\u{1F600}"
+        );
+        // The same character is held by one page and not by another.
+        assert_eq!(decode_cif_escapes_in(r"\U+0411", w1252), "\u{411}");
+        assert_eq!(
+            decode_cif_escapes_in(r"\U+0411", encoding_rs::WINDOWS_1251),
+            r"\U+0411"
+        );
+        // No code page to ask in UTF-8: every escape decodes.
+        assert_eq!(decode_cif_escapes_in(r"\U+0041", encoding_rs::UTF_8), "A");
+        // An OEM page is asked too.
+        assert_eq!(
+            decode_cif_escapes_in(r"\U+00E9", LegacyEncoding::Oem(437)),
+            r"\U+00E9"
+        );
     }
 
     #[test]
