@@ -4577,12 +4577,19 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             i(49),
             XDataValue::Real(cols.gutter),
             i(50),
-            i(if manual_heights { count as i16 } else { 0 }),
+            i(if manual_heights {
+                count.min(i16::MAX as usize) as i16
+            } else {
+                0
+            }),
         ];
         if manual_heights {
-            record
-                .values
-                .extend(cols.heights.iter().take(count).map(|h| XDataValue::Real(*h)));
+            record.values.extend(
+                cols.heights
+                    .iter()
+                    .take(count)
+                    .map(|h| XDataValue::Real(*h)),
+            );
         }
         record
             .values
@@ -5122,13 +5129,13 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 self.writer.write_double(20, arc.center.y)?;
                 self.writer.write_double(40, arc.radius)?;
                 // AutoCAD stores a clockwise edge's angles as 360 minus each
-                // (ezdxf's ArcEdge says the same), so the file says the same arc.
+                // (ezdxf's ArcEdge says the same), so the file means the same arc.
                 let (start, end) = if arc.counter_clockwise {
-                    (arc.start_angle.to_degrees(), arc.end_angle.to_degrees())
+                    (super::degrees(arc.start_angle), super::degrees(arc.end_angle))
                 } else {
                     (
-                        360.0 - arc.start_angle.to_degrees(),
-                        360.0 - arc.end_angle.to_degrees(),
+                        360.0 - super::degrees(arc.start_angle),
+                        360.0 - super::degrees(arc.end_angle),
                     )
                 };
                 self.writer.write_double(50, start)?;
@@ -6121,7 +6128,9 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 ObjectType::XRecord(xrecord) => self.write_xrecord(xrecord, document)?,
                 ObjectType::Group(group) => self.write_group(group)?,
                 ObjectType::MLineStyle(mlinestyle) => self.write_mlinestyle(mlinestyle)?,
-                ObjectType::ImageDefinition(imagedef) => self.write_image_definition(imagedef)?,
+                ObjectType::ImageDefinition(imagedef) => {
+                    self.write_image_definition(imagedef, document)?
+                }
                 ObjectType::UnderlayDefinition(def) => self.write_underlay_definition(def)?,
                 ObjectType::PlotSettings(plotsettings) => self.write_plot_settings(plotsettings)?,
                 ObjectType::MultiLeaderStyle(style) => self.write_multileader_style(style)?,
@@ -6136,7 +6145,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 ObjectType::ImageDefinitionReactor(obj) => self.write_imagedef_reactor(obj)?,
                 ObjectType::GeoData(obj) => self.write_geodata(obj)?,
                 ObjectType::SpatialFilter(obj) => self.write_spatial_filter(obj, document)?,
-                ObjectType::RasterVariables(obj) => self.write_raster_variables(obj)?,
+                ObjectType::RasterVariables(obj) => self.write_raster_variables(obj, document)?,
                 ObjectType::BookColor(obj) => self.write_bookcolor(obj)?,
                 ObjectType::PlaceHolder(obj) => {
                     self.write_stub_handle_only("ACDBPLACEHOLDER", obj.handle, obj.owner)?
@@ -7965,9 +7974,14 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         Ok(())
     }
 
-    fn write_image_definition(&mut self, imagedef: &ImageDefinition) -> Result<()> {
+    fn write_image_definition(
+        &mut self,
+        imagedef: &ImageDefinition,
+        document: &CadDocument,
+    ) -> Result<()> {
         self.writer.write_string(0, "IMAGEDEF")?;
         self.writer.write_handle(5, imagedef.handle)?;
+        self.write_reactor_group(document.image_definition_reactors(imagedef))?;
         self.writer.write_handle(330, imagedef.owner)?;
         self.writer.write_subclass("AcDbRasterImageDef")?;
 
@@ -9382,9 +9396,14 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
     }
 
     /// Write a RASTERVARIABLES object
-    fn write_raster_variables(&mut self, obj: &RasterVariables) -> Result<()> {
+    fn write_raster_variables(
+        &mut self,
+        obj: &RasterVariables,
+        document: &CadDocument,
+    ) -> Result<()> {
         self.writer.write_string(0, "RASTERVARIABLES")?;
         self.writer.write_handle(5, obj.handle)?;
+        self.write_reactor_group(document.raster_variables_reactors(obj))?;
         self.writer.write_handle(330, obj.owner)?;
         self.writer.write_subclass("AcDbRasterVariables")?;
         self.writer.write_i32(90, obj.class_version)?;
@@ -9392,6 +9411,25 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.writer.write_i16(71, obj.image_quality)?;
         self.writer.write_i16(72, obj.units)?;
         Ok(())
+    }
+
+    /// An object's `{ACAD_REACTORS` group: the reactors that are written.
+    fn write_reactor_group(&mut self, reactors: Vec<Handle>) -> Result<()> {
+        let reactors: Vec<Handle> = reactors
+            .into_iter()
+            .filter(|handle| {
+                !handle.is_null()
+                    && (self.valid_handles.is_empty() || self.valid_handles.contains(handle))
+            })
+            .collect();
+        if reactors.is_empty() {
+            return Ok(());
+        }
+        self.writer.write_string(102, "{ACAD_REACTORS")?;
+        for reactor in reactors {
+            self.writer.write_handle(330, reactor)?;
+        }
+        self.writer.write_string(102, "}")
     }
 
     /// Write a DBCOLOR object
