@@ -4250,8 +4250,6 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         if polyline.end_width != 0.0 {
             self.writer.write_double(41, polyline.end_width)?;
         }
-        self.write_normal(polyline.normal)?;
-
         // The extrusion of the OCS the vertices are in (the LWPOLYLINE form has
         // always written it; the heavy form dropped it, libviprs/acadsharp-rs-tests#160).
         self.write_normal(polyline.normal)?;
