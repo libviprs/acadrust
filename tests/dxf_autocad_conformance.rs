@@ -4,7 +4,9 @@
 
 use acadrust::entities::*;
 use acadrust::objects::{
-    ObjectType, ProxyObject, ProxyObjectReference, ProxyPayload, ProxyReferenceKind, Scale,
+    BlockEvalValue, BlockGrip, BlockOrientedGrip, BlockVisibilityParameter, DynamicBlockData,
+    DynamicBlockObject, ObjectType, ProxyObject, ProxyObjectReference, ProxyPayload,
+    ProxyReferenceKind, Scale,
 };
 use acadrust::types::{DxfVersion, Handle, Vector2, Vector3};
 use acadrust::{CadDocument, DwgReader, DwgWriter, DxfReader, DxfWriter};
@@ -87,10 +89,26 @@ fn proxy_object(doc: &mut CadDocument, dwg_version: i32) -> Handle {
 fn proxy_object_layout_matches_autocad_per_version() {
     // (DXF version, proxied object's own format version, expected groups)
     let cases: [(DxfVersion, i32, &[i32]); 4] = [
-        (DxfVersion::AC1018, 31, &[90, 91, 95, 70, 93, 310, 340, 330, 94]),
-        (DxfVersion::AC1024, 23, &[90, 91, 95, 70, 161, 310, 340, 330, 94]),
-        (DxfVersion::AC1024, 31, &[90, 91, 95, 70, 162, 161, 310, 340, 330, 94]),
-        (DxfVersion::AC1032, 31, &[90, 91, 71, 97, 70, 162, 161, 310, 340, 330, 94]),
+        (
+            DxfVersion::AC1018,
+            31,
+            &[90, 91, 95, 70, 93, 310, 340, 330, 94],
+        ),
+        (
+            DxfVersion::AC1024,
+            23,
+            &[90, 91, 95, 70, 161, 310, 340, 330, 94],
+        ),
+        (
+            DxfVersion::AC1024,
+            31,
+            &[90, 91, 95, 70, 162, 161, 310, 340, 330, 94],
+        ),
+        (
+            DxfVersion::AC1032,
+            31,
+            &[90, 91, 71, 97, 70, 162, 161, 310, 340, 330, 94],
+        ),
     ];
     for (version, object_version, expected) in cases {
         let mut doc = CadDocument::with_version(version);
@@ -121,7 +139,10 @@ fn proxy_object_references_and_payload_read_back() {
     let kinds: Vec<_> = object.object_ids.iter().map(|r| r.kind).collect();
     assert_eq!(
         kinds,
-        [ProxyReferenceKind::HardPointer, ProxyReferenceKind::SoftPointer]
+        [
+            ProxyReferenceKind::HardPointer,
+            ProxyReferenceKind::SoftPointer
+        ]
     );
 }
 
@@ -147,11 +168,19 @@ fn proxy_entity_graphics_are_written_once_inside_the_proxy_subclass() {
             object_ids: Vec::new(),
         }),
     };
-    let handle = doc.add_entity(EntityType::Extended(entity)).unwrap();
+    let handle = doc
+        .add_entity(EntityType::Extended(Box::new(entity)))
+        .unwrap();
     let rec = record(&write_pairs(&doc), handle);
     let entity_part: Vec<i32> = {
-        let start = rec.iter().position(|(c, v)| *c == 100 && v == "AcDbEntity").unwrap();
-        let end = rec.iter().position(|(c, v)| *c == 100 && v == "AcDbProxyEntity").unwrap();
+        let start = rec
+            .iter()
+            .position(|(c, v)| *c == 100 && v == "AcDbEntity")
+            .unwrap();
+        let end = rec
+            .iter()
+            .position(|(c, v)| *c == 100 && v == "AcDbProxyEntity")
+            .unwrap();
         rec[start..end].iter().map(|(c, _)| *c).collect()
     };
     assert!(
@@ -180,9 +209,14 @@ fn remote_text_uses_the_rtext_subclass_marker() {
             text: "$(getvar, \"dwgname\")".to_string(),
         }),
     };
-    let handle = doc.add_entity(EntityType::Extended(entity)).unwrap();
+    let handle = doc
+        .add_entity(EntityType::Extended(Box::new(entity)))
+        .unwrap();
     let rec = record(&write_pairs(&doc), handle);
-    assert!(rec.iter().any(|(c, v)| *c == 100 && v == "RText"), "{rec:?}");
+    assert!(
+        rec.iter().any(|(c, v)| *c == 100 && v == "RText"),
+        "{rec:?}"
+    );
     assert!(!rec.iter().any(|(_, v)| v == "AcDbRText"));
 }
 
@@ -205,7 +239,11 @@ fn hatch_with_a_derived_boundary_writes_pixel_size_before_seed_points() {
     let mut flags = BoundaryPathFlags::new();
     flags.set_derived(true);
     let mut path = BoundaryPath::with_flags(flags);
-    for (a, b) in [((0.0, 0.0), (1.0, 0.0)), ((1.0, 0.0), (1.0, 1.0)), ((1.0, 1.0), (0.0, 0.0))] {
+    for (a, b) in [
+        ((0.0, 0.0), (1.0, 0.0)),
+        ((1.0, 0.0), (1.0, 1.0)),
+        ((1.0, 1.0), (0.0, 0.0)),
+    ] {
         path.edges.push(BoundaryEdge::Line(LineEdge {
             start: Vector2::new(a.0, a.1),
             end: Vector2::new(b.0, b.1),
@@ -213,7 +251,7 @@ fn hatch_with_a_derived_boundary_writes_pixel_size_before_seed_points() {
     }
     hatch.paths.push(path);
     hatch.pixel_size = 0.0725;
-    let handle = doc.add_entity(EntityType::Hatch(hatch)).unwrap();
+    let handle = doc.add_entity(EntityType::Hatch(Box::new(hatch))).unwrap();
     let rec = record(&write_pairs(&doc), handle);
     let p47 = rec.iter().position(|(c, _)| *c == 47).expect("47 written");
     let p98 = rec.iter().position(|(c, _)| *c == 98).expect("98 written");
@@ -225,15 +263,19 @@ fn hatch_with_a_derived_boundary_writes_pixel_size_before_seed_points() {
 fn active_layout_viewports_get_ids_starting_at_one() {
     let mut doc = CadDocument::new();
     let first = doc
-        .add_paper_space_entity(EntityType::Viewport(Viewport::new()))
+        .add_paper_space_entity(EntityType::Viewport(Box::new(Viewport::new())))
         .unwrap();
     let second = doc
-        .add_paper_space_entity(EntityType::Viewport(Viewport::new()))
+        .add_paper_space_entity(EntityType::Viewport(Box::new(Viewport::new())))
         .unwrap();
     let pairs = write_pairs(&doc);
     for (handle, id) in [(first, "1"), (second, "2")] {
         let rec = record(&pairs, handle);
-        let get = |code| rec.iter().find(|(c, _)| *c == code).map(|(_, v)| v.trim().to_string());
+        let get = |code| {
+            rec.iter()
+                .find(|(c, _)| *c == code)
+                .map(|(_, v)| v.trim().to_string())
+        };
         assert_eq!(get(69).as_deref(), Some(id), "viewport id");
         assert_eq!(get(68).as_deref(), Some(id), "viewport status");
     }
@@ -250,6 +292,8 @@ fn mtext_context_data_has_no_subclass_marker_and_autocad_point_codes() {
         reactors: Vec::new(),
         xdictionary_handle: None,
         class_version: 4,
+        has_file_to_extension_dictionary: true,
+        uses_legacy_mleader_context_base: false,
         is_default: true,
         scale: Handle::NULL,
         kind: ObjectContextKind::MText(MTextContext {
@@ -264,16 +308,29 @@ fn mtext_context_data_has_no_subclass_marker_and_autocad_point_codes() {
             columns: None,
         }),
     };
-    doc.objects.insert(handle, ObjectType::ObjectContextData(context));
+    doc.objects
+        .insert(handle, ObjectType::ObjectContextData(context));
     let pairs = write_pairs(&doc);
     let rec = record(&pairs, handle);
     assert!(
         !rec.iter().any(|(_, v)| v == "AcDbMTextObjectContextData"),
         "AutoCAD rejects the marker: {rec:?}"
     );
-    let value = |code| rec.iter().find(|(c, _)| *c == code).map(|(_, v)| v.trim().to_string());
-    assert_eq!(value(10).as_deref(), Some("1.0"), "10 is the x-axis direction");
-    assert_eq!(value(11).as_deref(), Some("29798.0"), "11 is the insertion point");
+    let value = |code| {
+        rec.iter()
+            .find(|(c, _)| *c == code)
+            .map(|(_, v)| v.trim().to_string())
+    };
+    assert_eq!(
+        value(10).as_deref(),
+        Some("1.0"),
+        "10 is the x-axis direction"
+    );
+    assert_eq!(
+        value(11).as_deref(),
+        Some("29798.0"),
+        "11 is the insertion point"
+    );
 
     let path = std::env::temp_dir().join("acadrust_mtext_context_rt.dxf");
     std::fs::write(&path, DxfWriter::new(&doc).write_to_vec().unwrap()).unwrap();
@@ -302,4 +359,125 @@ fn r2007_table_records_do_not_claim_the_referenced_flag() {
     for vport in loaded.vports.iter() {
         assert!(!vport.xref_reference, "{} claims the 64 flag", vport.name);
     }
+}
+
+fn visibility_parameter(
+    doc: &mut CadDocument,
+    eval_value_code: i16,
+    eval_value: BlockEvalValue,
+) -> Handle {
+    let handle = doc.allocate_handle();
+    let object = BlockVisibilityParameter {
+        handle,
+        owner: Handle::NULL,
+        eval_major: 33,
+        eval_minor: 378,
+        eval_value_code,
+        eval_value,
+        eval_node_id: 1,
+        element_name: "Visibility State".to_string(),
+        element_major: 33,
+        element_minor: 378,
+        name: "Visibility1".to_string(),
+        ..Default::default()
+    };
+    doc.objects
+        .insert(handle, ObjectType::BlockVisibilityParameter(object));
+    handle
+}
+
+#[test]
+fn visibility_eval_expr_without_value_writes_nothing_after_node_ids() {
+    // AutoCAD DXFOUT (2018) of a visibility-bearing dynamic block ends
+    // AcDbEvalExpr after 90/98/99; the shared reader treats an absent 70 as
+    // the -9999 "no value" sentinel. Emitting "70 -9999" makes AutoCAD reject
+    // the object with "Unexpected DXF group code: 70".
+    let mut doc = CadDocument::with_version(DxfVersion::AC1032);
+    let handle = visibility_parameter(&mut doc, -9999, BlockEvalValue::None);
+    let codes = codes_after(&record(&write_pairs(&doc), handle), "AcDbEvalExpr");
+    assert_eq!(&codes[..4], &[90, 98, 99, 100], "{codes:?}");
+}
+
+#[test]
+fn visibility_eval_expr_with_value_matches_parameter_layout() {
+    // AcDbEvalExpr with a value carries an empty expression string, the value
+    // type, then the value - the layout every other parameter writes and the
+    // shared reader accepts (a real value is group 140, not 40).
+    let mut doc = CadDocument::with_version(DxfVersion::AC1032);
+    let handle = visibility_parameter(&mut doc, 40, BlockEvalValue::Real(6.5));
+    let codes = codes_after(&record(&write_pairs(&doc), handle), "AcDbEvalExpr");
+    assert_eq!(&codes[..7], &[90, 98, 99, 1, 70, 140, 100], "{codes:?}");
+}
+
+fn alignment_grip(doc: &mut CadDocument) -> Handle {
+    let handle = doc.allocate_handle();
+    let object = DynamicBlockObject {
+        handle,
+        owner: Handle::NULL,
+        dxf_name: "BLOCKALIGNMENTGRIP".to_string(),
+        cpp_class_name: "AcDbBlockAlignmentGrip".to_string(),
+        data: DynamicBlockData::AlignmentGrip(BlockOrientedGrip {
+            grip: BlockGrip::default(),
+            orientation: Vector3::new(1.0, 0.0, 0.0),
+        }),
+        ..Default::default()
+    };
+    doc.objects.insert(handle, ObjectType::DynamicBlock(object));
+    handle
+}
+
+#[test]
+fn alignment_grip_orientation_uses_sequential_group_codes() {
+    // The reference writer emits AcDbBlockAlignmentGrip's orientation as the
+    // sequential trio 140/141/142. Deriving y/z as base+10/base+20 (the
+    // ordinary point convention) emits 140/150/160 instead, which a conforming
+    // reader rejects with "DXF read error" inside BLOCKALIGNMENTGRIP and then
+    // discards the whole drawing.
+    let mut doc = CadDocument::with_version(DxfVersion::AC1032);
+    let handle = alignment_grip(&mut doc);
+    let codes = codes_after(
+        &record(&write_pairs(&doc), handle),
+        "AcDbBlockAlignmentGrip",
+    );
+    assert_eq!(&codes[..3], &[140, 141, 142], "{codes:?}");
+}
+
+#[test]
+fn wipeout_polygonal_clip_boundary_writes_a_closed_ring() {
+    // The reference writer closes a polygonal clip boundary in DXF: a
+    // four-vertex ring is written as five points with the first repeated, so
+    // 91 reads 5. Writing the unclosed ring leaves the reader short of a point,
+    // which surfaces as "Xdata wasn't read" in WIPEOUT and a discarded drawing.
+    let mut doc = CadDocument::with_version(DxfVersion::AC1032);
+    let mut wipeout = Wipeout::new();
+    wipeout.clip_type = WipeoutClipType::Polygonal;
+    wipeout.clip_boundary_vertices = vec![
+        Vector2::new(-0.5, -0.5),
+        Vector2::new(0.5, -0.5),
+        Vector2::new(0.5, -0.394),
+        Vector2::new(-0.5, -0.394),
+    ];
+    let handle = doc.add_entity(EntityType::Wipeout(wipeout)).unwrap();
+    let rec = record(&write_pairs(&doc), handle);
+    let count = rec
+        .iter()
+        .position(|(code, _)| *code == 91)
+        .expect("clip boundary count written");
+    assert_eq!(
+        rec[count].1.trim(),
+        "5",
+        "polygonal clip boundary must be closed: {rec:?}"
+    );
+    let xs: Vec<&str> = rec
+        .iter()
+        .filter(|(code, _)| *code == 14)
+        .map(|(_, value)| value.trim())
+        .collect();
+    let ys: Vec<&str> = rec
+        .iter()
+        .filter(|(code, _)| *code == 24)
+        .map(|(_, value)| value.trim())
+        .collect();
+    assert_eq!(xs.len(), 5, "{xs:?}");
+    assert_eq!((xs[4], ys[4]), (xs[0], ys[0]), "ring must close: {xs:?}");
 }

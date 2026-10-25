@@ -16,7 +16,72 @@ use crate::types::{Color, Handle, LineWeight, Vector2, Vector3};
 use super::common;
 use super::DwgObjectWriter;
 
+struct ArchitectureRecordBody {
+    type_code: i16,
+    has_ds_data: bool,
+    payload: crate::objects::ProxyPayload,
+    text: crate::objects::ProxyPayload,
+    references: Vec<crate::objects::ProxyObjectReference>,
+}
+
 impl<'a> DwgObjectWriter<'a> {
+    fn architecture_record_body(
+        data: &crate::classes::arch::ArchEntityData,
+        version: crate::types::DxfVersion,
+    ) -> crate::error::Result<ArchitectureRecordBody> {
+        use crate::io::dwg::dwg_stream_readers::object_reader::{
+            entities::read_proxy_payload, DwgObjectReader,
+        };
+
+        let raw = data.raw_dwg_data.as_deref().ok_or_else(|| {
+            crate::error::DxfError::NotImplemented(format!(
+                "Arch entity {} has no DWG class body",
+                data.dxf_name
+            ))
+        })?;
+        let objects = DwgObjectReader::new(Vec::new(), version, Default::default())?;
+        let (type_code, mut reader) = objects.read_raw_record(raw, data.dwg_handle_bits)?;
+        let common = objects.read_common_entity_data(&mut reader, type_code);
+        reader.check_error()?;
+        let (payload, text, references) = read_proxy_payload(&mut reader, common.common.handle);
+        reader.check_error()?;
+        Ok(ArchitectureRecordBody {
+            type_code,
+            has_ds_data: common.has_ds_data,
+            payload,
+            text,
+            references,
+        })
+    }
+
+    pub(crate) fn validate_architecture_record(
+        data: &crate::classes::arch::ArchEntityData,
+        version: crate::types::DxfVersion,
+    ) -> crate::error::Result<()> {
+        Self::architecture_record_body(data, version).map(|_| ())
+    }
+
+    fn write_architecture_entity(
+        &mut self,
+        entity: &ExtendedEntity,
+        data: &crate::classes::arch::ArchEntityData,
+    ) {
+        let body = Self::architecture_record_body(data, self.dxf_version)
+            .expect("Arch class record was validated before writing");
+        let type_code = self.class_type_code(&data.dxf_name, body.type_code);
+        self.pending_has_ds_data = body.has_ds_data;
+        self.entity_preamble(type_code, &entity.common);
+        // The opaque class body is independent of the common entity header.
+        // Decode its handle stream so relative references survive a new handle.
+        self.write_registered_payload(&body.payload, &body.references);
+        let text = body.text.data();
+        for bit in 0..body.text.bit_count as usize {
+            self.writer
+                .write_text_bit(text[bit / 8] & (0x80 >> (bit % 8)) != 0);
+        }
+        self.register_object(entity.common.handle);
+    }
+
     /// Encode only a REGION body for a construction-history profile. Common
     /// entity data, database handles and external AcDs records do not belong
     /// to an embedded entity, so use the shared inline modeler writer.
@@ -45,7 +110,10 @@ impl<'a> DwgObjectWriter<'a> {
     pub(super) fn write_entity(&mut self, entity: &EntityType) {
         // Already emitted verbatim (ACADRUST_RAW_ALL bisection aid): skip, so a
         // compound entity does not re-allocate handles for its children.
-        if self.registered_handles.contains(&entity.common().handle.value()) {
+        if self
+            .registered_handles
+            .contains(&entity.common().handle.value())
+        {
             return;
         }
         // Verbatim passthrough: the entity still carries the exact bytes it was read
@@ -55,18 +123,48 @@ impl<'a> DwgObjectWriter<'a> {
         // the AcDs section, which is assembled from what gets written).
         if let Some(raw) = &entity.common().raw_record {
             let handle = entity.common().handle;
-            let acis = matches!(entity, EntityType::Solid3D(_) | EntityType::Region(_) | EntityType::Body(_) | EntityType::Surface(_));
+            let acis = matches!(
+                entity,
+                EntityType::Solid3D(_)
+                    | EntityType::Region(_)
+                    | EntityType::Body(_)
+                    | EntityType::Surface(_)
+            );
             // Compound entities own follow-up records (VERTEX…/ATTRIB…/SEQEND) that the
             // reader folded into them; the writer emits those alongside, so they must
-            // go through the normal path.
-            let compound = matches!(entity, EntityType::Polyline(_) | EntityType::Polyline2D(_) | EntityType::Polyline3D(_)
-                | EntityType::PolyfaceMesh(_) | EntityType::PolygonMesh(_) | EntityType::Insert(_));
+            // go through the normal path. An INSERT without attributes owns none, and
+            // copying it keeps subclasses such as AcIdBlockReference intact.
+            let compound = matches!(
+                entity,
+                EntityType::Polyline(_)
+                    | EntityType::Polyline2D(_)
+                    | EntityType::Polyline3D(_)
+                    | EntityType::PolyfaceMesh(_)
+                    | EntityType::PolygonMesh(_)
+            ) || matches!(entity, EntityType::Insert(i) if !i.attributes.is_empty() || i.seqend_handle.is_some());
+            // Native frame-only records may contain the optional fill payload.
+            // Normalize them to the R2018 layout when rewriting the drawing.
+            let frame_only_mtext = self.version.r2018_plus(self.dxf_version)
+                && matches!(entity, EntityType::MText(text) if text.background_fill_flags & 0x11 == 0x10);
+            let stale_paper_owner = entity.common().entity_mode == Some(1)
+                && entity.common().owner_handle != self.paper_space_block_handle;
+            let architecture = matches!(entity, EntityType::Extended(entity)
+                if matches!(&entity.data, ExtendedEntityData::Arch(_)));
             let ok = self.version.r2004_plus()
                 && raw.version == self.dxf_version
                 && !self.raw_excluded_handles.contains(&handle.value())
                 && !compound
+                && !frame_only_mtext
+                && !stale_paper_owner
+                && !architecture
                 && !(acis && self.version.r2013_plus(self.dxf_version))
-                && !self.owner_overrides.contains_key(&handle);
+                && !self.owner_overrides.contains_key(&handle)
+                // EED naming an application this drawing has no APPID for
+                // (carried in from another drawing) is dropped on the normal
+                // path; the verbatim record would keep it.
+                && entity.common().extended_data.raw_dwg_eed.iter().all(|(app, _)| {
+                    self.document.app_ids.iter().any(|a| a.handle.value() == *app)
+                });
             if ok {
                 self.register_raw_object(handle, &raw.data, raw.handle_bits);
                 return;
@@ -120,6 +218,10 @@ impl<'a> DwgObjectWriter<'a> {
             EntityType::SectionSymbol(e) => self.write_section_symbol(e),
             EntityType::ViewBorder(e) => self.write_view_border(e),
             EntityType::Extended(e) => {
+                if let ExtendedEntityData::Arch(data) = &e.data {
+                    self.write_architecture_entity(e, data);
+                    return;
+                }
                 let raw = match &e.data {
                     ExtendedEntityData::Format(data) => data
                         .raw_dwg_data
@@ -227,6 +329,8 @@ impl<'a> DwgObjectWriter<'a> {
                     common::OBJ_PROXY_ENTITY
                 }
             }
+            // Written earlier from the original class record.
+            ExtendedEntityData::Arch(_) => return,
         };
 
         if let ExtendedEntityData::Proxy(data) = &e.data {
@@ -463,6 +567,7 @@ impl<'a> DwgObjectWriter<'a> {
                     self.write_registered_payload(&payload, &data.object_ids);
                 }
             }
+            ExtendedEntityData::Arch(_) => {}
         }
         self.register_object(e.common.handle);
     }
@@ -579,29 +684,8 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_bit(data.show_intensity);
         self.writer.write_bit(data.show_cropping);
         self.writer.write_bit_long(data.croppings.len() as i32);
-        if data.croppings.is_empty() {
-            self.writer.write_bit_long(data.unknown_bl0);
-            self.writer.write_bit_long(data.unknown_bl1);
-            self.writer.write_bit_short(data.stylization_type);
-            self.writer
-                .write_variable_text(&data.intensity_color_scheme);
-            self.writer.write_variable_text(&data.current_color_scheme);
-            self.writer
-                .write_variable_text(&data.classification_color_scheme);
-            self.writer.write_bit_double(data.elevation_min);
-            self.writer.write_bit_double(data.elevation_max);
-            self.writer.write_bit_long(data.intensity_min);
-            self.writer.write_bit_long(data.intensity_max);
-            self.writer
-                .write_bit_short(data.intensity_out_of_range_behavior);
-            self.writer
-                .write_bit_short(data.elevation_out_of_range_behavior);
-            self.writer.write_bit(data.elevation_apply_to_fixed_range);
-            self.writer.write_bit(data.intensity_as_gradient);
-            self.writer.write_bit(data.elevation_as_gradient);
-        }
         for cropping in &data.croppings {
-            self.writer.write_bit_short(cropping.crop_type);
+            self.writer.write_byte(cropping.crop_type as u8);
             self.writer.write_bit(cropping.inside);
             self.writer.write_bit(cropping.inverted);
             self.writer.write_3bit_double(cropping.plane);
@@ -612,6 +696,31 @@ impl<'a> DwgObjectWriter<'a> {
                 self.writer.write_3bit_double(*point);
             }
         }
+        self.writer.write_bit_long(data.hidden_scans.len() as i32);
+        for scan in &data.hidden_scans {
+            self.writer.write_variable_text(scan);
+        }
+        self.writer.write_bit_long(data.hidden_regions.len() as i32);
+        for region in &data.hidden_regions {
+            self.writer.write_bit_long(*region);
+        }
+        self.writer.write_bit_short(data.stylization_type);
+        self.writer
+            .write_variable_text(&data.intensity_color_scheme);
+        self.writer.write_variable_text(&data.current_color_scheme);
+        self.writer
+            .write_variable_text(&data.classification_color_scheme);
+        self.writer.write_bit_double(data.elevation_min);
+        self.writer.write_bit_double(data.elevation_max);
+        self.writer.write_bit_long(data.intensity_min);
+        self.writer.write_bit_long(data.intensity_max);
+        self.writer
+            .write_bit_short(data.intensity_out_of_range_behavior);
+        self.writer
+            .write_bit_short(data.elevation_out_of_range_behavior);
+        self.writer.write_bit(data.elevation_apply_to_fixed_range);
+        self.writer.write_bit(data.intensity_as_gradient);
+        self.writer.write_bit(data.elevation_as_gradient);
     }
 
     // â”€â”€ Point â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -891,13 +1000,9 @@ impl<'a> DwgObjectWriter<'a> {
             // Background flags BL 90 (0 = no background)
             self.writer.write_bit_long(e.background_fill_flags);
 
-            // The background-fill block is written when the UseBackgroundFillColor
-            // bit (0x01) is set, or — for R2018+ — when the TextFrame bit (0x10)
-            // is set. Mirrors read_mtext.
-            if (e.background_fill_flags & 0x01) != 0
-                || (self.version.r2018_plus(self.dxf_version)
-                    && (e.background_fill_flags & 0x10) != 0)
-            {
+            // A frame alone does not carry fill properties in the R2018 layout.
+            // Including them shifts the annotative/column fields in ACAD.
+            if (e.background_fill_flags & 0x01) != 0 {
                 // Background scale factor BD 45
                 self.writer.write_bit_double(e.background_scale);
                 // Background color CMC 63
@@ -1308,6 +1413,16 @@ impl<'a> DwgObjectWriter<'a> {
             att.vertical_alignment as i16,
         );
 
+        // Common TEXT style precedes embedded MTEXT handles (ODA 20.4.4).
+        let style_handle = self
+            .document
+            .text_styles
+            .get(&att.text_style)
+            .map(|s| s.handle)
+            .unwrap_or(Handle::NULL);
+        self.writer
+            .write_handle(DwgReferenceType::HardPointer, style_handle.value());
+
         // writeCommonAttData: R2010+ version byte
         if self.version.r2010_plus() {
             self.writer.write_byte(0);
@@ -1345,14 +1460,6 @@ impl<'a> DwgObjectWriter<'a> {
         if self.version.r2007_plus() {
             self.writer.write_bit(att.lock_position);
         }
-        let style_handle = self
-            .document
-            .text_styles
-            .get(&att.text_style)
-            .map(|s| s.handle)
-            .unwrap_or(Handle::NULL);
-        self.writer
-            .write_handle(DwgReferenceType::HardPointer, style_handle.value());
 
         self.register_object(handle);
     }
@@ -1557,8 +1664,18 @@ impl<'a> DwgObjectWriter<'a> {
             self.writer.write_bit_long(scenario);
         }
 
+        // Generate a clamped uniform knot vector if not provided. The
+        // degree written below must match the degree the knots were
+        // generated for, so both come from the same helper.
+        let (degree, knots): (i32, Vec<f64>) =
+            if scenario == 1 && e.knots.is_empty() && !e.control_points.is_empty() {
+                Spline::clamped_knots_with_degree(e.degree, e.control_points.len())
+            } else {
+                (e.degree, e.knots.clone())
+            };
+
         // Degree BL (common, before scenario switch)
-        self.writer.write_bit_long(e.degree);
+        self.writer.write_bit_long(degree);
 
         let has_weights = !e.weights.is_empty();
 
@@ -1576,13 +1693,6 @@ impl<'a> DwgObjectWriter<'a> {
                 self.writer.write_bit_double(e.knot_tolerance);
                 // Ctrl tol BD 43
                 self.writer.write_bit_double(e.control_tolerance);
-
-                // Generate clamped uniform knot vector if not provided
-                let knots: Vec<f64> = if e.knots.is_empty() && !e.control_points.is_empty() {
-                    Spline::generate_clamped_knots(e.degree as usize, e.control_points.len())
-                } else {
-                    e.knots.clone()
-                };
 
                 // Numknots BL 72
                 self.writer.write_bit_long(knots.len() as i32);
@@ -1857,7 +1967,11 @@ impl<'a> DwgObjectWriter<'a> {
                 .write_bit_long(e.gradient_color.colors.len() as i32);
             for entry in &e.gradient_color.colors {
                 self.writer.write_bit_double(entry.value);
-                self.writer.write_cm_color(&entry.color);
+                self.writer.write_cm_color_with_names(
+                    &entry.color,
+                    entry.color_name.as_deref(),
+                    entry.book_name.as_deref(),
+                );
             }
 
             self.writer.write_variable_text(&e.gradient_color.name);
@@ -1933,7 +2047,8 @@ impl<'a> DwgObjectWriter<'a> {
         let type_code = self.class_type_code("MPOLYGON", common::OBJ_MPOLYGON);
         let common = self.hatch_common_for_write(e);
         self.entity_preamble(type_code, &common);
-        self.writer.write_bit_short(e.style as i16);
+        // Object version: 1 in every file read so far.
+        self.writer.write_bit_short(1);
 
         if self.version.r2004_plus() {
             self.writer
@@ -1952,7 +2067,11 @@ impl<'a> DwgObjectWriter<'a> {
                 .write_bit_long(e.gradient_color.colors.len() as i32);
             for entry in &e.gradient_color.colors {
                 self.writer.write_bit_double(entry.value);
-                self.writer.write_cm_color(&entry.color);
+                self.writer.write_cm_color_with_names(
+                    &entry.color,
+                    entry.color_name.as_deref(),
+                    entry.book_name.as_deref(),
+                );
             }
             self.writer.write_variable_text(&e.gradient_color.name);
         }
@@ -1960,13 +2079,9 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_bit_double(e.elevation);
         self.writer.write_3bit_double(e.normal);
         self.writer.write_variable_text(&e.pattern.name);
+        // MPOLYGON has no associative flag and no hatch style.
         self.writer.write_bit(e.is_solid);
-        self.writer.write_bit(e.is_associative);
-        self.writer.write_bit_long(e.paths.len() as i32);
-        for path in &e.paths {
-            self.write_hatch_boundary_path(path);
-        }
-        self.writer.write_bit_short(e.style as i16);
+        self.write_mpolygon_loops(&e.paths, false);
         self.writer.write_bit_short(e.pattern_type as i16);
         if !e.is_solid {
             self.writer.write_bit_double(e.pattern_angle);
@@ -1985,14 +2100,36 @@ impl<'a> DwgObjectWriter<'a> {
         }
         self.writer.write_cm_color(&e.mpolygon_hatch_color);
         self.writer.write_2raw_double(e.mpolygon_x_direction);
-        self.writer.write_bit_long(e.mpolygon_boundary_handle_count);
-        for path in &e.paths {
-            for handle in &path.boundary_handles {
-                self.writer
-                    .write_handle(DwgReferenceType::SoftPointer, handle.value());
+        self.write_mpolygon_loops(&e.mpolygon_invalid_loops, true);
+        self.register_object(e.common.handle);
+    }
+
+    fn write_mpolygon_loops(&mut self, paths: &[BoundaryPath], invalid: bool) {
+        let loops: Vec<&PolylineEdge> = paths
+            .iter()
+            .filter_map(|path| match path.edges.as_slice() {
+                [BoundaryEdge::Polyline(polyline)] => Some(polyline),
+                _ => None,
+            })
+            .collect();
+        self.writer.write_bit_long(loops.len() as i32);
+        for polyline in loops {
+            // Per-loop flag of unconfirmed meaning.
+            self.writer.write_bit(false);
+            if invalid {
+                // Unknown flag carried by invalid loops only.
+                self.writer.write_bit(false);
+            }
+            let has_bulge = polyline.vertices.iter().any(|v| v.z != 0.0);
+            self.writer.write_bit(has_bulge);
+            self.writer.write_bit_long(polyline.vertices.len() as i32);
+            for v in &polyline.vertices {
+                self.writer.write_2raw_double(Vector2::new(v.x, v.y));
+                if has_bulge {
+                    self.writer.write_bit_double(v.z);
+                }
             }
         }
-        self.register_object(e.common.handle);
     }
 
     fn write_hatch_boundary_path(&mut self, path: &BoundaryPath) {
@@ -2180,7 +2317,12 @@ impl<'a> DwgObjectWriter<'a> {
         // Frozen layer count BL
         self.writer.write_bit_long(e.frozen_layers.len() as i32);
         // Status flags BL 90
-        self.writer.write_bit_long(e.status.to_bits());
+        let grid_bits = if self.version.r2007_plus() {
+            i32::from(e.grid_flags.to_bits()) << 18
+        } else {
+            0
+        };
+        self.writer.write_bit_long(e.status.to_bits() | grid_bits);
         // Style Sheet TV 1
         self.writer.write_variable_text(&e.style_sheet);
         // Render Mode RC 281
@@ -2296,11 +2438,12 @@ impl<'a> DwgObjectWriter<'a> {
         // Elevation BD 11 Z-coord
         self.writer.write_bit_double(base.text_middle_point.z);
 
-        // Flags byte — bit 0: text positioned at a user-defined location.
+        // Flags byte — bit 0 is set when the text sits at its default place,
+        // the opposite of DXF group 70 bit 128.
         let flags_byte = if base.text_user_positioned {
-            base.dwg_flags_byte | 0x01
-        } else {
             base.dwg_flags_byte & !0x01
+        } else {
+            base.dwg_flags_byte | 0x01
         };
         self.writer.write_byte(flags_byte);
 
@@ -2622,8 +2765,8 @@ impl<'a> DwgObjectWriter<'a> {
     fn write_polyline3d(&mut self, e: &Polyline3D) {
         self.entity_preamble(common::OBJ_POLYLINE_3D, &e.common);
 
-        // Byte 1: smooth surface type (C# hardcodes 0)
-        self.writer.write_byte(e.smooth_type as u8);
+        // Byte 1: curve type (1 quadratic, 2 cubic B-spline)
+        self.writer.write_byte(e.smooth_type.to_dwg_code());
         // Byte 2: closed flag only — bit 3 (Is3DPolyline) is implied by
         // the object type code and must NOT be written in the DWG data
         let closed_flag = if e.flags.closed { 1u8 } else { 0u8 };
@@ -3142,36 +3285,12 @@ impl<'a> DwgObjectWriter<'a> {
         // entity MLINE (47), `include/dwg.h`), and writes that raw short
         // straight back out at group 71.
         //
-        // Deliberately not `e.flags.bits()` — which is what the DXF writer
-        // emits at `src/io/dxf/writer/section_writer.rs:9373` — because the
-        // in-memory flags can hold combinations the documented contract
-        // excludes: `MLineFlags::empty()`, or `CLOSED` without `HAS_VERTICES`
-        // from a DXF file whose group 71 said 2. A `0` or `2` on this short is
-        // a value no AutoCAD drawing contains, and ACadSharp's reader resolves
-        // it as open by `== 3` (`DwgObjectReader.cs:3374`). So the open/closed
-        // pair is always rebuilt from `CLOSED` into one of the two documented
-        // patterns, and only the cap bits are carried across verbatim. That
-        // makes a DWG write lossless for every flag set a conforming file can
-        // hold, which is the four-bit space with `HAS_VERTICES` set. It does
-        // not make the two writers byte-identical: for the two excluded sets
-        // the DXF writer emits the raw bits, so an in-memory `0` crosses DXF as
-        // `0` and DWG as `1`, and a `2` crosses as `2` and `3` respectively.
-        //
-        // ACadSharp <= 3.7.1 is the one known reader this costs, and citing its
-        // `== 3` above without saying so would be one-sided: `DwgObjectReader.cs:3374`
-        // resolves the short by equality, so a closed multiline that also
-        // suppresses a cap (7, 11, 15) reads back OPEN there — while 4 and 8
-        // already die on any DWG it reads. That is its own defect: its model
-        // declares `[DxfCodeValue(71)] MLineFlags` with all four bits and its
-        // DXF path carries them. Real AutoCAD drawings settle the question —
-        // `real_AC1018.dwg`/`real_AC1032.dwg` handle `3A6` carries 5, which
-        // libredwg 0.14 decodes as HAS_VERTEX | SUPPRESS_START_CAPS.
+        // HAS_VERTICES is derived from the vertex list in the record. Preserve
+        // the closed and cap-suppression bits supplied by the model while
+        // making group 71 agree with group 72 in every output format.
         let caps = e.flags & (MLineFlags::NO_START_CAPS | MLineFlags::NO_END_CAPS);
-        let open_closed: i16 = if e.flags.contains(MLineFlags::CLOSED) {
-            3
-        } else {
-            1
-        };
+        let open_closed: i16 =
+            (e.serialized_flags() & (MLineFlags::HAS_VERTICES | MLineFlags::CLOSED)).bits();
         self.writer.write_bit_short(open_closed | caps.bits());
 
         // Linesinstyle RC 73 — number of segments from first vertex
@@ -3479,6 +3598,8 @@ impl<'a> DwgObjectWriter<'a> {
 
     /// R2010+ inline cell.
     fn write_table_cell_r2010(&mut self, cell: &TableCell) {
+        let cell = cell.binary_layout();
+        let cell: &TableCell = &cell;
         self.writer.write_bit_long(cell.state.bits() as i32);
         self.writer.write_variable_text(&cell.tooltip);
         self.writer.write_bit_long(cell.custom_data);
@@ -3558,7 +3679,22 @@ impl<'a> DwgObjectWriter<'a> {
             self.writer.write_bit_double(col.width);
         }
         self.writer.write_bit_long(e.rows.len() as i32);
-        for row in &e.rows {
+        // Rows read from DXF name no cell style; the binary format names the
+        // title, header and data rows (1, 2, 3).
+        let unnamed = e.rows.iter().all(|row| row.style_id == 0);
+        let legacy = e.legacy_style_override.clone().unwrap_or_default();
+        let title = !legacy.title_suppressed.unwrap_or(false);
+        let header = !legacy.header_suppressed.unwrap_or(false);
+        for (r, row) in e.rows.iter().enumerate() {
+            let style_id = if !unnamed {
+                row.style_id
+            } else if title && r == 0 {
+                1
+            } else if header && r == usize::from(title) {
+                2
+            } else {
+                3
+            };
             self.writer.write_bit_long(row.cells.len() as i32);
             for cell in &row.cells {
                 self.write_table_cell_r2010(cell);
@@ -3570,7 +3706,7 @@ impl<'a> DwgObjectWriter<'a> {
                 self.write_table_custom_data(data);
             }
             self.write_table_cell_style(row.style.as_ref());
-            self.writer.write_bit_long(row.style_id);
+            self.writer.write_bit_long(style_id);
             self.writer.write_bit_double(row.height);
         }
         self.writer.write_bit_long(e.field_handles.len() as i32);
@@ -3975,7 +4111,7 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_bit_double(e.x_scale);
         self.writer.write_bit_double(e.y_scale);
         self.writer.write_bit_double(e.z_scale);
-        self.writer.write_byte(e.flags.bits());
+        self.writer.write_byte(e.display_flags().bits());
         self.writer.write_byte(e.contrast);
         self.writer.write_byte(e.fade);
 
@@ -4230,11 +4366,18 @@ impl<'a> DwgObjectWriter<'a> {
         // 91 Leader LineColor (CMC)
         self.writer.write_cm_color(&e.line_color);
 
-        // 341 LeaderLineTypeID (handle) - HardPointer
+        // 341 LeaderLineTypeID (handle) - HardPointer. Without one, ByBlock:
+        // ACAD's default for a multileader's leader lines.
         let lt = e
             .line_type_handle
             .filter(|handle| !handle.is_null())
-            .unwrap_or(self.document.header.bylayer_linetype_handle);
+            .unwrap_or_else(|| {
+                self.document
+                    .line_types
+                    .get("ByBlock")
+                    .map(|lt| lt.handle)
+                    .unwrap_or(self.document.header.byblock_linetype_handle)
+            });
         self.writer
             .write_handle(DwgReferenceType::HardPointer, lt.value());
 
@@ -4346,7 +4489,7 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_bit_double(e.scale_factor);
 
         // R2010+: attachment directions — order is dir(271), bottom(272),
-        // top(273) per AutoCAD, NOT the dir/top/bottom of the
+        // top(273) per ACAD, NOT the dir/top/bottom of the
         // public libredwg spec.
         if self.version.r2010_plus() {
             // 271 Text attachment direction (BS)
@@ -4644,8 +4787,7 @@ impl<'a> DwgObjectWriter<'a> {
         fallback.style = style.to_string();
         let mtext = embedded.unwrap_or(&fallback);
 
-        // AcDbMTextObjectEmbedded has a reduced common-entity header whose
-        // order differs from a standalone MTEXT entity.
+        // AcDbMTextObjectEmbedded starts at the common entity's Entmode.
         // Embedded MTEXT is a payload, not a model/paper-space entity.  Mode
         // zero still requires its (nullable) owner slot in the handle stream.
         self.writer.write_2bits(0);
@@ -4655,12 +4797,12 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_bit(true);
         self.writer.write_bit(false);
         self.writer
-            .write_bit_short(mtext.common.color.index().unwrap_or(256) as i16);
+            .write_en_color(&mtext.common.color, &mtext.common.transparency);
         self.writer.write_bit_double(mtext.common.linetype_scale);
         self.writer.write_2bits(0);
         self.writer.write_2bits(0);
-        self.writer.write_2bits(0);
         self.writer.write_byte(mtext.common.shadow_flags);
+        self.writer.write_2bits(0);
         self.writer.write_bit(false);
         self.writer.write_bit(false);
         self.writer.write_bit(false);
@@ -4771,6 +4913,16 @@ impl<'a> DwgObjectWriter<'a> {
             e.vertical_alignment as i16,
         );
 
+        // Common TEXT style precedes embedded MTEXT handles (ODA 20.4.4).
+        let style_handle = self
+            .document
+            .text_styles
+            .get(&e.text_style)
+            .map(|s| s.handle)
+            .unwrap_or(Handle::NULL);
+        self.writer
+            .write_handle(DwgReferenceType::HardPointer, style_handle.value());
+
         // writeCommonAttData: R2010+ version byte
         if self.version.r2010_plus() {
             self.writer.write_byte(0); // version
@@ -4819,17 +4971,6 @@ impl<'a> DwgObjectWriter<'a> {
         // Prompt
         self.writer.write_variable_text(&e.prompt);
 
-        // The outer TEXT style is the final ATTDEF handle.  For multiline
-        // attributes the embedded MTEXT layer/style handles precede it.
-        let style_handle = self
-            .document
-            .text_styles
-            .get(&e.text_style)
-            .map(|s| s.handle)
-            .unwrap_or(Handle::NULL);
-        self.writer
-            .write_handle(DwgReferenceType::HardPointer, style_handle.value());
-
         self.register_object(e.common.handle);
     }
 
@@ -4853,6 +4994,16 @@ impl<'a> DwgObjectWriter<'a> {
             e.horizontal_alignment as i16,
             e.vertical_alignment as i16,
         );
+
+        // Common TEXT style precedes embedded MTEXT handles (ODA 20.4.4).
+        let style_handle = self
+            .document
+            .text_styles
+            .get(&e.text_style)
+            .map(|s| s.handle)
+            .unwrap_or(Handle::NULL);
+        self.writer
+            .write_handle(DwgReferenceType::HardPointer, style_handle.value());
 
         // writeCommonAttData: R2010+ version byte
         if self.version.r2010_plus() {
@@ -4891,15 +5042,6 @@ impl<'a> DwgObjectWriter<'a> {
         if self.version.r2007_plus() {
             self.writer.write_bit(e.lock_position);
         }
-        // The outer TEXT style follows the embedded MTEXT handles.
-        let style_handle = self
-            .document
-            .text_styles
-            .get(&e.text_style)
-            .map(|s| s.handle)
-            .unwrap_or(Handle::NULL);
-        self.writer
-            .write_handle(DwgReferenceType::HardPointer, style_handle.value());
 
         self.register_object(e.common.handle);
     }
@@ -5053,7 +5195,7 @@ impl<'a> DwgObjectWriter<'a> {
         let tail_written = if acds {
             // AC1027+: ACIS data is stored in the AcDsPrototype_1b section.
             // Entity stream writes acis_empty=true with no inline data.
-            self.write_acis_empty(e.point_of_reference, &e.acis_data, &e.wires, &e.silhouettes);
+            self.write_acis_empty(&e.acis_data);
             self.queue_sab_entry(&e.acis_data, e.common.handle);
             false
         } else {
@@ -5062,16 +5204,8 @@ impl<'a> DwgObjectWriter<'a> {
 
         // SAB binary path already wrote trailing fields; skip for SAT/empty.
         if !tail_written {
-            // AcDs-backed R2013+ bodies have no trailing acis-empty bit when
-            // the wireframe flag is false. The next field is the R2007
-            // unknown BL.
-            self.writer.write_bit_long(0);
-
-            // R2013+: modeler-geometry revision block (COMMON_3DSOLID).
-            // Empty / SAT bodies carry no materials block (materials only
-            // follow binary SAB, handled on the early-return path). Omitting
-            // this block corrupts the entity stream for R2013+ and prevents
-            // the file from opening in AutoCAD/TrueView/BricsCAD.
+            // AcDs relocates the geometry, but material bindings remain inline.
+            self.write_acis_materials(&e.acis_data, false);
             if self.version.r2013_plus(self.dxf_version) {
                 self.write_acis_revision(&e.acis_data.revision);
             }
@@ -5092,7 +5226,7 @@ impl<'a> DwgObjectWriter<'a> {
 
         let acds = self.needs_acds_section();
         let tail_written = if acds {
-            self.write_acis_empty(e.point_of_reference, &e.acis_data, &e.wires, &e.silhouettes);
+            self.write_acis_empty(&e.acis_data);
             self.queue_sab_entry(&e.acis_data, e.common.handle);
             false
         } else {
@@ -5101,13 +5235,7 @@ impl<'a> DwgObjectWriter<'a> {
 
         // SAB binary path already wrote trailing fields; skip for SAT/empty.
         if !tail_written {
-            self.writer.write_bit_long(0);
-
-            // R2013+: modeler-geometry revision block (COMMON_3DSOLID).
-            // Empty / SAT bodies carry no materials block (materials only
-            // follow binary SAB, handled on the early-return path). Omitting
-            // this block corrupts the entity stream for R2013+ and prevents
-            // the file from opening in AutoCAD/TrueView/BricsCAD.
+            self.write_acis_materials(&e.acis_data, false);
             if self.version.r2013_plus(self.dxf_version) {
                 self.write_acis_revision(&e.acis_data.revision);
             }
@@ -5128,7 +5256,7 @@ impl<'a> DwgObjectWriter<'a> {
 
         let acds = self.needs_acds_section();
         let tail_written = if acds {
-            self.write_acis_empty(e.point_of_reference, &e.acis_data, &e.wires, &e.silhouettes);
+            self.write_acis_empty(&e.acis_data);
             self.queue_sab_entry(&e.acis_data, e.common.handle);
             false
         } else {
@@ -5137,13 +5265,7 @@ impl<'a> DwgObjectWriter<'a> {
 
         // SAB binary path already wrote trailing fields; skip for SAT/empty.
         if !tail_written {
-            self.writer.write_bit_long(0);
-
-            // R2013+: modeler-geometry revision block (COMMON_3DSOLID).
-            // Empty / SAT bodies carry no materials block (materials only
-            // follow binary SAB, handled on the early-return path). Omitting
-            // this block corrupts the entity stream for R2013+ and prevents
-            // the file from opening in AutoCAD/TrueView/BricsCAD.
+            self.write_acis_materials(&e.acis_data, false);
             if self.version.r2013_plus(self.dxf_version) {
                 self.write_acis_revision(&e.acis_data.revision);
             }
@@ -5158,16 +5280,34 @@ impl<'a> DwgObjectWriter<'a> {
     }
 
     fn write_surface_matrix(&mut self, value: &[f64; 16]) {
-        for item in value {
-            self.writer.write_bit_double(*item);
+        for item in crate::entities::surface::transpose_matrix(*value) {
+            self.writer.write_bit_double(item);
         }
     }
 
-    fn write_surface_embedded_entity(
+    pub(super) fn write_surface_embedded_entity(
         &mut self,
         entity: &crate::entities::EmbeddedEntity,
         byte_aligned: bool,
     ) {
+        if let crate::entities::EmbeddedEntity::Body {
+            type_code,
+            acis_data,
+        } = entity
+        {
+            // Type, a presence bit (set when there is no body), then the
+            // modeler block. The reference application writes the binary form.
+            self.writer.write_bit_long(*type_code);
+            self.writer.write_bit(!acis_data.has_data());
+            if acis_data.has_data() {
+                let binary = (!acis_data.is_binary)
+                    .then(|| acis_data.parse_sat())
+                    .flatten()
+                    .map(|doc| AcisData::from_sab(self.sab_from_sat(&doc)));
+                self.write_modeler_block(binary.as_ref().unwrap_or(acis_data));
+            }
+            return;
+        }
         let encoded = crate::io::dwg::embedded_entity::encode_embedded_entity(
             entity,
             self.version,
@@ -5200,9 +5340,9 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_bit(value.align_start);
         self.writer.write_bit(value.bank);
         self.writer.write_bit(value.base_point_set);
+        self.writer.write_3bit_double(value.reference_vector);
         self.writer.write_bit(value.sweep_entity_transform_computed);
         self.writer.write_bit(value.path_entity_transform_computed);
-        self.writer.write_3bit_double(value.reference_vector);
         self.write_surface_matrix(&value.sweep_entity_transform);
         self.write_surface_matrix(&value.path_entity_transform);
     }
@@ -5214,14 +5354,14 @@ impl<'a> DwgObjectWriter<'a> {
 
         let acds = self.needs_acds_section();
         let tail_written = if acds {
-            self.write_acis_empty(e.point_of_reference, &e.acis_data, &e.wires, &e.silhouettes);
+            self.write_acis_empty(&e.acis_data);
             self.queue_sab_entry(&e.acis_data, e.common.handle);
             false
         } else {
             self.write_acis_data(e.point_of_reference, &e.acis_data, &e.wires, &e.silhouettes)
         };
         if !tail_written {
-            self.writer.write_bit_long(0);
+            self.write_acis_materials(&e.acis_data, false);
             if self.version.r2013_plus(self.dxf_version) {
                 self.write_acis_revision(&e.acis_data.revision);
             }
@@ -5241,19 +5381,7 @@ impl<'a> DwgObjectWriter<'a> {
                 self.writer.write_3bit_double(*sweep_vector);
                 self.write_surface_matrix(sweep_transform);
                 if let Some(entity) = sweep_entity {
-                    let encoded = crate::io::dwg::embedded_entity::encode_embedded_entity(
-                        entity,
-                        self.version,
-                        self.dxf_version,
-                    );
-                    let bit_length = encoded.bytes.len() * 8;
-                    self.writer.write_bit_long(encoded.type_code);
-                    self.writer.write_bit_long(bit_length as i32);
-                    crate::io::dwg::embedded_entity::write_embedded_bits_with_length(
-                        &mut self.writer,
-                        &encoded,
-                        bit_length,
-                    );
+                    self.write_surface_embedded_entity(entity, true);
                 } else {
                     self.writer.write_bit_long(0);
                     self.writer.write_bit_long(0);
@@ -5352,37 +5480,13 @@ impl<'a> DwgObjectWriter<'a> {
                 self.write_surface_matrix(sweep_transform);
                 self.write_surface_matrix(path_transform);
                 if let Some(entity) = sweep_entity {
-                    let encoded = crate::io::dwg::embedded_entity::encode_embedded_entity(
-                        entity,
-                        self.version,
-                        self.dxf_version,
-                    );
-                    let bit_length = encoded.bytes.len() * 8;
-                    self.writer.write_bit_long(encoded.type_code);
-                    self.writer.write_bit_long(bit_length as i32);
-                    crate::io::dwg::embedded_entity::write_embedded_bits_with_length(
-                        &mut self.writer,
-                        &encoded,
-                        bit_length,
-                    );
+                    self.write_surface_embedded_entity(entity, true);
                 } else {
                     self.writer.write_bit_long(0);
                     self.writer.write_bit_long(0);
                 }
                 if let Some(entity) = path_entity {
-                    let encoded = crate::io::dwg::embedded_entity::encode_embedded_entity(
-                        entity,
-                        self.version,
-                        self.dxf_version,
-                    );
-                    let bit_length = encoded.bytes.len() * 8;
-                    self.writer.write_bit_long(encoded.type_code);
-                    self.writer.write_bit_long(bit_length as i32);
-                    crate::io::dwg::embedded_entity::write_embedded_bits_with_length(
-                        &mut self.writer,
-                        &encoded,
-                        bit_length,
-                    );
+                    self.write_surface_embedded_entity(entity, true);
                 } else {
                     self.writer.write_bit_long(0);
                     self.writer.write_bit_long(0);
@@ -5413,28 +5517,32 @@ impl<'a> DwgObjectWriter<'a> {
     ///
     /// For R2013 and later, ACIS data lives in the AcDsPrototype_1b section.
     /// The entity stream indicates that modeler geometry is not inline, but its
-    /// native COMMON_3DSOLID wireframe cache still remains in the entity.
-    fn write_acis_empty(
-        &mut self,
-        point: Vector3,
-        acis: &AcisData,
-        wires: &[Wire],
-        silhouettes: &[Silhouette],
-    ) {
+    fn write_acis_empty(&mut self, acis: &AcisData) {
         // R2013+ AcDs-backed records no longer carry the legacy leading
         // `acis_empty` bit.  Their first modeler-geometry bit is the
         // wireframe-presence flag.
         //
-        // A derived reference point alone is not a display cache. Only emit
-        // this section when the caller supplies actual wire/silhouette data.
-        if wires.is_empty() && silhouettes.is_empty() {
-            self.writer.write_bit(false);
-        } else if self.write_acis_wireframe(point, acis, wires, silhouettes) {
-            // COMMON_3DSOLID has an extra-modeler-data gate only when the
-            // AcDs-backed entity contains a wireframe section.
-            self.writer.write_bit(acis.extra_acis_data.is_none());
-            self.write_extra_acis_data(acis);
+        // Only the cache header is kept: no reference point, wires or
+        // silhouettes. An application-built point or wire list here makes
+        // the reference application's console engine reject the whole
+        // drawing, and the display cache is rebuilt from the body anyway.
+        self.writer.write_bit(acis.wireframe_data_present);
+        if !acis.wireframe_data_present {
+            return;
         }
+        self.writer.write_bit(false); // point_present
+        self.writer.write_bit_long(acis.wireframe_isolines);
+        self.writer.write_bit(acis.wireframe_isoline_present);
+        if acis.wireframe_isoline_present {
+            self.writer.write_bit_long(0); // wires
+        }
+        // The silhouette count is present in every wireframe block,
+        // independently of the isoline cache.
+        self.writer.write_bit_long(0);
+        // COMMON_3DSOLID has an extra-modeler-data gate only when the
+        // AcDs-backed entity contains a wireframe section.
+        self.writer.write_bit(acis.extra_acis_data.is_none());
+        self.write_extra_acis_data(acis);
     }
 
     /// Write the R2013+ modeler-geometry revision block (`COMMON_3DSOLID`).
@@ -5466,9 +5574,12 @@ impl<'a> DwgObjectWriter<'a> {
     }
 
     fn write_extra_acis_data(&mut self, acis: &AcisData) {
-        let Some(extra) = &acis.extra_acis_data else {
-            return;
-        };
+        if let Some(extra) = &acis.extra_acis_data {
+            self.write_modeler_block(extra);
+        }
+    }
+
+    fn write_modeler_block(&mut self, extra: &AcisData) {
         self.writer.write_bit(false);
         if extra.is_binary && !extra.sab_data.is_empty() {
             self.writer.write_bit_short(2);
@@ -5508,6 +5619,26 @@ impl<'a> DwgObjectWriter<'a> {
         self.queue_sab_entry(acis, entity.common().handle);
     }
 
+    fn sab_from_sat(&self, sat: &crate::entities::acis::SatDocument) -> Vec<u8> {
+        let julian = self.document.header.update_date_julian;
+        if !sat.header.date.is_empty() || julian <= 0.0 {
+            return crate::entities::acis::SabWriter::write(sat);
+        }
+        // Drawing dates count the fraction from midnight, not noon.
+        let (year, month, day, hour, minute, second) = crate::fields::julian_parts(julian - 0.5);
+        const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let weekday = DAYS[crate::fields::weekday(julian - 0.5) as usize % 7];
+        let mut dated = sat.clone();
+        dated.header.date = format!(
+            "{weekday} {} {day:>2} {hour:02}:{minute:02}:{second:02} {year}",
+            MONTHS[(month as usize).clamp(1, 12) - 1]
+        );
+        crate::entities::acis::SabWriter::write(&dated)
+    }
+
     /// Queue SAB data for writing into the AcDsPrototype_1b section.
     ///
     /// Converts SAT text → SAB binary if needed (mirroring the DXF writer's
@@ -5516,12 +5647,12 @@ impl<'a> DwgObjectWriter<'a> {
         if acis.is_binary && !acis.sab_data.is_empty() {
             // Already have SAB binary data
             self.sab_entries
-                .push((entity_handle, acis.sab_data.clone()));
+                .push((entity_handle, acis.sab_for_save().into_owned()));
         } else if !acis.sat_data.is_empty() {
             // Convert SAT text → SAB binary via SatDocument
             if let Ok(mut sat_doc) = crate::entities::acis::SatDocument::parse(&acis.sat_data) {
                 sat_doc.strip_for_sab();
-                let sab = crate::entities::acis::SabWriter::write(&sat_doc);
+                let sab = self.sab_from_sat(&sat_doc);
                 self.sab_entries.push((entity_handle, sab));
             }
         }
@@ -5541,6 +5672,30 @@ impl<'a> DwgObjectWriter<'a> {
         self.write_acis_data_impl(point, acis, wires, silhouettes, false)
     }
 
+    pub(super) fn write_history_acis_data(&mut self, acis: &AcisData) {
+        if !self.version.r2007_plus() {
+            self.write_acis_data(Vector3::ZERO, acis, &[], &[]);
+            return;
+        }
+        let converted;
+        let acis = if acis.is_binary && !acis.sab_data.is_empty() {
+            acis
+        } else if let Ok(sat) = crate::entities::acis::SatDocument::parse(&acis.sat_data) {
+            let mut binary = acis.clone();
+            binary.is_binary = true;
+            binary.sab_data = self.sab_from_sat(&sat);
+            converted = binary;
+            &converted
+        } else {
+            self.writer.write_bit(true); // acis_empty
+            return;
+        };
+        self.writer.write_bit(false); // acis_empty
+        self.writer.write_bit(false); // binary payload
+        self.writer.write_bit_short(2_i16);
+        self.writer.write_bytes(&acis.sab_for_save());
+    }
+
     fn write_acis_data_impl(
         &mut self,
         point: Vector3,
@@ -5553,7 +5708,7 @@ impl<'a> DwgObjectWriter<'a> {
             if let Ok(sat) = crate::entities::acis::SatDocument::parse(&acis.sat_data) {
                 let mut binary = acis.clone();
                 binary.is_binary = true;
-                binary.sab_data = crate::entities::acis::SabWriter::write(&sat);
+                binary.sab_data = self.sab_from_sat(&sat);
                 return self.write_acis_data_impl(point, &binary, wires, silhouettes, inline);
             }
         }
@@ -5568,7 +5723,7 @@ impl<'a> DwgObjectWriter<'a> {
             if acis.is_binary && !acis.sab_data.is_empty() {
                 // SAB binary (version 2) — write raw bytes directly.
                 self.writer.write_bit_short(2_i16);
-                self.writer.write_bytes(&acis.sab_data);
+                self.writer.write_bytes(&acis.sab_for_save());
                 if self.version.r2007_plus() {
                     let wireframe_present =
                         self.write_acis_wireframe(point, acis, wires, silhouettes);
@@ -5671,7 +5826,11 @@ impl<'a> DwgObjectWriter<'a> {
         // Some valid AcDs-backed solids intentionally carry geometry only
         // (no point, isolines, wires or silhouettes). Synthesizing a cache for
         // those changes COMMON_3DSOLID and ODA rejects the object.
+        // Before R2013 the modeler data is inline and a non-empty body must
+        // announce the cache block, even when it holds nothing: a record
+        // without it is rejected (a DXF-sourced solid never has one).
         let wireframe_present = acis.wireframe_data_present
+            || (acis.has_data() && !self.version.r2013_plus(self.dxf_version))
             || point != Vector3::ZERO
             || acis.wireframe_isolines != 0
             || !wires.is_empty()
@@ -5680,7 +5839,7 @@ impl<'a> DwgObjectWriter<'a> {
 
         if wireframe_present {
             // Wireframe anchor: the entity's stored reference point (bbox
-            // centre in AutoCAD-authored files), falling back to the first
+            // centre in ACAD-authored files), falling back to the first
             // wire vertex.
             let anchor = if acis.wireframe_point_present || point != Vector3::ZERO {
                 point
@@ -5706,9 +5865,14 @@ impl<'a> DwgObjectWriter<'a> {
                 }
             }
 
+            // Silhouettes are independent of the isoline cache.
             self.writer.write_bit_long(silhouettes.len() as i32);
             for sil in silhouettes {
-                self.writer.write_bit_long_long(sil.viewport_id);
+                if self.version.r2010_plus() {
+                    self.writer.write_bit_long_long(sil.viewport_id);
+                } else {
+                    self.writer.write_bit_long(sil.viewport_id as i32);
+                }
                 self.writer.write_3bit_double(sil.target);
                 self.writer.write_3bit_double(sil.view_direction);
                 self.writer.write_3bit_double(sil.up_vector);
@@ -5729,7 +5893,7 @@ impl<'a> DwgObjectWriter<'a> {
 
     /// Write a single wire struct (shared by wires and silhouette wires).
     /// Field order/types per LibreDWG `Dwg_3DSOLID_wire` (mirrors the reader):
-    /// RC type, BLd selection_marker, BS/BL color, BLd acis_index, BL num_points.
+    /// RC type, BLd selection_marker, BS color, BLd acis_index, BL num_points.
     fn write_wire(&mut self, wire: &Wire) {
         self.writer.write_byte(wire.wire_type as u8);
         self.writer.write_bit_long(wire.selection_marker);
@@ -5739,11 +5903,7 @@ impl<'a> DwgObjectWriter<'a> {
             crate::types::Color::Index(idx) => idx as i16,
             _ => 256,
         };
-        if self.version.r2004_plus() {
-            self.writer.write_bit_long(color_val as i32);
-        } else {
-            self.writer.write_bit_short(color_val);
-        }
+        self.writer.write_bit_short(color_val);
         self.writer.write_bit_long(wire.acis_index);
         self.writer.write_bit_long(wire.points.len() as i32);
         for pt in &wire.points {
@@ -5768,7 +5928,7 @@ mod tests {
     use super::*;
     use crate::document::CadDocument;
     use crate::entities::{EntityCommon, Line, Point};
-    use crate::types::{Handle, Vector3};
+    use crate::types::{DxfVersion, Handle, Vector3};
 
     fn make_doc_with_entity(entity: EntityType) -> CadDocument {
         let mut doc = CadDocument::new();
@@ -5780,6 +5940,63 @@ mod tests {
             br.entity_handles.push(handle);
         }
         doc
+    }
+
+    #[test]
+    fn wire_color_uses_bit_short_in_every_dwg_version() {
+        use crate::io::dwg::dwg_stream_readers::bit_reader::DwgBitReader;
+
+        for dxf_version in [
+            DxfVersion::AC1012,
+            DxfVersion::AC1014,
+            DxfVersion::AC1015,
+            DxfVersion::AC1018,
+            DxfVersion::AC1021,
+            DxfVersion::AC1024,
+            DxfVersion::AC1027,
+            DxfVersion::AC1032,
+        ] {
+            let document = CadDocument::with_version(dxf_version);
+            for color in [
+                Color::ByBlock,
+                Color::Index(1),
+                Color::Index(255),
+                Color::ByLayer,
+            ] {
+                let mut writer = DwgObjectWriter::new(&document).unwrap();
+                let wire = Wire {
+                    color,
+                    selection_marker: -1,
+                    acis_index: 0x80FA,
+                    points: vec![Vector3::ZERO, Vector3::UNIT_X],
+                    ..Wire::default()
+                };
+                writer.write_wire(&wire);
+                let mut reader = DwgBitReader::new(
+                    writer.writer.main().to_bytes_snapshot(),
+                    writer.version,
+                    dxf_version,
+                );
+                assert_eq!(reader.read_byte(), wire.wire_type as u8);
+                assert_eq!(reader.read_bit_long(), -1);
+                assert_eq!(
+                    reader.read_bit_short(),
+                    match color {
+                        Color::ByBlock => 0,
+                        Color::ByLayer => 256,
+                        Color::Index(index) => i16::from(index),
+                        _ => unreachable!(),
+                    },
+                    "{dxf_version:?} {color:?}"
+                );
+                assert_eq!(reader.read_bit_long(), wire.acis_index);
+                assert_eq!(reader.read_bit_long(), 2);
+                assert_eq!(reader.read_3bit_double(), Vector3::ZERO);
+                assert_eq!(reader.read_3bit_double(), Vector3::UNIT_X);
+                assert!(!reader.read_bit());
+                reader.check_error().unwrap();
+            }
+        }
     }
 
     #[test]
@@ -5828,7 +6045,7 @@ mod tests {
     use crate::entities::table::{CellContent, CellStyle, TableCell};
     use crate::io::dwg::DwgVersion;
     use crate::io::dwg::dwg_stream_writers::bit_writer::DwgBitWriter;
-    use crate::types::{Color, DxfVersion};
+    use crate::types::Color;
 
     fn cell_main_stream(version: DxfVersion, cell: &TableCell) -> Vec<u8> {
         let doc = CadDocument::with_version(version);

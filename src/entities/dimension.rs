@@ -92,8 +92,9 @@ pub struct DimensionBase {
     pub flip_arrow1: bool,
     /// Flip the second dimension arrow.
     pub flip_arrow2: bool,
-    /// Complete DWG dimension flag byte. Bit zero mirrors
-    /// [`text_user_positioned`](Self::text_user_positioned).
+    /// Complete DWG dimension flag byte. Bit zero is the inverse of
+    /// [`text_user_positioned`](Self::text_user_positioned): set when the
+    /// text sits at its default place.
     pub dwg_flags_byte: u8,
     /// Dimension text was positioned at a user-defined location rather than at
     /// the style's default (DXF group 70, bit 0x80). When false the text
@@ -128,7 +129,8 @@ impl DimensionBase {
             dwg_unknown_bit: false,
             flip_arrow1: false,
             flip_arrow2: false,
-            dwg_flags_byte: 0,
+            // Bit 0 set: the text sits at its default place.
+            dwg_flags_byte: 0x01,
             text_user_positioned: false,
         }
     }
@@ -300,7 +302,8 @@ impl DimensionLinear {
 
     /// Get the measurement value (projected onto rotation axis)
     pub fn measurement(&self) -> f64 {
-        let diff = self.second_point - self.first_point;
+        let wcs_to_ocs = Matrix3::arbitrary_axis(self.base.normal).transpose();
+        let diff = wcs_to_ocs * (self.second_point - self.first_point);
         let projected = diff.x * self.rotation.cos() + diff.y * self.rotation.sin();
         if projected.is_finite() {
             projected.abs()
@@ -451,11 +454,11 @@ impl DimensionAngular2Ln {
     pub fn new(vertex: Vector3, first_point: Vector3, second_point: Vector3) -> Self {
         let mut base = DimensionBase::new(DimensionType::Angular);
 
-        // Calculate angle between the two lines
+        // Calculate angle between the two lines; files store it in radians.
         let v1 = (first_point - vertex).normalize();
         let v2 = (second_point - vertex).normalize();
         let angle = v1.dot(&v2).acos();
-        base.actual_measurement = angle.to_degrees();
+        base.actual_measurement = angle;
 
         Self {
             base,
@@ -533,11 +536,11 @@ impl DimensionAngular3Pt {
     pub fn new(vertex: Vector3, first_point: Vector3, second_point: Vector3) -> Self {
         let mut base = DimensionBase::new(DimensionType::Angular3Point);
 
-        // Calculate angle
+        // Calculate angle; files store it in radians.
         let v1 = (first_point - vertex).normalize();
         let v2 = (second_point - vertex).normalize();
         let angle = v1.dot(&v2).acos();
-        base.actual_measurement = angle.to_degrees();
+        base.actual_measurement = angle;
 
         Self {
             base,
@@ -981,55 +984,26 @@ impl Dimension {
             Dimension::LargeRadial(d) => d.measurement(),
         }
     }
+
+    /// The measurement a file stores (DXF group 42, the DWG actual
+    /// measurement): an angular dimension's angle in radians, any other
+    /// dimension's [`measurement`](Self::measurement).
+    pub fn stored_measurement(&self) -> f64 {
+        match self {
+            Dimension::Angular2Ln(d) => d.measurement_radians(),
+            Dimension::Angular3Pt(d) => d.measurement_radians(),
+            _ => self.measurement(),
+        }
+    }
 }
 
 impl super::Entity for Dimension {
-    fn handle(&self) -> crate::types::Handle {
-        self.base().common.handle
+    fn common(&self) -> &super::EntityCommon {
+        &self.base().common
     }
 
-    fn set_handle(&mut self, handle: crate::types::Handle) {
-        self.base_mut().common.handle = handle;
-    }
-
-    fn layer(&self) -> &str {
-        &self.base().common.layer
-    }
-
-    fn set_layer(&mut self, layer: String) {
-        self.base_mut().common.layer = layer;
-    }
-
-    fn color(&self) -> crate::types::Color {
-        self.base().common.color
-    }
-
-    fn set_color(&mut self, color: crate::types::Color) {
-        self.base_mut().common.color = color;
-    }
-
-    fn line_weight(&self) -> crate::types::LineWeight {
-        self.base().common.line_weight
-    }
-
-    fn set_line_weight(&mut self, weight: crate::types::LineWeight) {
-        self.base_mut().common.line_weight = weight;
-    }
-
-    fn transparency(&self) -> crate::types::Transparency {
-        self.base().common.transparency
-    }
-
-    fn set_transparency(&mut self, transparency: crate::types::Transparency) {
-        self.base_mut().common.transparency = transparency;
-    }
-
-    fn is_invisible(&self) -> bool {
-        self.base().common.invisible
-    }
-
-    fn set_invisible(&mut self, invisible: bool) {
-        self.base_mut().common.invisible = invisible;
+    fn common_mut(&mut self) -> &mut super::EntityCommon {
+        &mut self.base_mut().common
     }
 
     fn bounding_box(&self) -> crate::types::BoundingBox3D {
@@ -1094,44 +1068,7 @@ impl super::Entity for Dimension {
     }
 
     fn apply_transform(&mut self, transform: &Transform) {
-        let Dimension::Ordinate(d) = self else {
-            let translated = transform.apply(Vector3::ZERO);
-            self.translate(translated);
-            return;
-        };
-
-        let old_normal = d.base.normal;
-        let old_basis = Matrix3::arbitrary_axis(old_normal);
-        let old_axis_angle = -d.base.horizontal_direction;
-        let old_axis = old_basis * Vector3::new(old_axis_angle.cos(), old_axis_angle.sin(), 0.0);
-        let old_text_angle = old_axis_angle + d.base.text_rotation;
-        let old_text_axis =
-            old_basis * Vector3::new(old_text_angle.cos(), old_text_angle.sin(), 0.0);
-
-        d.definition_point = transform.apply(d.definition_point);
-        d.feature_location = transform.apply(d.feature_location);
-        d.leader_endpoint = transform.apply(d.leader_endpoint);
-        d.base.definition_point = d.definition_point;
-        d.base.text_middle_point = transform.apply(d.base.text_middle_point);
-        d.base.insertion_point = transform.apply(d.base.insertion_point);
-
-        let transformed_normal = transform.apply_rotation(old_normal);
-        if transformed_normal.length() > 1e-12 {
-            d.base.normal = transformed_normal.normalize();
-        }
-        let new_wcs_to_ocs = Matrix3::arbitrary_axis(d.base.normal).transpose();
-        let transformed_axis = new_wcs_to_ocs * transform.apply_rotation(old_axis);
-        let mut new_axis_angle = old_axis_angle;
-        if transformed_axis.length() > 1e-12 {
-            new_axis_angle = transformed_axis.y.atan2(transformed_axis.x);
-            d.base.horizontal_direction = -new_axis_angle;
-        }
-        let transformed_text_axis = new_wcs_to_ocs * transform.apply_rotation(old_text_axis);
-        if transformed_text_axis.length() > 1e-12 {
-            let relative = transformed_text_axis.y.atan2(transformed_text_axis.x) - new_axis_angle;
-            d.base.text_rotation = relative.sin().atan2(relative.cos());
-        }
-        d.refresh_measurement();
+        super::transform::transform_dimension(self, transform);
     }
 
     fn entity_type(&self) -> &'static str {

@@ -26,7 +26,7 @@ fn doc_with(start: f64, end: f64, counter_clockwise: bool) -> CadDocument {
         counter_clockwise,
     }));
     hatch.add_path(path);
-    doc.add_entity(EntityType::Hatch(hatch)).unwrap();
+    doc.add_entity(EntityType::Hatch(Box::new(hatch))).unwrap();
     doc
 }
 

@@ -1,10 +1,15 @@
 //! DXF class definitions (CLASSES section)
 //!
+//! [`arch`] is the ACAD Arch (AEC) class catalog and the geometry
+//! model used to read, write, build, and modify those entities and objects.
+
 //! Classes define custom object types registered in the DXF drawing.
 //! Each class maps a DXF entity/object name to its C++ class name and
 //! application that registered it.
 //!
 //! Corresponds to the classic `DxfClass` and `DxfClassCollection`.
+
+pub mod arch;
 
 use std::collections::HashMap;
 
@@ -154,7 +159,19 @@ impl DxfClassCollection {
             self.entries[idx].instance_count = class.instance_count;
         } else {
             if class.class_number < 500 {
-                class.class_number = 500 + self.entries.len() as i16;
+                // Its position names it, unless a source class already holds
+                // that number; two classes must never share one.
+                let positional = 500 + self.entries.len() as i16;
+                class.class_number = if self.entries.iter().any(|c| c.class_number == positional) {
+                    self.entries
+                        .iter()
+                        .map(|c| c.class_number)
+                        .max()
+                        .unwrap_or(499)
+                        + 1
+                } else {
+                    positional
+                };
             }
             let idx = self.entries.len();
             self.name_index.insert(key, idx);
@@ -165,7 +182,7 @@ impl DxfClassCollection {
     /// Append a class verbatim, preserving order and duplicate dxf names.
     ///
     /// The DWG classes section is *positional*: a custom object's type code is
-    /// `500 + index_in_section`, and readers (libredwg, AutoCAD) resolve the
+    /// `500 + index_in_section`, and readers (libredwg, ACAD) resolve the
     /// class by that index, not by the stored number. Two distinct classes may
     /// legitimately share a dxf name (different C++ classes), so deduping by
     /// name — as [`add_or_update`](Self::add_or_update) does — drops one entry,
@@ -183,6 +200,12 @@ impl DxfClassCollection {
     pub fn get_by_name(&self, dxf_name: &str) -> Option<&DxfClass> {
         let key = dxf_name.to_uppercase();
         self.name_index.get(&key).map(|&idx| &self.entries[idx])
+    }
+
+    /// The class registered under `dxf_name`, to change its flags.
+    pub fn get_mut_by_name(&mut self, dxf_name: &str) -> Option<&mut DxfClass> {
+        let index = *self.name_index.get(&dxf_name.to_uppercase())?;
+        self.entries.get_mut(index)
     }
 
     /// Check if a class with the given DXF name exists
@@ -268,7 +291,7 @@ impl DxfClassCollection {
         }
     }
 
-    /// Populate with default class definitions that AutoCAD expects.
+    /// Populate with default class definitions that ACAD expects.
     ///
     /// This mirrors the reference `DxfClassCollection.UpdateDxfClasses()`.
     pub fn update_defaults(&mut self) {
@@ -296,19 +319,19 @@ impl<'a> IntoIterator for &'a DxfClassCollection {
     }
 }
 
-/// Build the set of default DXF classes that AutoCAD registers.
+/// Build the set of default DXF classes that ACAD registers.
 ///
-/// DXF names, proxy flags, and application names match AutoCAD R2013 (AC1027)
+/// DXF names, proxy flags, and application names match ACAD R2013 (AC1027)
 /// reference output.
-fn default_classes() -> Vec<DxfClass> {
+pub(crate) fn default_classes() -> Vec<DxfClass> {
     // (dxf_name, cpp_class_name, proxy_flags, app_name, is_entity)
     let defs: &[(&str, &str, u16, &str, bool)] = &[
         // ── Entity classes ──────────────────────────────────────────
         ("MESH", "AcDbSubDMesh", 4095,
-            "AcDbSubDMesh|Description: AutoCAD subD mesh", true),
+            "AcDbSubDMesh|Description: ACAD subD mesh", true),
         ("ACAD_TABLE", "AcDbTable", 1025, "ObjectDBX Classes", true),
         ("WIPEOUT", "AcDbWipeout", 127,
-            "WipeOut|AutoCAD Express Tool|www.autodesk.com", true),
+            "WipeOut|ACAD Express Tool|www.autodesk.com", true),
         ("IMAGE", "AcDbRasterImage", 127, "ISM", true),
         ("PDFREFERENCE", "AcDbPdfReference", 1, "ObjectDBX Classes", true),
         ("DWFREFERENCE", "AcDbDwfReference", 1, "ObjectDBX Classes", true),
@@ -339,10 +362,10 @@ fn default_classes() -> Vec<DxfClass> {
             "ARCALIGNEDTEXT",
             "AcDbArcAlignedText",
             127,
-            "AutoCAD Express Tools",
+            "ACAD Express Tools",
             true,
         ),
-        ("RTEXT", "AcDbRText", 127, "AutoCAD Express Tools", true),
+        ("RTEXT", "AcDbRText", 127, "ACAD Express Tools", true),
         (
             "POSITIONMARKER",
             "AcDbGeoPositionMarker",
@@ -483,12 +506,12 @@ fn default_classes() -> Vec<DxfClass> {
 
         // ── Object classes ──────────────────────────────────────────
         ("ACDBASSOCDEPENDENCY", "AcDbAssocDependency", 0, "ObjectDBX Classes", false),
-        ("ACDBASSOCVALUEDEPENDENCY", "AcDbAssocValueDependency", 0, "ObjectDBX Classes", false),
-        ("ACDBASSOCGEOMDEPENDENCY", "AcDbAssocGeomDependency", 0, "ObjectDBX Classes", false),
+        ("ACDBASSOCVALUEDEPENDENCY", "AcDbAssocValueDependency", 1025, "ObjectDBX Classes", false),
+        ("ACDBASSOCGEOMDEPENDENCY", "AcDbAssocGeomDependency", 1025, "ObjectDBX Classes", false),
         ("ACDBASSOCACTION", "AcDbAssocAction", 0, "ObjectDBX Classes", false),
-        ("ACDBASSOCNETWORK", "AcDbAssocNetwork", 0, "ObjectDBX Classes", false),
-        ("ACDBASSOC2DCONSTRAINTGROUP", "AcDbAssoc2dConstraintGroup", 0, "ObjectDBX Classes", false),
-        ("ACDBASSOCVARIABLE", "AcDbAssocVariable", 0, "ObjectDBX Classes", false),
+        ("ACDBASSOCNETWORK", "AcDbAssocNetwork", 1025, "ObjectDBX Classes", false),
+        ("ACDBASSOC2DCONSTRAINTGROUP", "AcDbAssoc2dConstraintGroup", 1025, "ObjectDBX Classes", false),
+        ("ACDBASSOCVARIABLE", "AcDbAssocVariable", 1025, "ObjectDBX Classes", false),
         ("ACDBASSOCPERSSUBENTMANAGER", "AcDbAssocPersSubentManager", 0, "ObjectDBX Classes", false),
         // Abstract action-parameter bases have no persistent instances.
         // Registering them in a fresh file makes strict readers reject the
@@ -618,10 +641,10 @@ fn default_classes() -> Vec<DxfClass> {
         ("ACDBPOINTPATH", "AcDbPointPath", 0, "SCENEOE", false),
         ("TVDEVICEPROPERTIES", "AcDbTvDeviceProperties", 0, "SCENEOE", false),
         ("ACDBPOINTCLOUDDEF", "AcDbPointCloudDef", 0, "AcDbPointCloudObj", false),
-        ("ACDBPOINTCLOUDDEFEX", "AcDbPointCloudDefEx", 0, "AcDbPointCloudObj", false),
+        ("ACDBPOINTCLOUDDEF_EX", "AcDbPointCloudDefEx", 1024, "AcDbPointCloudObj", false),
         ("ACDBPOINTCLOUDDEF_REACTOR", "AcDbPointCloudDefReactor", 0, "AcDbPointCloudObj", false),
-        ("ACDBPOINTCLOUDDEF_REACTOR_EX", "AcDbPointCloudDefReactorEx", 0, "AcDbPointCloudObj", false),
-        ("ACDBPOINTCLOUDCOLORMAP", "AcDbPointCloudColorMap", 0, "AcDbPointCloudObj", false),
+        ("ACDBPOINTCLOUDDEF_REACTOR_EX", "AcDbPointCloudDefReactorEx", 1025, "AcDbPointCloudObj", false),
+        ("ACDBPOINTCLOUDCOLORMAP", "AcDbPointCloudColorMap", 1025, "AcDbPointCloudObj", false),
         ("NAVISWORKSMODELDEF", "AcDbNavisworksModelDef", 0, "ObjectDBX Classes", false),
         ("CONTEXTDATAMANAGER", "AcDbContextDataManager", 0, "ObjectDBX Classes", false),
         ("DATATABLE", "AcDbDataTable", 0, "ObjectDBX Classes", false),
@@ -693,7 +716,7 @@ fn default_classes() -> Vec<DxfClass> {
             false,
         ),
         ("WIPEOUTVARIABLES", "AcDbWipeoutVariables", 0,
-            "WipeOut|AutoCAD Express Tool|www.autodesk.com", false),
+            "WipeOut|ACAD Express Tool|www.autodesk.com", false),
         ("DIMASSOC", "AcDbDimAssoc", 0,
             "AcDbDimAssoc|Product Desc:     AcDim ARX App For Dimension|Company:          Autodesk|WEB Address:      www.autodesk.com", false),
         ("TABLECONTENT", "AcDbTableContent", 1025, "ObjectDBX Classes", false),
@@ -715,7 +738,7 @@ fn default_classes() -> Vec<DxfClass> {
 
     defs.iter()
         .map(|&(dxf, cpp, flags, app, is_entity)| {
-            if is_entity {
+            let mut class = if is_entity {
                 let mut c = DxfClass::new_entity(dxf, cpp);
                 c.proxy_flags = ProxyFlags(flags);
                 c.application_name = app.to_string();
@@ -725,7 +748,19 @@ fn default_classes() -> Vec<DxfClass> {
                 c.proxy_flags = ProxyFlags(flags);
                 c.application_name = app.to_string();
                 c
+            };
+            match dxf {
+                "ACDBASSOCNETWORK" | "ACDBASSOC2DCONSTRAINTGROUP" | "ACDBASSOCVARIABLE" => {
+                    class.dwg_version = 27;
+                    class.maintenance_version = 45;
+                }
+                "ACDBASSOCVALUEDEPENDENCY" | "ACDBASSOCGEOMDEPENDENCY" => {
+                    class.dwg_version = 27;
+                    class.maintenance_version = 29;
+                }
+                _ => {}
             }
+            class
         })
         .collect()
 }
@@ -781,6 +816,18 @@ mod tests {
         assert!(!coll.contains("ACDBASSOCPOINTREFACTIONPARAM"));
         assert!(coll.contains("ACDBASSOCCOMPOUNDACTIONPARAM"));
         assert!(coll.contains("ACDBASSOCOSNAPPOINTREFACTIONPARAM"));
+        for name in [
+            "ACDBASSOCVALUEDEPENDENCY",
+            "ACDBASSOCGEOMDEPENDENCY",
+            "ACDBASSOCNETWORK",
+            "ACDBASSOC2DCONSTRAINTGROUP",
+            "ACDBASSOCVARIABLE",
+        ] {
+            let class = coll.get_by_name(name).unwrap();
+            assert_eq!(class.proxy_flags, ProxyFlags(1025));
+            assert_eq!(class.dwg_version, 27);
+            assert!(class.maintenance_version > 0);
+        }
     }
 
     #[test]
