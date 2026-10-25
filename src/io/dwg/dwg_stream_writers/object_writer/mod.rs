@@ -2706,16 +2706,16 @@ mod tests {
     }
 }
 
-/// A class-based object whose class the output does not register has no type
-/// code of its own. It used to be written with the fallback 500, which is the
-/// first class of the output, so a reader decoded it as that class and lost
-/// its place in the stream (libviprs/acadsharp-rs-tests#112).
+/// Objects of a class the output does not register. A save to an older
+/// version leaves them out (they would be written under the fallback type
+/// code 500). A save back to the version the drawing was read from has no
+/// such problem to solve, so the object stays.
 #[cfg(test)]
 mod unregistered_class_tests {
     use super::*;
-    use crate::objects::{DataObject, DataObjectData};
+    use crate::objects::{AssociativeObject, DataObject, DataObjectData};
 
-    fn written_handles(version: DxfVersion, source: Option<DxfVersion>) -> Vec<u64> {
+    fn data_object_handles(version: DxfVersion, source: Option<DxfVersion>) -> Vec<u64> {
         let mut doc = CadDocument::with_version(version);
         doc.dwg_source_version = source;
         let handle = Handle::new(0x7000);
@@ -2728,29 +2728,41 @@ mod unregistered_class_tests {
         handles.into_iter().map(|(h, _)| h).collect()
     }
 
+    fn associative_handles(version: DxfVersion, source: Option<DxfVersion>) -> Vec<u64> {
+        let mut doc = CadDocument::with_version(version);
+        doc.dwg_source_version = source;
+        let handle = Handle::new(0x7100);
+        let mut object =
+            AssociativeObject::new("ACDBASSOCPERSSUBENTMANAGER", "AcDbAssocPersSubentManager");
+        object.handle = handle;
+        doc.objects.insert(handle, ObjectType::Associative(object));
+        doc.classes.clear();
+        let (_, handles, _, _) = DwgObjectWriter::new(&doc).unwrap().write();
+        handles.into_iter().map(|(h, _)| h).collect()
+    }
+
     #[test]
     fn an_object_with_no_registered_class_is_left_out_of_an_older_save() {
         for version in [DxfVersion::AC1014, DxfVersion::AC1015, DxfVersion::AC1018] {
             assert!(
-                !written_handles(version, None).contains(&0x7000),
+                !data_object_handles(version, None).contains(&0x7000),
                 "{version:?}: an object of an unregistered class was written (as type 500)"
             );
         }
     }
 
     #[test]
+    fn an_object_with_no_registered_class_is_left_out_when_the_source_is_another_version() {
+        assert!(
+            !data_object_handles(DxfVersion::AC1015, Some(DxfVersion::AC1018)).contains(&0x7000)
+        );
+    }
+
+    #[test]
     fn an_associative_object_with_no_registered_class_is_left_out_of_an_older_save() {
-        use crate::objects::AssociativeObject;
         for version in [DxfVersion::AC1014, DxfVersion::AC1015, DxfVersion::AC1018] {
-            let mut doc = CadDocument::with_version(version);
-            let handle = Handle::new(0x7100);
-            let mut object = AssociativeObject::new("ACDBASSOCPERSSUBENTMANAGER", "AcDbAssocPersSubentManager");
-            object.handle = handle;
-            doc.objects.insert(handle, ObjectType::Associative(object));
-            doc.classes.clear();
-            let (_, handles, _, _) = DwgObjectWriter::new(&doc).unwrap().write();
             assert!(
-                !handles.iter().any(|(h, _)| *h == 0x7100),
+                !associative_handles(version, None).contains(&0x7100),
                 "{version:?}: an associative object of an unregistered class was written as type 500"
             );
         }
@@ -2758,6 +2770,15 @@ mod unregistered_class_tests {
 
     #[test]
     fn a_same_version_save_keeps_it() {
-        assert!(written_handles(DxfVersion::AC1015, Some(DxfVersion::AC1015)).contains(&0x7000));
+        assert!(
+            data_object_handles(DxfVersion::AC1015, Some(DxfVersion::AC1015)).contains(&0x7000)
+        );
+    }
+
+    #[test]
+    fn a_same_version_save_keeps_an_associative_object() {
+        assert!(
+            associative_handles(DxfVersion::AC1018, Some(DxfVersion::AC1018)).contains(&0x7100)
+        );
     }
 }
