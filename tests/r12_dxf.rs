@@ -1,5 +1,11 @@
 //! Asking for AC1009 gives an R12 file (libviprs/acadsharp-rs-tests#111).
 //!
+//! Upstream's writer makes that an explicit request, `DxfWriter::with_version`,
+//! because a document that merely carries AC1009 keeps being written as R13 so
+//! nothing it holds is lost. These tests ask the way upstream wants them to.
+//! Upstream has no binary R12 form either, so that test asserts the error it
+//! returns instead of the one-byte-code layout the fork used to write.
+//!
 //! The ASCII and binary DXFs written for AC1009 and AC1012 used to be
 //! byte-identical and the reader found AC1012 in both. R12 has no handles, no
 //! `330` owners, no `100` subclass markers, no CLASSES or OBJECTS section, and
@@ -29,10 +35,10 @@ fn document(version: DxfVersion) -> CadDocument {
     ]);
     pl.close();
     doc.add_entity(EntityType::LwPolyline(pl)).unwrap();
-    doc.add_entity(EntityType::MText(MText::with_value(
+    doc.add_entity(EntityType::MText(Box::new(MText::with_value(
         "first\\Psecond",
         Vector3::new(9.0, 9.0, 0.0),
-    )))
+    ))))
     .unwrap();
     doc
 }
@@ -50,6 +56,7 @@ fn pairs(dxf: &str) -> Vec<(i32, String)> {
 fn ascii(version: DxfVersion) -> String {
     String::from_utf8(
         DxfWriter::new(&document(version))
+            .with_version(version)
             .write_to_vec()
             .unwrap(),
     )
@@ -88,7 +95,9 @@ fn r12_has_the_r12_sections_only_in_order() {
         .collect();
     assert_eq!(sections, ["HEADER", "TABLES", "BLOCKS", "ENTITIES"]);
     assert_eq!(p.last().unwrap(), &(0, "EOF".to_string()));
-    for table in ["BLOCK_RECORD", "DIMSTYLE"] {
+    // R12 does have a DIMSTYLE table (upstream writes one, as AutoCAD's own R12
+    // files carry); BLOCK_RECORD is the R13 table.
+    for table in ["BLOCK_RECORD"] {
         assert!(
             !p.contains(&(2, table.to_string())),
             "the {table} table is R13"
@@ -124,6 +133,7 @@ fn r12_writes_the_polyline_in_its_heavy_form_and_text_for_mtext() {
 #[test]
 fn r12_reads_back_as_r12_with_its_geometry() {
     let bytes = DxfWriter::new(&document(DxfVersion::AC1009))
+        .with_version(DxfVersion::AC1009)
         .write_to_vec()
         .unwrap();
     let doc = DxfReader::from_reader(Cursor::new(bytes))
@@ -142,74 +152,17 @@ fn r12_reads_back_as_r12_with_its_geometry() {
     assert_eq!((lines, circles), (1, 1));
 }
 
-/// A strict reader of the R12 binary form: one-byte codes (255 then two bytes
-/// from 255 up), the widths the format fixes, and nothing after EOF.
-fn binary_pairs(bytes: &[u8]) -> Vec<(i32, String)> {
-    let sentinel = b"AutoCAD Binary DXF\r\n\x1a\x00";
-    assert!(bytes.starts_with(sentinel));
-    let mut i = sentinel.len();
-    let mut out = Vec::new();
-    while i < bytes.len() {
-        let code = if bytes[i] == 255 {
-            let c = i16::from_le_bytes([bytes[i + 1], bytes[i + 2]]) as i32;
-            i += 3;
-            c
-        } else {
-            let c = bytes[i] as i32;
-            i += 1;
-            c
-        };
-        let value = match code {
-            0..=9 | 100..=102 | 105 | 300..=309 | 999 | 1000..=1003 | 1005 => {
-                let end = i + bytes[i..].iter().position(|b| *b == 0).unwrap();
-                let s = String::from_utf8(bytes[i..end].to_vec()).unwrap();
-                i = end + 1;
-                s
-            }
-            10..=59 | 110..=149 | 210..=239 | 1010..=1059 => {
-                let v = f64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
-                i += 8;
-                v.to_string()
-            }
-            60..=79 | 170..=179 | 270..=289 | 370..=389 | 1060..=1070 => {
-                let v = i16::from_le_bytes([bytes[i], bytes[i + 1]]);
-                i += 2;
-                v.to_string()
-            }
-            90..=99 | 1071 => {
-                let v = i32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
-                i += 4;
-                v.to_string()
-            }
-            1004 | 310..=319 => {
-                let n = bytes[i] as usize;
-                i += 1 + n;
-                String::new()
-            }
-            other => panic!("group {other} at byte {i}: not an R12 group"),
-        };
-        let eof = code == 0 && value == "EOF";
-        out.push((code, value));
-        if eof {
-            assert_eq!(i, bytes.len(), "bytes after EOF");
-            return out;
-        }
-    }
-    panic!("no EOF");
-}
-
 #[test]
-fn r12_binary_has_one_byte_codes_and_the_same_content_as_the_ascii() {
+fn r12_binary_is_refused_rather_than_written_as_r13() {
     let doc = document(DxfVersion::AC1009);
-    let bin = binary_pairs(&DxfWriter::new_binary(&doc).write_to_vec().unwrap());
-    let asc = pairs(&ascii(DxfVersion::AC1009));
-    let names = |p: &[(i32, String)]| -> Vec<String> {
-        p.iter()
-            .filter(|(c, _)| *c == 0)
-            .map(|(_, v)| v.clone())
-            .collect()
-    };
-    assert_eq!(names(&bin), names(&asc));
+    let err = DxfWriter::new_binary(&doc)
+        .with_version(DxfVersion::AC1009)
+        .write_to_vec()
+        .expect_err("binary R12 is not written");
+    assert!(
+        err.to_string().contains("AC1009"),
+        "the error says which version it refused: {err}"
+    );
 }
 
 #[test]

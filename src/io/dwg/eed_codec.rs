@@ -36,13 +36,19 @@ use crate::xdata::XDataValue;
 /// `0` when the layer is unknown).
 #[cfg(test)]
 fn encode_values(wide: bool, values: &[XDataValue], layer_handle: impl Fn(&str) -> u64) -> Vec<u8> {
-    encode_values_with_encoding(wide, values, encoding_rs::WINDOWS_1252, 30, layer_handle)
+    encode_values_with_encoding(
+        wide,
+        values,
+        encoding_rs::WINDOWS_1252.into(),
+        30,
+        layer_handle,
+    )
 }
 
 pub(crate) fn encode_values_with_encoding(
     wide: bool,
     values: &[XDataValue],
-    encoding: &'static encoding_rs::Encoding,
+    encoding: crate::io::dxf::code_page::LegacyEncoding,
     code_page: u16,
     layer_handle: impl Fn(&str) -> u64,
 ) -> Vec<u8> {
@@ -123,7 +129,7 @@ pub(crate) fn encode_values_with_encoding(
 /// resolves a layer table handle back to its name. Returns `None` if the bytes
 /// contain an unknown item code or are truncated mid-item, so the caller can
 /// keep the verbatim `raw_dwg_eed` blob instead of a partial record.
-pub(crate) fn decode_values(
+pub fn decode_values(
     bytes: &[u8],
     wide: bool,
     layer_name: impl Fn(u64) -> Option<String>,
@@ -167,10 +173,9 @@ pub(crate) fn decode_values(
                     i += 2;
                     let slice = bytes.get(i..i + n)?;
                     i += n;
-                    let encoding =
-                        crate::io::dxf::code_page::encoding_from_dwg_code_page(code_page);
+                    let encoding = crate::io::dxf::code_page::encoding_from_dwg_code_page(code_page);
                     let decoded = encoding.decode(slice).0.into_owned();
-                    crate::io::dxf::code_page::decode_mif_escapes(&decoded, encoding)
+                    encoding.decode_escapes(&decoded)
                 };
                 values.push(XDataValue::String(s));
             }
@@ -261,7 +266,7 @@ mod tests {
         let data = encode_values_with_encoding(
             false,
             &[XDataValue::String("MVIEW".into())],
-            encoding_rs::WINDOWS_1254,
+            encoding_rs::WINDOWS_1254.into(),
             33,
             |_| 0,
         );
@@ -292,7 +297,7 @@ mod tests {
         let encoded = encode_values_with_encoding(
             false,
             &[XDataValue::Handle(Handle::new(0x6DA))],
-            encoding_rs::WINDOWS_1252,
+            encoding_rs::WINDOWS_1252.into(),
             30,
             |_| 0,
         );

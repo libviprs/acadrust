@@ -5,7 +5,7 @@
 //! enum compact.
 
 use crate::entities::{Entity, EntityCommon, MText};
-use crate::types::{BoundingBox3D, Color, Handle, LineWeight, Transparency, Vector2, Vector3};
+use crate::types::{BoundingBox3D, Color, Handle, Matrix3, Matrix4, Transform, Vector2, Vector3};
 
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -17,7 +17,9 @@ pub struct ExtendedEntity {
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ExtendedEntityData {
-    Camera { view_handle: Handle },
+    Camera {
+        view_handle: Handle,
+    },
     SectionObject(SectionObjectData),
     ArcAlignedText(ArcAlignedTextData),
     RemoteText(RemoteTextData),
@@ -32,6 +34,10 @@ pub enum ExtendedEntityData {
     Legacy(LegacyEntityData),
     DynamicBlock(crate::objects::DynamicBlockData),
     RegisteredClass(RegisteredClassEntityData),
+    /// ACAD Arch entity (wall, door, stair, space, and the other
+    /// AEC entities). The class record stays intact; profiles can be moved
+    /// and reshaped.
+    Arch(crate::classes::arch::ArchEntityData),
 }
 
 impl ExtendedEntityData {
@@ -45,6 +51,11 @@ impl ExtendedEntityData {
                 value.raw_dwg_data = source.raw_dwg_data.clone();
                 value.raw_dwg_version = source.raw_dwg_version;
                 value.raw_dxf_codes = source.raw_dxf_codes.clone();
+            }
+            (Self::Arch(value), Self::Arch(source)) => {
+                value.raw_dwg_data = source.raw_dwg_data.clone();
+                value.raw_dxf_codes = source.raw_dxf_codes.clone();
+                value.dwg_source_version = source.dwg_source_version;
             }
             _ => {}
         }
@@ -201,8 +212,8 @@ pub struct PointCloudExData {
     pub name: String,
     pub show_intensity: bool,
     pub show_cropping: bool,
-    pub unknown_bl0: i32,
-    pub unknown_bl1: i32,
+    pub hidden_scans: Vec<String>,
+    pub hidden_regions: Vec<i32>,
     pub stylization_type: i16,
     pub intensity_color_scheme: String,
     pub current_color_scheme: String,
@@ -324,57 +335,18 @@ impl ExtendedEntity {
                 data.entity_dxf_name().unwrap_or("DYNAMICBLOCKENTITY")
             }
             ExtendedEntityData::RegisteredClass(data) => &data.dxf_name,
+            ExtendedEntityData::Arch(data) => data.dxf_name.as_str(),
         }
     }
 }
 
 impl Entity for ExtendedEntity {
-    fn handle(&self) -> Handle {
-        self.common.handle
+    fn common(&self) -> &super::EntityCommon {
+        &self.common
     }
 
-    fn set_handle(&mut self, handle: Handle) {
-        self.common.handle = handle;
-    }
-
-    fn layer(&self) -> &str {
-        &self.common.layer
-    }
-
-    fn set_layer(&mut self, layer: String) {
-        self.common.layer = layer;
-    }
-
-    fn color(&self) -> Color {
-        self.common.color
-    }
-
-    fn set_color(&mut self, color: Color) {
-        self.common.color = color;
-    }
-
-    fn line_weight(&self) -> LineWeight {
-        self.common.line_weight
-    }
-
-    fn set_line_weight(&mut self, weight: LineWeight) {
-        self.common.line_weight = weight;
-    }
-
-    fn transparency(&self) -> Transparency {
-        self.common.transparency
-    }
-
-    fn set_transparency(&mut self, transparency: Transparency) {
-        self.common.transparency = transparency;
-    }
-
-    fn is_invisible(&self) -> bool {
-        self.common.invisible
-    }
-
-    fn set_invisible(&mut self, invisible: bool) {
-        self.common.invisible = invisible;
+    fn common_mut(&mut self) -> &mut super::EntityCommon {
+        &mut self.common
     }
 
     fn bounding_box(&self) -> BoundingBox3D {
@@ -391,9 +363,8 @@ impl Entity for ExtendedEntity {
             ExtendedEntityData::PointCloud(data) => {
                 vec![data.extents_min, data.extents_max]
             }
-            ExtendedEntityData::PointCloudEx(data) => {
-                vec![data.extents_min, data.extents_max]
-            }
+            ExtendedEntityData::PointCloudEx(data) => point_cloud_ex_corners(data).to_vec(),
+            ExtendedEntityData::Arch(data) => data.profiles.iter().flatten().copied().collect(),
             _ => Vec::new(),
         };
         BoundingBox3D::from_points(&points).unwrap_or_default()
@@ -419,9 +390,12 @@ impl Entity for ExtendedEntity {
                 data.ucs_origin = data.ucs_origin + offset;
             }
             ExtendedEntityData::PointCloudEx(data) => {
-                data.extents_min = data.extents_min + offset;
-                data.extents_max = data.extents_max + offset;
+                // The extents stay in the scan's own coordinates; the
+                // placement moves.
                 data.ucs_origin = data.ucs_origin + offset;
+            }
+            ExtendedEntityData::Arch(data) => {
+                let _ = data.translate(&mut self.common.graphic_data, offset);
             }
             _ => {}
         }
@@ -430,4 +404,141 @@ impl Entity for ExtendedEntity {
     fn entity_type(&self) -> &'static str {
         "EXTENDED_ENTITY"
     }
+
+    fn apply_transform(&mut self, transform: &Transform) {
+        match &mut self.data {
+            ExtendedEntityData::SectionObject(data) => {
+                for point in data.vertices.iter_mut().chain(&mut data.back_line_vertices) {
+                    *point = transform.apply(*point);
+                }
+                data.vertical_direction = transform
+                    .apply_rotation(data.vertical_direction)
+                    .normalize();
+            }
+            ExtendedEntityData::ArcAlignedText(data) => {
+                let old_ocs = Matrix3::arbitrary_axis(data.normal);
+                let new_normal = transform.apply_rotation(data.normal).normalize();
+                let new_ocs_t = Matrix3::arbitrary_axis(new_normal).transpose();
+                let transformed_angle = |angle: f64| {
+                    let direction = old_ocs * Vector3::new(angle.cos(), angle.sin(), 0.0);
+                    let local = new_ocs_t * transform.apply_rotation(direction);
+                    local.y.atan2(local.x)
+                };
+                data.start_angle = transformed_angle(data.start_angle);
+                data.end_angle = transformed_angle(data.end_angle);
+                if super::transform::is_reflecting(transform) {
+                    std::mem::swap(&mut data.start_angle, &mut data.end_angle);
+                }
+                data.center = transform.apply(data.center);
+                data.normal = new_normal;
+                let scale = transform.apply_rotation(old_ocs * Vector3::UNIT_X).length();
+                data.radius *= scale;
+                data.text_size *= scale;
+                data.character_spacing *= scale;
+                data.offset_from_arc *= scale;
+                data.right_offset *= scale;
+                data.left_offset *= scale;
+            }
+            ExtendedEntityData::RemoteText(data) => {
+                let old_ocs = Matrix3::arbitrary_axis(data.normal);
+                let direction =
+                    old_ocs * Vector3::new(data.rotation.cos(), data.rotation.sin(), 0.0);
+                let new_normal = transform.apply_rotation(data.normal).normalize();
+                let rotated = Matrix3::arbitrary_axis(new_normal).transpose()
+                    * transform.apply_rotation(direction);
+                if rotated.x != 0.0 || rotated.y != 0.0 {
+                    data.rotation = rotated.y.atan2(rotated.x);
+                }
+                data.position = transform.apply(data.position);
+                data.normal = new_normal;
+                data.height *= transform.apply_rotation(direction).length();
+            }
+            ExtendedEntityData::GeoPositionMarker(data) => {
+                data.position = transform.apply(data.position);
+                let scale = transform.apply_rotation(Vector3::UNIT_X).length();
+                data.radius *= scale;
+                data.landing_gap *= scale;
+                if let Some(text) = &mut data.embedded_mtext {
+                    text.apply_transform(transform);
+                }
+            }
+            ExtendedEntityData::CoordinationModel(data) => {
+                let mut placement = Matrix4::zero();
+                for (row, values) in placement.m.iter_mut().enumerate() {
+                    values.copy_from_slice(&data.transform[row * 4..row * 4 + 4]);
+                }
+                let placement = transform.matrix * placement;
+                for (row, values) in placement.m.iter().enumerate() {
+                    data.transform[row * 4..row * 4 + 4].copy_from_slice(values);
+                }
+            }
+            ExtendedEntityData::PointCloud(data) => {
+                data.origin = transform.apply(data.origin);
+                let (min, max) = transformed_extents(data.extents_min, data.extents_max, transform);
+                data.extents_min = min;
+                data.extents_max = max;
+                data.ucs_origin = transform.apply(data.ucs_origin);
+                data.ucs_x_direction = transform.apply_rotation(data.ucs_x_direction);
+                data.ucs_y_direction = transform.apply_rotation(data.ucs_y_direction);
+                data.ucs_z_direction = transform.apply_rotation(data.ucs_z_direction);
+            }
+            ExtendedEntityData::PointCloudEx(data) => {
+                // Extents and crop geometry live in the scan's local frame.
+                data.ucs_origin = transform.apply(data.ucs_origin);
+                data.ucs_x_direction = transform.apply_rotation(data.ucs_x_direction);
+                data.ucs_y_direction = transform.apply_rotation(data.ucs_y_direction);
+                data.ucs_z_direction = transform.apply_rotation(data.ucs_z_direction);
+            }
+            ExtendedEntityData::Arch(data) => {
+                let _ = data.transform_points(&mut self.common.graphic_data, |point| {
+                    transform.apply(point)
+                });
+                return;
+            }
+            // Cameras refer to VIEW table records. Remaining classes contain
+            // opaque payloads or drawing metadata, with no editable geometry.
+            ExtendedEntityData::Camera { .. }
+            | ExtendedEntityData::Proxy(_)
+            | ExtendedEntityData::OleFrame(_)
+            | ExtendedEntityData::LayoutPrintConfig(_)
+            | ExtendedEntityData::Format(_)
+            | ExtendedEntityData::Legacy(_)
+            | ExtendedEntityData::DynamicBlock(_)
+            | ExtendedEntityData::RegisteredClass(_) => return,
+        }
+        self.common.raw_record = None;
+    }
+}
+
+fn transformed_extents(min: Vector3, max: Vector3, transform: &Transform) -> (Vector3, Vector3) {
+    let corners: [Vector3; 8] = std::array::from_fn(|index| {
+        transform.apply(Vector3::new(
+            if index & 1 == 0 { min.x } else { max.x },
+            if index & 2 == 0 { min.y } else { max.y },
+            if index & 4 == 0 { min.z } else { max.z },
+        ))
+    });
+    let bounds = BoundingBox3D::from_points(&corners).unwrap();
+    (bounds.min, bounds.max)
+}
+
+pub fn point_cloud_ex_to_world(data: &PointCloudExData, p: Vector3) -> Vector3 {
+    data.ucs_origin
+        + data.ucs_x_direction * p.x
+        + data.ucs_y_direction * p.y
+        + data.ucs_z_direction * p.z
+}
+
+pub fn point_cloud_ex_corners(data: &PointCloudExData) -> [Vector3; 8] {
+    let (a, b) = (data.extents_min, data.extents_max);
+    let mut out = [Vector3::ZERO; 8];
+    for (i, corner) in out.iter_mut().enumerate() {
+        let p = Vector3::new(
+            if i & 1 == 0 { a.x } else { b.x },
+            if i & 2 == 0 { a.y } else { b.y },
+            if i & 4 == 0 { a.z } else { b.z },
+        );
+        *corner = point_cloud_ex_to_world(data, p);
+    }
+    out
 }

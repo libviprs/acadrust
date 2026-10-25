@@ -39,7 +39,7 @@ pub fn read_classes(
         data,
         version,
         maintenance_version,
-        crate::io::dxf::code_page::LegacyCodePage::unknown(encoding_rs::WINDOWS_1252),
+        encoding_rs::WINDOWS_1252,
     )
 }
 
@@ -47,7 +47,7 @@ pub fn read_classes_with_encoding(
     data: &[u8],
     version: DxfVersion,
     maintenance_version: u8,
-    encoding: crate::io::dxf::code_page::LegacyCodePage,
+    encoding: impl Into<crate::io::dxf::code_page::LegacyEncoding>,
 ) -> Result<DxfClassCollection> {
     let dwg = DwgVersion::from_dxf_version(version)?;
 

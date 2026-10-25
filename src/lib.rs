@@ -2,7 +2,7 @@
 //!
 //! A pure Rust library for reading, writing, and inspecting CAD files in DXF
 //! (ASCII and binary) and native binary DWG formats. DXF support spans R12
-//! through R2018+; DWG support spans R13 through R2018+.
+//! through R2018+; DWG support spans R12 through R2018+.
 //!
 //! ## Highlights
 //!
@@ -17,18 +17,68 @@
 //!   [`DwgReader::read_with_stats`].
 //! - **Automatic code-page handling** for older drawings.
 //! - Optional Serde serialization and 3D import support.
+//! - **ACAD Arch** classes: preserve native AEC records, construct straight
+//!   walls, doors, and windows, and edit supported parameters. See
+//!   [`classes::arch`].
 //!
 //! ## Feature Flags
 //!
-//! | Feature | Description |
-//! |---------|-------------|
-//! | `serde` | Enables `serde::Serialize` and `serde::Deserialize` implementations. |
-//! | `import` | Enables STL, COLLADA, OBJ, glTF/GLB, and FBX importers. |
+//! | Feature | Default | Description |
+//! |---------|---------|-------------|
+//! | `parallel` | Yes | Rayon parallelism for native DWG reading and writing. |
+//! | `serde` | No | Enables `serde::Serialize` and `serde::Deserialize` implementations. |
+//! | `import` | No | Enables STL, COLLADA, OBJ, glTF/GLB, and FBX importers. |
 //!
 //! ```toml
 //! [dependencies]
-//! acadrust = { version = "0.5.5", features = ["serde", "import"] }
+//! acadrust = { version = "0.6.7", features = ["serde", "import"] }
 //! ```
+//!
+//! Use `default-features = false` to omit acadrust's Rayon dependency and run
+//! DWG work sequentially on the calling thread:
+//!
+//! ```toml
+//! [dependencies]
+//! acadrust = { version = "0.6.7", default-features = false }
+//! ```
+//!
+//! Cargo features are additive, so another dependency can enable `parallel`.
+//! Applications already disabling default features must explicitly enable
+//! `parallel` to retain native parallelism. WebAssembly stays sequential.
+//!
+//! ## Limit DWG Concurrency
+//!
+//! With `parallel` enabled on native targets, DWG reads and writes use the
+//! current Rayon pool, falling back to Rayon's shared global pool. Add
+//! `rayon = "1"` to your application's dependencies, create a pool once, and
+//! reuse it for all batches to share a worker limit with acadrust's internal
+//! work:
+//!
+//! ```rust,no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+//! # {
+//! use acadrust::DwgReader;
+//! use rayon::prelude::*;
+//!
+//! let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+//! let paths = ["first.dwg", "second.dwg"];
+//! let counts: Vec<usize> = pool.install(|| {
+//!     paths.par_iter().map(|path| {
+//!         let mut reader = DwgReader::from_file(path)?;
+//!         let doc = reader.read()?;
+//!         Ok(doc.entities().count())
+//!     }).collect::<acadrust::Result<_>>()
+//! })?;
+//! println!("Entity counts: {counts:?}");
+//! # }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Wrap DWG writes in `pool.install` too. Calls outside this pool and separate
+//! pools are not covered by its limit. A one-thread pool still uses a Rayon
+//! worker; disabling `parallel` keeps acadrust's work on its calling thread.
 //!
 //! ## Quick Start — DXF
 //!
@@ -122,24 +172,35 @@
 //! # }
 //! ```
 //!
+//! ## ACAD Arch
+//!
+//! [`classes::arch`] recognizes AEC, structural, and building-systems classes.
+//! A same-version DWG save preserves the native class body. `wall`, `door`,
+//! and `window` build an AC1032 drawing from parameters. `decode` reads any
+//! Arch class, and supported setters update native parameters together with
+//! cached graphics. The calling guide is
+//! [src/classes/arch/API.md](https://github.com/hakanaktt/acadrust/blob/main/src/classes/arch/API.md).
+//!
 //! ## Module Overview
 //!
 //! | Module | Contents |
 //! |--------|----------|
 //! | [`document`] | [`CadDocument`] — central drawing container |
 //! | [`entities`] | 48 top-level entity variants |
+//! | [`entities::modification`] | Entity explosion, mirroring, transforms, and translation |
 //! | [`tables`] | Table entries such as [`Layer`] and [`LineType`] |
 //! | [`objects`] | Non-graphical objects, dictionaries, layouts, and styles |
 //! | [`types`] | Primitives such as [`Vector3`], [`Color`], and [`DxfVersion`] |
 //! | [`io`] | DXF, DWG, and optional import readers and writers |
 //! | [`entities::acis`] | ACIS/SAT/SAB parsing, writing, and primitive builders |
 //! | [`notification`] | Structured parse notifications and recovery counts |
+//! | [`classes::arch`] | ACAD Arch entities, objects, constructors, and edits |
 //!
 //! ## File Version Support
 //!
-//! | Code | AutoCAD | DXF | DWG |
+//! | Code | ACAD | DXF | DWG |
 //! |------|---------|-----|-----|
-//! | AC1009 | R12 | R/W | — |
+//! | AC1009 | R11/R12 | R/W | R/W |
 //! | AC1012 | R13 | R/W | R/W |
 //! | AC1014 | R14 | R/W | R/W |
 //! | AC1015 | 2000 | R/W | R/W |
@@ -149,33 +210,45 @@
 //! | AC1027 | 2013 | R/W | R/W |
 //! | AC1032 | 2018+ | R/W | R/W |
 //!
+//! DXF R11/R12 is written as R13 unless requested explicitly with
+//! [`DxfWriter::with_version`](io::dxf::DxfWriter::with_version), which emits a
+//! genuine R12 file and converts newer entities to R12 entities.
+//!
 //! `R/W` describes the format-level reader and writer paths. Entity
 //! availability varies by file version. See the
-//! [per-version compatibility matrix](https://github.com/hakanaktt/acadrust/blob/main/src/docs/entity_status_matrix.md),
-//! which records tested fixtures and CAD-engine audit results rather than a
-//! guarantee for every possible drawing.
+//! [R11/R12 support status](https://github.com/hakanaktt/acadrust/blob/main/src/docs/ac1009_support.md)
+//! for confirmed AC1009 fidelity gaps. DXF export promotes R11/R12 documents to
+//! R13 or later. Compatibility results describe tested fixtures and CAD-engine
+//! audits rather than a guarantee for every possible drawing.
 
 #![allow(missing_docs)]
 #![warn(rustdoc::missing_crate_level_docs)]
 
 pub mod classes;
 pub mod compound_file;
-pub mod document;
+pub mod count;
 mod current_transparency;
-pub mod nested_copy;
+pub mod document;
 pub mod entities;
 pub mod error;
 pub mod fields;
 pub mod io;
 pub mod layer_state;
+pub mod nested_copy;
 pub mod notification;
 pub mod objects;
+pub mod plot_style;
+pub mod sheet_set;
 pub mod tables;
 pub mod types;
 pub mod vba;
 pub mod xdata;
 
 // Re-export commonly used types
+pub use audit::{
+    AuditIssue, AuditIssueCode, AuditLocation, AuditReport, AuditSeverity, RepairAction,
+    RepairReport,
+};
 pub use error::{DxfError, Result};
 pub use types::{
     BoundingBox2D, BoundingBox3D, Color, DxfVersion, Handle, LineWeight, Transparency, Vector2,
@@ -196,19 +269,21 @@ pub use tables::{
 
 // Re-export document
 pub use document::{
-    CadDocument, Preview, PreviewFormat, SemanticEntityV1, SemanticInventoryV1, SemanticNodeV1,
-    SemanticObjectV1, SemanticPartV1, SemanticReferenceV1, SemanticRelationshipKindV1,
-    SemanticTableRecordV1, SolidHistoryGraph, SEMANTIC_INVENTORY_VERSION,
+    BlockGraph, CadDocument, Preview, PreviewFormat, SemanticEntityV1, SemanticInventoryV1,
+    SemanticNodeV1, SemanticObjectV1, SemanticPartV1, SemanticReferenceV1,
+    SemanticRelationshipKindV1, SemanticTableRecordV1, SolidHistoryGraph,
+    SEMANTIC_INVENTORY_VERSION,
 };
 pub use layer_state::{LayerState, LayerStateLayer, LayerStateMask};
 
 // Re-export I/O types
-pub use io::dwg::{DwgReadOptions, DwgReader, DwgWriter};
-pub use io::dxf::{DxfReader, DxfReaderConfiguration, DxfWriter};
+pub use io::dwg::{DwgReadOptions, DwgReader, DwgWriter, MeshFaceBudget};
+pub use io::dxf::{DxfOmission, DxfReader, DxfReaderConfiguration, DxfWriter};
 pub use io::read::{
     push_read_diagnostic, ReadDiagnostic, ReadOutcome, ReadStage, ReadStats, SourceFormat,
     MAX_READ_DIAGNOSTICS,
 };
+pub use io::recover::RecoverOutcome;
 
 // Re-export ACIS types
 pub use entities::acis::primitives;
@@ -224,6 +299,8 @@ pub use io::import::{
 
 /// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub mod audit;
 
 #[cfg(test)]
 mod tests {

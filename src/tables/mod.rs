@@ -14,6 +14,7 @@
 //! | [`VPort`] | Viewport configurations |
 //! | [`Ucs`] | User coordinate systems |
 
+use crate::error::DxfError;
 use crate::types::Handle;
 use indexmap::IndexMap;
 
@@ -114,10 +115,10 @@ impl<T: TableEntry> Table<T> {
     }
 
     /// Add an entry to the table
-    pub fn add(&mut self, entry: T) -> Result<(), String> {
+    pub fn add(&mut self, entry: T) -> Result<(), DxfError> {
         let name = normalize_name(entry.name());
         if self.entries.contains_key(&name) {
-            return Err(format!("Entry '{}' already exists in table", entry.name()));
+            return Err(format!("Entry '{}' already exists in table", entry.name()).into());
         }
         self.entries.insert(name, entry);
         Ok(())
@@ -130,7 +131,7 @@ impl<T: TableEntry> Table<T> {
     }
 
     /// Add an entry while preserving existing entries with the same display
-    /// name. This is needed for AutoCAD VPORT tables, where tiled model-space
+    /// name. This is needed for VPORT tables, where tiled model-space
     /// viewports can all be named "*Active".
     pub fn add_allow_duplicate(&mut self, entry: T) {
         let name = normalize_name(entry.name());
@@ -174,15 +175,15 @@ impl<T: TableEntry> Table<T> {
     }
 
     /// Rename an entry without changing its handle or table position.
-    pub fn rename(&mut self, old_name: &str, new_name: impl Into<String>) -> Result<(), String> {
+    pub fn rename(&mut self, old_name: &str, new_name: impl Into<String>) -> Result<(), DxfError> {
         let new_name = new_name.into();
         let old_key = normalize_name(old_name);
         let new_key = normalize_name(&new_name);
         let Some(index) = self.entries.get_index_of(&old_key) else {
-            return Err(format!("Entry '{old_name}' does not exist in table"));
+            return Err(format!("Entry '{old_name}' does not exist in table").into());
         };
         if old_key != new_key && self.entries.contains_key(&new_key) {
-            return Err(format!("Entry '{new_name}' already exists in table"));
+            return Err(format!("Entry '{new_name}' already exists in table").into());
         }
         if old_key == new_key {
             self.entries[index].set_name(new_name);
@@ -209,8 +210,8 @@ impl<T: TableEntry> Table<T> {
     /// Lookups are keyed by the normalized name captured at insertion, so
     /// assigning `entry.name` directly leaves the entry reachable only under
     /// its old name. Every name-based resolution then misses: the DWG/DXF
-    /// writers turn an unresolved entity layer into a NULL hard pointer, which
-    /// AutoCAD reports as a damaged drawing. A rename colliding with another
+    /// writers turn an unresolved entity layer into a NULL hard pointer and
+    /// produce an invalid drawing. A rename colliding with another
     /// entry keeps the suffixed form `add_allow_duplicate` uses, so no entry is
     /// ever dropped.
     ///

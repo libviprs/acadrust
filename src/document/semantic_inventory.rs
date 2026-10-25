@@ -192,6 +192,7 @@ impl<'a> SemanticInventoryV1<'a> {
             dgn_ls_definitions: _,
             dgn_ls_components: _,
             eed_by_handle,
+            object_xdata,
             xdic_by_handle,
             reactors_by_handle,
             block_entity_handles: _,
@@ -199,8 +200,12 @@ impl<'a> SemanticInventoryV1<'a> {
             preview,
             acis_sab_handles: _,
             raw_acds_data: _,
+            r12_header_raw: _,
+            r12_table_usage: _,
+            r12_block_tags: _,
             raw_acds_fingerprint: _,
             raw_records: _,
+            original_objects: _,
             raw_record_owners: _,
             dwg_data_store_handles: _,
             section_view_style: _,
@@ -316,6 +321,25 @@ impl<'a> SemanticInventoryV1<'a> {
                 });
             }
         }
+        // Records without a verbatim EED block (read from DXF).
+        for (owner, xdata) in object_xdata {
+            for record in xdata.records() {
+                let application = app_ids.get(&record.application_name);
+                let has_raw = application.is_some_and(|app| {
+                    eed_by_handle
+                        .get(owner)
+                        .is_some_and(|blocks| blocks.iter().any(|(a, _)| *a == app.handle.value()))
+                });
+                if has_raw {
+                    continue;
+                }
+                visitor(SemanticPartV1::NonEntityExtendedData {
+                    owner: self.reference(*owner),
+                    application,
+                    values: Some(record.values.clone()),
+                });
+            }
+        }
     }
 
     fn visit_relationship(
@@ -426,7 +450,8 @@ fn classify_object(object: &ObjectType) -> SemanticObjectV1<'_> {
         | ObjectType::FieldList(_)
         | ObjectType::RegisteredClass(_)
         | ObjectType::DgnLineStyle(_)
-        | ObjectType::ProxyObject(_) => SemanticObjectV1::Typed(object),
+        | ObjectType::ProxyObject(_)
+        | ObjectType::Arch(_) => SemanticObjectV1::Typed(object),
     }
 }
 

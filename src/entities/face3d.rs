@@ -1,7 +1,7 @@
 //! Face3D entity (3D face)
 
 use crate::entities::{Entity, EntityCommon};
-use crate::types::{BoundingBox3D, Color, Handle, LineWeight, Transparency, Vector3};
+use crate::types::{BoundingBox3D, Vector3};
 
 /// Invisible edge flags for Face3D
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +100,8 @@ pub struct Face3D {
     pub second_corner: Vector3,
     /// Third corner point (in WCS)
     pub third_corner: Vector3,
-    /// Fourth corner point (in WCS) - same as third if only 3 corners
+    /// Fourth corner point (in WCS). Triangles repeat an adjacent corner;
+    /// newly created triangles repeat the third corner.
     pub fourth_corner: Vector3,
     /// Invisible edge flags
     pub invisible_edges: InvisibleEdgeFlags,
@@ -132,92 +133,59 @@ impl Face3D {
 
     /// Check if this is a triangle (3 vertices)
     pub fn is_triangle(&self) -> bool {
-        (self.third_corner - self.fourth_corner).length() < 1e-10
+        let corners = [
+            self.first_corner,
+            self.second_corner,
+            self.third_corner,
+            self.fourth_corner,
+        ];
+        (0..4).any(|index| (corners[index] - corners[(index + 1) % 4]).length() < 1e-10)
     }
 
     /// Get all corner points
     pub fn corners(&self) -> Vec<Vector3> {
-        if self.is_triangle() {
-            vec![self.first_corner, self.second_corner, self.third_corner]
-        } else {
-            vec![
-                self.first_corner,
-                self.second_corner,
-                self.third_corner,
-                self.fourth_corner,
-            ]
+        let mut corners: Vec<Vector3> = Vec::with_capacity(4);
+        for corner in [
+            self.first_corner,
+            self.second_corner,
+            self.third_corner,
+            self.fourth_corner,
+        ] {
+            if corners
+                .last()
+                .is_none_or(|previous| (corner - *previous).length() >= 1e-10)
+            {
+                corners.push(corner);
+            }
         }
+        if corners.len() > 1 && (corners[0] - corners[corners.len() - 1]).length() < 1e-10 {
+            corners.pop();
+        }
+        corners
     }
 
     /// Calculate the area of the face
     pub fn area(&self) -> f64 {
-        if self.is_triangle() {
-            // Triangle area using cross product
-            let v1 = self.second_corner - self.first_corner;
-            let v2 = self.third_corner - self.first_corner;
-            v1.cross(&v2).length() * 0.5
-        } else {
-            // Quadrilateral area (sum of two triangles)
-            let v1 = self.second_corner - self.first_corner;
-            let v2 = self.third_corner - self.first_corner;
-            let area1 = v1.cross(&v2).length() * 0.5;
-
-            let v3 = self.third_corner - self.first_corner;
-            let v4 = self.fourth_corner - self.first_corner;
-            let area2 = v3.cross(&v4).length() * 0.5;
-
-            area1 + area2
-        }
+        let corners = self.corners();
+        corners[1..]
+            .windows(2)
+            .map(|pair| {
+                (pair[0] - corners[0])
+                    .cross(&(pair[1] - corners[0]))
+                    .length()
+                    * 0.5
+            })
+            .sum()
     }
 }
 
 impl Entity for Face3D {
-    fn handle(&self) -> Handle {
-        self.common.handle
+    fn common(&self) -> &super::EntityCommon {
+        &self.common
     }
 
-    fn set_handle(&mut self, handle: Handle) {
-        self.common.handle = handle;
-    }
-
-    fn layer(&self) -> &str {
-        &self.common.layer
-    }
-
-    fn set_layer(&mut self, layer: String) {
-        self.common.layer = layer;
-    }
-
-    fn color(&self) -> Color {
-        self.common.color
-    }
-
-    fn set_color(&mut self, color: Color) {
-        self.common.color = color;
-    }
-
-    fn line_weight(&self) -> LineWeight {
-        self.common.line_weight
-    }
-
-    fn set_line_weight(&mut self, weight: LineWeight) {
-        self.common.line_weight = weight;
-    }
-
-    fn transparency(&self) -> Transparency {
-        self.common.transparency
-    }
-
-    fn set_transparency(&mut self, transparency: Transparency) {
-        self.common.transparency = transparency;
-    }
-
-    fn is_invisible(&self) -> bool {
-        self.common.invisible
-    }
-
-    fn set_invisible(&mut self, invisible: bool) {
-        self.common.invisible = invisible;
+    fn common_mut(&mut self) -> &mut super::EntityCommon {
+        &mut self.common
     }
 
     fn bounding_box(&self) -> BoundingBox3D {

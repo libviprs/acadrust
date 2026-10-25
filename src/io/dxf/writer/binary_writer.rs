@@ -9,80 +9,55 @@ use std::io::Write;
 /// Binary DXF sentinel
 const BINARY_DXF_SENTINEL: &[u8] = b"AutoCAD Binary DXF\r\n\x1a\x00";
 
-/// Byte widths of an integer value in binary DXF.
-#[derive(Clone, Copy)]
-enum IntWidth {
-    One,
-    Two,
-    Four,
-    Eight,
-}
-
 /// Binary DXF stream writer
 pub struct DxfBinaryWriter<W: Write> {
     writer: W,
-    /// R12 files give a group code one byte (255 then two bytes for the
-    /// extended-data range); R13 and later always use two.
-    short_codes: bool,
     /// Stack buffer for formatting handles without heap allocation.
     hex_buf: [u8; 17],
-    /// The legacy code page a pre-2007 file is written in. `None` writes UTF-8.
-    legacy: Option<&'static encoding_rs::Encoding>,
+    encoding: Option<crate::io::dxf::code_page::LegacyEncoding>,
 }
 
 impl<W: Write> DxfBinaryWriter<W> {
-    /// Write strings in `encoding`, with MIF `\U+XXXX` for what it cannot hold,
-    /// as a pre-2007 file declares in `$DWGCODEPAGE`.
-    pub fn with_legacy_encoding(
-        mut self,
-        encoding: Option<&'static encoding_rs::Encoding>,
-    ) -> Self {
-        self.legacy = encoding;
-        self
-    }
-
     /// Create a new binary DXF writer
     pub fn new(mut writer: W) -> Result<Self> {
         // Write the binary sentinel at the start
         writer.write_all(BINARY_DXF_SENTINEL)?;
         Ok(Self {
             writer,
-            short_codes: false,
             hex_buf: [0u8; 17],
-            legacy: None,
+            encoding: None,
         })
     }
 
-    /// A writer for the R12 binary layout, which has one-byte group codes.
-    pub fn new_r12(writer: W) -> Result<Self> {
-        let mut w = Self::new(writer)?;
-        w.short_codes = true;
-        Ok(w)
+    /// Select the declared code page for a pre-2007 DXF.
+    pub fn set_encoding(&mut self, encoding: crate::io::dxf::code_page::LegacyEncoding) {
+        self.encoding = Some(encoding);
     }
 
     /// Write a DXF code as 16-bit little-endian
     fn write_code(&mut self, code: i32) -> Result<()> {
-        if self.short_codes {
-            if (0..255).contains(&code) {
-                self.writer.write_u8(code as u8)?;
-            } else {
-                self.writer.write_u8(255)?;
-                self.writer.write_i16::<LittleEndian>(code as i16)?;
-            }
-            return Ok(());
-        }
         self.writer.write_i16::<LittleEndian>(code as i16)?;
         Ok(())
     }
 
     /// Write a null-terminated string
     fn write_null_string(&mut self, value: &str) -> Result<()> {
-        match self.legacy {
-            Some(enc) if !value.is_ascii() => {
-                let bytes = crate::io::dxf::code_page::encode_legacy_string(value, enc);
-                self.writer.write_all(&bytes)?;
-            }
-            _ => self.writer.write_all(value.as_bytes())?,
+        // A NUL terminates a binary DXF string. Drop embedded NULs so they
+        // cannot turn the remainder of the value into a new group code.
+        let sanitized;
+        let value = if value.contains('\0') {
+            sanitized = value.replace('\0', "");
+            sanitized.as_str()
+        } else {
+            value
+        };
+        if let Some(encoding) = self.encoding {
+            self.writer
+                .write_all(&crate::io::dxf::code_page::encode_legacy_string(
+                    value, encoding,
+                ))?;
+        } else {
+            self.writer.write_all(value.as_bytes())?;
         }
         self.writer.write_u8(0)?;
         Ok(())
@@ -134,16 +109,13 @@ impl<W: Write> DxfBinaryWriter<W> {
         Ok(true)
     }
 
-    /// Write an integer at the width the group code fixes in binary DXF.
+    /// Write an integer using the binary width required by its group code.
+    /// Callers often have a wider or narrower Rust integer available than the
+    /// DXF field requires, so the group-code type is the source of truth.
     ///
-    /// The format gives every code its own width (16 bits for 60-79, 32 for
-    /// 90-99, one byte for 290-299, and so on), whatever integer type the
-    /// caller happens to hold. A writer that takes the width from the Rust type
-    /// shifts every later group, which is what made readers refuse the file
-    /// (acadsharp-rs-tests#110). A value that does not fit its group is an
-    /// error: writing half of it would corrupt the file without saying so. A
-    /// code the format does not define keeps the width of the caller's type.
-    fn write_integer(&mut self, code: i32, value: i64, native: IntWidth) -> Result<()> {
+    /// A value that does not fit its group is an error: writing half of it
+    /// would corrupt the file without saying so (acadsharp-rs-tests#110).
+    fn write_integer(&mut self, code: i32, value: i64) -> Result<()> {
         use crate::error::DxfError;
         use crate::io::dxf::GroupCodeValueType;
 
@@ -152,20 +124,8 @@ impl<W: Write> DxfBinaryWriter<W> {
                 "value {value} does not fit the width binary DXF gives group {code}"
             ))
         };
-        let width = match GroupCodeValueType::from_raw_code(code) {
-            GroupCodeValueType::Bool => IntWidth::One,
-            GroupCodeValueType::Byte | GroupCodeValueType::Int16 => IntWidth::Two,
-            GroupCodeValueType::Int32 => IntWidth::Four,
-            GroupCodeValueType::Int64 => IntWidth::Eight,
-            GroupCodeValueType::Double | GroupCodeValueType::Point3D => {
-                self.write_code(code)?;
-                self.writer.write_f64::<LittleEndian>(value as f64)?;
-                return Ok(());
-            }
-            _ => native,
-        };
-        match width {
-            IntWidth::One => {
+        match GroupCodeValueType::from_raw_code(code) {
+            GroupCodeValueType::Bool => {
                 let v = u8::try_from(value)
                     .ok()
                     .filter(|v| *v <= 1)
@@ -173,20 +133,27 @@ impl<W: Write> DxfBinaryWriter<W> {
                 self.write_code(code)?;
                 self.writer.write_u8(v)?;
             }
-            IntWidth::Two => {
+            // Binary DXF stores Byte groups in the same two-byte slot as
+            // Int16 groups (the reader follows this convention as well).
+            GroupCodeValueType::Byte | GroupCodeValueType::Int16 => {
                 let v = i16::try_from(value).map_err(|_| too_big())?;
                 self.write_code(code)?;
                 self.writer.write_i16::<LittleEndian>(v)?;
             }
-            IntWidth::Four => {
+            GroupCodeValueType::Int32 => {
                 let v = i32::try_from(value).map_err(|_| too_big())?;
                 self.write_code(code)?;
                 self.writer.write_i32::<LittleEndian>(v)?;
             }
-            IntWidth::Eight => {
+            GroupCodeValueType::Int64 => {
                 self.write_code(code)?;
                 self.writer.write_i64::<LittleEndian>(value)?;
             }
+            GroupCodeValueType::Double => {
+                self.write_code(code)?;
+                self.writer.write_f64::<LittleEndian>(value as f64)?;
+            }
+            _ => return Err(DxfError::InvalidDxfCode(code)),
         }
         Ok(())
     }
@@ -209,7 +176,7 @@ impl<W: Write> DxfStreamWriter for DxfBinaryWriter<W> {
         self.write_code(code)?;
         // Sanitize embedded newlines to DXF paragraph markers, matching the
         // ASCII writer.  While binary DXF uses null-terminated strings (so raw
-        // newlines won't structurally break the file), many AutoCAD consumers
+        // newlines won't structurally break the file), many ACAD consumers
         // still expect \P instead of literal line breaks in string values.
         if value.contains('\n') || value.contains('\r') {
             let sanitized = value
@@ -232,20 +199,19 @@ impl<W: Write> DxfStreamWriter for DxfBinaryWriter<W> {
     }
 
     fn write_byte(&mut self, code: i32, value: u8) -> Result<()> {
-        // Group codes 280-289 are "Byte" type but written as Int16 in binary DXF
-        self.write_integer(code, i64::from(value), IntWidth::Two)
+        self.write_integer(code, i64::from(value))
     }
 
     fn write_i16(&mut self, code: i32, value: i16) -> Result<()> {
-        self.write_integer(code, i64::from(value), IntWidth::Two)
+        self.write_integer(code, i64::from(value))
     }
 
     fn write_i32(&mut self, code: i32, value: i32) -> Result<()> {
-        self.write_integer(code, i64::from(value), IntWidth::Four)
+        self.write_integer(code, i64::from(value))
     }
 
     fn write_i64(&mut self, code: i32, value: i64) -> Result<()> {
-        self.write_integer(code, value, IntWidth::Eight)
+        self.write_integer(code, value)
     }
 
     fn write_double(&mut self, code: i32, value: f64) -> Result<()> {
@@ -255,10 +221,26 @@ impl<W: Write> DxfStreamWriter for DxfBinaryWriter<W> {
     }
 
     fn write_bool(&mut self, code: i32, value: bool) -> Result<()> {
+        use crate::io::dxf::GroupCodeValueType;
+
         // Logical flags also occur in integer groups, including history
         // flags 280/281. Their binary width follows the group code, not the
         // Rust value type; only groups 290-299 use a single byte.
-        self.write_integer(code, i64::from(value), IntWidth::One)
+        let value = u8::from(value);
+        match GroupCodeValueType::from_raw_code(code) {
+            GroupCodeValueType::Bool => {
+                self.write_code(code)?;
+                self.writer.write_u8(value)?;
+                Ok(())
+            }
+            GroupCodeValueType::Byte | GroupCodeValueType::Int16 => {
+                self.write_i16(code, i16::from(value))
+            }
+            GroupCodeValueType::Int32 => self.write_i32(code, i32::from(value)),
+            GroupCodeValueType::Int64 => self.write_i64(code, i64::from(value)),
+            GroupCodeValueType::Double => self.write_double(code, f64::from(value)),
+            _ => Err(crate::error::DxfError::InvalidDxfCode(code)),
+        }
     }
 
     fn write_handle(&mut self, code: i32, handle: Handle) -> Result<()> {
@@ -377,6 +359,66 @@ mod tests {
         let str_end = buf[str_start..].iter().position(|&b| b == 0).unwrap() + str_start;
         let written = std::str::from_utf8(&buf[str_start..str_end]).unwrap();
         assert_eq!(written, "Hello\\PWorld\\PFoo\\PBar");
+    }
+
+    #[test]
+    fn embedded_nuls_do_not_split_binary_strings() {
+        for encoding in [None, Some(encoding_rs::WINDOWS_1252.into())] {
+            for xrecord in [false, true] {
+                for (value, sanitized) in [
+                    ("", ""),
+                    ("\0", ""),
+                    ("\0\0", ""),
+                    ("\0caf\u{e9}\0 au\0 lait\0", "caf\u{e9} au lait"),
+                ] {
+                    let mut writer = DxfBinaryWriter::new(Vec::new()).unwrap();
+                    if let Some(encoding) = encoding {
+                        writer.set_encoding(encoding);
+                    }
+                    let code = if xrecord { 1_i16 } else { 1000 };
+                    if xrecord {
+                        writer.write_xrecord_string(i32::from(code), value).unwrap();
+                    } else {
+                        writer.write_string(i32::from(code), value).unwrap();
+                    }
+                    writer.write_string(0, "EOF").unwrap();
+
+                    let mut expected = BINARY_DXF_SENTINEL.to_vec();
+                    expected.extend_from_slice(&code.to_le_bytes());
+                    if encoding.is_some() {
+                        let (bytes, _, errors) = encoding_rs::WINDOWS_1252.encode(sanitized);
+                        assert!(!errors);
+                        expected.extend_from_slice(&bytes);
+                    } else {
+                        expected.extend_from_slice(sanitized.as_bytes());
+                    }
+                    expected.extend_from_slice(b"\0\0\0EOF\0");
+                    assert_eq!(writer.into_inner(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nul_filtering_preserves_each_string_paths_newline_behavior() {
+        for (xrecord, expected_string) in [
+            (false, b"one\\Ptwo\\Pthree".as_slice()),
+            (true, b"one\r\ntwo\nthree".as_slice()),
+        ] {
+            let mut writer = DxfBinaryWriter::new(Vec::new()).unwrap();
+            if xrecord {
+                writer
+                    .write_xrecord_string(1, "one\0\r\ntwo\nthree\0")
+                    .unwrap();
+            } else {
+                writer.write_string(1, "one\0\r\ntwo\nthree\0").unwrap();
+            }
+            let mut expected = BINARY_DXF_SENTINEL.to_vec();
+            expected.extend_from_slice(&1_i16.to_le_bytes());
+            expected.extend_from_slice(expected_string);
+            expected.push(0);
+            assert_eq!(writer.into_inner(), expected);
+        }
     }
 }
 

@@ -1,7 +1,22 @@
 //! Text entity
 
 use super::{Entity, EntityCommon};
-use crate::types::{BoundingBox3D, Color, Handle, LineWeight, Transparency, Vector3};
+use crate::types::{BoundingBox3D, Vector3};
+
+pub(crate) fn estimated_width_in_heights(s: &str) -> f64 {
+    s.chars()
+        .map(|c| match c as u32 {
+            0x1100..=0x115F
+            | 0x2E80..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6 => 1.0,
+            _ => 0.6,
+        })
+        .sum()
+}
 
 /// Text horizontal alignment
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,57 +135,17 @@ impl Default for Text {
 }
 
 impl Entity for Text {
-    fn handle(&self) -> Handle {
-        self.common.handle
+    fn common(&self) -> &super::EntityCommon {
+        &self.common
     }
 
-    fn set_handle(&mut self, handle: Handle) {
-        self.common.handle = handle;
-    }
-
-    fn layer(&self) -> &str {
-        &self.common.layer
-    }
-
-    fn set_layer(&mut self, layer: String) {
-        self.common.layer = layer;
-    }
-
-    fn color(&self) -> Color {
-        self.common.color
-    }
-
-    fn set_color(&mut self, color: Color) {
-        self.common.color = color;
-    }
-
-    fn line_weight(&self) -> LineWeight {
-        self.common.line_weight
-    }
-
-    fn set_line_weight(&mut self, weight: LineWeight) {
-        self.common.line_weight = weight;
-    }
-
-    fn transparency(&self) -> Transparency {
-        self.common.transparency
-    }
-
-    fn set_transparency(&mut self, transparency: Transparency) {
-        self.common.transparency = transparency;
-    }
-
-    fn is_invisible(&self) -> bool {
-        self.common.invisible
-    }
-
-    fn set_invisible(&mut self, invisible: bool) {
-        self.common.invisible = invisible;
+    fn common_mut(&mut self) -> &mut super::EntityCommon {
+        &mut self.common
     }
 
     fn bounding_box(&self) -> BoundingBox3D {
         // Simplified bounding box based on insertion point and height
-        let width = self.value.len() as f64 * self.height * 0.6 * self.width_factor;
+        let width = estimated_width_in_heights(&self.value) * self.height * self.width_factor;
         BoundingBox3D::new(
             self.insertion_point,
             Vector3::new(
@@ -196,5 +171,13 @@ impl Entity for Text {
 
     fn apply_mirror(&mut self, transform: &crate::types::Transform) {
         super::mirror::mirror_text(self, transform);
+    }
+
+    fn apply_mirror_with_options(
+        &mut self,
+        transform: &crate::types::Transform,
+        options: super::MirrorOptions,
+    ) {
+        super::mirror::mirror_text_with_options(self, transform, options);
     }
 }

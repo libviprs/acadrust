@@ -13,8 +13,7 @@ pub struct DxfTextWriter<W: Write> {
     writer: W,
     /// Reusable stack buffer for formatting numbers without heap allocation.
     fmt_buf: [u8; 64],
-    /// The legacy code page a pre-2007 file is written in. `None` writes UTF-8.
-    legacy: Option<&'static encoding_rs::Encoding>,
+    encoding: Option<crate::io::dxf::code_page::LegacyEncoding>,
 }
 
 impl<W: Write> DxfTextWriter<W> {
@@ -23,27 +22,21 @@ impl<W: Write> DxfTextWriter<W> {
         Self {
             writer,
             fmt_buf: [0u8; 64],
-            legacy: None,
+            encoding: None,
         }
     }
 
-    /// Write strings in `encoding`, with MIF `\U+XXXX` for what it cannot hold,
-    /// as a pre-2007 file declares in `$DWGCODEPAGE`.
-    pub fn with_legacy_encoding(
-        mut self,
-        encoding: Option<&'static encoding_rs::Encoding>,
-    ) -> Self {
-        self.legacy = encoding;
-        self
+    /// Select the declared code page for a pre-2007 DXF.
+    pub fn set_encoding(&mut self, encoding: crate::io::dxf::code_page::LegacyEncoding) {
+        self.encoding = Some(encoding);
     }
 
-    /// The bytes of a string value in the file's encoding.
-    fn encode<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, [u8]> {
-        match self.legacy {
-            Some(enc) if !s.is_ascii() => {
-                std::borrow::Cow::Owned(crate::io::dxf::code_page::encode_legacy_string(s, enc))
-            }
-            _ => std::borrow::Cow::Borrowed(s.as_bytes()),
+    fn write_text_crlf(&mut self, value: &str) -> Result<()> {
+        if let Some(encoding) = self.encoding {
+            let bytes = crate::io::dxf::code_page::encode_legacy_string(value, encoding);
+            self.write_value_crlf(&bytes)
+        } else {
+            self.write_value_crlf(value.as_bytes())
         }
     }
 
@@ -136,7 +129,7 @@ impl<W: Write> DxfTextWriter<W> {
         // Rust's `{}` Display for f64 emits the shortest decimal string that
         // round-trips back to the same value, and never uses exponent notation
         // for magnitudes in this branch's range (1e-15 ..= 1e15).  This matches
-        // AutoCAD's compact output (e.g. "943.920153") instead of dumping the
+        // ACAD's compact output (e.g. "943.920153") instead of dumping the
         // full 16-digit binary expansion of the float ("943.9201530000000275"),
         // which trimming trailing zeros cannot clean up because the tail digits
         // are rounding noise, not zeros.  write! into a Cursor<&mut [u8]> does
@@ -166,6 +159,24 @@ impl<W: Write> DxfStreamWriter for DxfTextWriter<W> {
     #[inline]
     fn write_string(&mut self, code: i32, value: &str) -> Result<()> {
         self.write_code(code)?;
+        // A literal caret is written as "^ ": a bare "^x" is read as a control
+        // character (`\AcExpr (2^3)` would lose its operator). A caret already
+        // followed by a space is escaped (the SAT cipher writes it that way).
+        let caret;
+        let value = if value.contains('^') {
+            let mut escaped = String::with_capacity(value.len() + 4);
+            let mut chars = value.chars().peekable();
+            while let Some(c) = chars.next() {
+                escaped.push(c);
+                if c == '^' && chars.peek() != Some(&' ') {
+                    escaped.push(' ');
+                }
+            }
+            caret = escaped;
+            caret.as_str()
+        } else {
+            value
+        };
         // DXF text format is line-based: literal newlines in string values
         // would corrupt the file.  Replace them with the MText paragraph
         // marker \P which is the standard convention in DXF/DWG ecosystems.
@@ -174,11 +185,9 @@ impl<W: Write> DxfStreamWriter for DxfTextWriter<W> {
                 .replace("\r\n", "\\P")
                 .replace('\r', "\\P")
                 .replace('\n', "\\P");
-            let bytes = self.encode(&sanitized);
-            self.write_value_crlf(&bytes)?;
+            self.write_text_crlf(&sanitized)?;
         } else {
-            let bytes = self.encode(value);
-            self.write_value_crlf(&bytes)?;
+            self.write_text_crlf(value)?;
         }
         Ok(())
     }
@@ -191,8 +200,7 @@ impl<W: Write> DxfStreamWriter for DxfTextWriter<W> {
             .replace('\r', "^M")
             .replace('\n', "^J")
             .replace('\t', "^I");
-        let bytes = self.encode(&escaped);
-        self.write_value_crlf(&bytes)?;
+        self.write_text_crlf(&escaped)?;
         Ok(())
     }
 

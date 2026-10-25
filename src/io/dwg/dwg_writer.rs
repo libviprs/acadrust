@@ -23,7 +23,7 @@ use std::fs::File;
 use std::io::{BufWriter, Cursor, Seek, Write};
 use std::path::Path;
 
-use crate::document::{CadDocument, HeaderVariables};
+use crate::document::{CadDocument, HeaderVariables, SummaryInfo};
 use crate::error::{DxfError, Result};
 use crate::types::{DxfVersion, Handle};
 
@@ -54,6 +54,7 @@ impl DwgWriter {
     /// - An I/O error occurs
     /// - The document contains invalid data
     pub fn write_to_file<P: AsRef<Path>>(path: P, document: &CadDocument) -> Result<()> {
+        validate_unknown_records(document)?;
         let file = File::create(path)?;
         let writer = BufWriter::new(file);
         Self::write_to_writer(writer, document)
@@ -61,10 +62,19 @@ impl DwgWriter {
 
     /// Write a DWG file to any `Write + Seek` output.
     pub fn write_to_writer<W: Write + Seek>(mut output: W, document: &CadDocument) -> Result<()> {
+        validate_unknown_records(document)?;
+        if document.version == DxfVersion::AC1009 {
+            let bytes = crate::io::dwg::r12::write_document(document)?;
+            output.write_all(&bytes)?;
+            return Ok(());
+        }
         let mut prepared = crate::io::loft_parameters::prepared(document);
         prepare_surface_classes(&mut prepared);
         prepare_database_references(&mut prepared);
         prepare_table_keys(&mut prepared);
+        prepare_active_viewport_elevation(&mut prepared);
+        prepare_roundtrip_records(&mut prepared);
+        prepare_book_colors(&mut prepared)?;
         let document = prepared.as_ref();
         let perf = std::env::var_os("PERF").is_some();
         let started = web_time::Instant::now();
@@ -81,43 +91,29 @@ impl DwgWriter {
         let mut owned;
         let document: &CadDocument = if document.has_null_table_entries()
             || document.version < DxfVersion::AC1027
+            || has_missing_object_classes(document)
         {
             owned = document.clone();
             if owned.has_null_table_entries() {
                 owned.assign_table_entry_handles();
             }
-            // Pruning the class table to the legacy whitelist renumbers every
-            // surviving class (500 + index). Unknown objects/entities carried
-            // verbatim from a same-version source still embed their *original*
-            // class numbers, so after pruning they point at a missing class or
-            // — worse — at a different one. Only prune when nothing is being
-            // passed through raw, i.e. the source was not this exact version.
-            let raw_passthrough = owned.dwg_source_version == Some(owned.version);
-            if owned.version < DxfVersion::AC1027 && raw_passthrough {
-                prepare_legacy_document(&mut owned);
-            } else if owned.version < DxfVersion::AC1027 {
-                let required: Vec<_> = owned
-                    .entities()
-                    .filter_map(|entity| {
-                        let name = match entity {
-                            crate::entities::EntityType::Surface(surface) => {
-                                surface.kind.dxf_name()
-                            }
-                            crate::entities::EntityType::Extended(entity) => entity.class_name(),
-                            crate::entities::EntityType::Underlay(entity) => entity.entity_name(),
-                            _ => entity.as_entity().entity_type(),
-                        };
-                        owned.classes.get_by_name(name).cloned()
-                    })
-                    .collect();
-                owned.classes.retain_legacy_dwg_classes();
-                for mut class in required {
-                    if !owned.classes.contains(&class.dxf_name) {
-                        class.class_number = 0;
-                        owned.classes.add_or_update(class);
-                    }
+            if owned.version < DxfVersion::AC1027 {
+                // A table read from a file of this version is already valid
+                // for it, and the verbatim records copied from that file
+                // carry its class numbers: leave it as it is.
+                if owned.dwg_source_version != Some(owned.version) {
+                    prepare_legacy_classes(&mut owned);
                 }
+            }
+            // Objects added after reading (an evaluated dynamic block's
+            // AcDbBlockRepresentationData, a drawing variable) need their
+            // class whatever the version; the verbatim table only gains
+            // entries at its end, so the numbers it carries stay valid.
+            add_missing_object_classes(&mut owned);
+            if owned.version < DxfVersion::AC1027 {
                 prepare_legacy_document(&mut owned);
+                crate::objects::store_table_style_roundtrip(&mut owned);
+                crate::objects::store_visual_style_roundtrip(&mut owned);
             }
             &owned
         } else {
@@ -149,6 +145,7 @@ impl DwgWriter {
     /// Useful for isolating whether a read error is caused by compression
     /// or by the object data itself.
     pub fn write_to_file_no_lz77<P: AsRef<Path>>(path: P, document: &CadDocument) -> Result<()> {
+        validate_unknown_records(document)?;
         let file = File::create(path)?;
         let writer = BufWriter::new(file);
         Self::write_to_writer_no_lz77(writer, document)
@@ -159,11 +156,15 @@ impl DwgWriter {
         mut output: W,
         document: &CadDocument,
     ) -> Result<()> {
+        validate_unknown_records(document)?;
         validate_version(document.version)?;
         let mut prepared = crate::io::loft_parameters::prepared(document);
         prepare_surface_classes(&mut prepared);
         prepare_database_references(&mut prepared);
         prepare_table_keys(&mut prepared);
+        prepare_active_viewport_elevation(&mut prepared);
+        prepare_roundtrip_records(&mut prepared);
+        prepare_book_colors(&mut prepared)?;
         write_ac21_impl(&mut output, prepared.as_ref(), document.version, true)
     }
 
@@ -173,6 +174,241 @@ impl DwgWriter {
         Self::write_to_writer(&mut buffer, document)?;
         Ok(buffer.into_inner())
     }
+}
+
+pub(crate) fn prepare_active_viewport_elevation(document: &mut std::borrow::Cow<'_, CadDocument>) {
+    let elevation = document.header.elevation;
+    let needs_elevation = elevation != 0.0
+        && document.vports.iter().any(|viewport| {
+            viewport.name.eq_ignore_ascii_case("*ACTIVE") && viewport.ucs_elevation == 0.0
+        });
+    if needs_elevation {
+        // CAD hosts activate the VPORT's UCS elevation when loading the file,
+        // so a default zero viewport would mask the nonzero header setting.
+        for viewport in document.to_mut().vports.iter_mut() {
+            if viewport.name.eq_ignore_ascii_case("*ACTIVE") && viewport.ucs_elevation == 0.0 {
+                viewport.ucs_elevation = elevation;
+            }
+        }
+    }
+}
+
+fn validate_unknown_records(document: &CadDocument) -> Result<()> {
+    for entity in document.entities() {
+        if document.version < DxfVersion::AC1018 {
+            if let crate::entities::EntityType::Insert(insert) = entity {
+                for attribute in &insert.attributes {
+                    if attribute
+                        .common
+                        .color_name
+                        .as_ref()
+                        .is_some_and(|name| !name.is_empty())
+                        || attribute
+                            .common
+                            .color_book_handle
+                            .is_some_and(|handle| !handle.is_null())
+                    {
+                        return Err(DxfError::NotImplemented(format!(
+                            "Named color on attribute {} requires DWG R2004 or later",
+                            attribute.common.handle
+                        )));
+                    }
+                }
+            }
+        }
+        if document.version < DxfVersion::AC1018
+            && (entity
+                .common()
+                .color_name
+                .as_ref()
+                .is_some_and(|name| !name.is_empty())
+                || entity
+                    .common()
+                    .color_book_handle
+                    .is_some_and(|handle| !handle.is_null()))
+        {
+            return Err(DxfError::NotImplemented(format!(
+                "Named color on entity {} requires DWG R2004 or later",
+                entity.common().handle
+            )));
+        }
+        if let crate::entities::EntityType::Extended(entity) = entity {
+            if let crate::entities::ExtendedEntityData::Arch(data) = &entity.data {
+                if data.raw_dwg_data.is_none()
+                    || data
+                        .dwg_source_version
+                        .is_some_and(|version| version != document.version)
+                    || document.version == DxfVersion::AC1009
+                {
+                    return Err(DxfError::NotImplemented(format!(
+                        "Cannot encode Arch entity {} at handle {} as DWG {:?}: compatible raw DWG data is required",
+                        data.dxf_name, entity.common.handle, document.version
+                    )));
+                }
+                crate::io::dwg::dwg_stream_writers::DwgObjectWriter::validate_architecture_record(
+                    data,
+                    document.version,
+                )?;
+            }
+        }
+        if let crate::entities::EntityType::Unknown(entity) = entity {
+            if entity.raw_dwg_data.is_none()
+                || entity
+                    .dwg_source_version
+                    .is_some_and(|version| version != document.version)
+                || document.version == DxfVersion::AC1009
+            {
+                return Err(DxfError::NotImplemented(format!(
+                    "Cannot encode custom entity {} at handle {} as DWG {:?}: compatible raw DWG data is required",
+                    entity.dxf_name, entity.common.handle, document.version
+                )));
+            }
+        }
+    }
+    for object in document.objects.values() {
+        if let crate::objects::ObjectType::Arch(object) = object {
+            if object.raw_dwg_data.is_none()
+                || object
+                    .raw_dwg_version
+                    .is_some_and(|version| version != document.version)
+                || document.version == DxfVersion::AC1009
+            {
+                return Err(DxfError::NotImplemented(format!(
+                    "Cannot encode Arch object {} at handle {} as DWG {:?}: compatible raw DWG data is required",
+                    object.dxf_name, object.handle, document.version
+                )));
+            }
+            DwgObjectWriter::validate_architecture_object(object, document.version)?;
+        }
+        if let crate::objects::ObjectType::DynamicBlock(value) = object {
+            if let crate::objects::DynamicBlockData::PropertiesTable(table) = &value.data {
+                let supported = table
+                    .fields
+                    .iter()
+                    .all(|field| match (field.code, &field.value) {
+                        (90..=99, crate::objects::BlockPropertiesTableValue::Integer(_))
+                        | (170..=179, crate::objects::BlockPropertiesTableValue::Integer(_))
+                        | (290..=299, crate::objects::BlockPropertiesTableValue::Boolean(_))
+                        | (140..=149, crate::objects::BlockPropertiesTableValue::Real(_))
+                        | (300..=309, crate::objects::BlockPropertiesTableValue::Text(_))
+                        | (340..=349, crate::objects::BlockPropertiesTableValue::Handle(_)) => true,
+                        _ => false,
+                    });
+                if !supported {
+                    return Err(DxfError::NotImplemented(format!(
+                        "Cannot encode Block Properties Table at handle {} as DWG: a field uses an unsupported value type",
+                        value.handle
+                    )));
+                }
+            }
+        }
+        if let crate::objects::ObjectType::Unknown {
+            type_name,
+            handle,
+            raw_dwg_data,
+            raw_dwg_version,
+            ..
+        } = object
+        {
+            if raw_dwg_data.is_none()
+                || raw_dwg_version.is_some_and(|version| version != document.version)
+                || document.version == DxfVersion::AC1009
+            {
+                return Err(DxfError::NotImplemented(format!(
+                    "Cannot encode custom object {type_name} at handle {handle} as DWG {:?}: compatible raw DWG data is required",
+                    document.version
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn prepare_book_colors(document: &mut std::borrow::Cow<'_, CadDocument>) -> Result<()> {
+    use crate::objects::{BookColor, ObjectType};
+    let mut missing = Vec::new();
+    let mut collect = |owner, attribute_index, common: &crate::entities::EntityCommon| {
+        let Some(name) = common.color_name.as_ref().filter(|name| !name.is_empty()) else {
+            return;
+        };
+        let existing = common
+            .color_book_handle
+            .and_then(|handle| document.objects.get(&handle));
+        if let Some(ObjectType::BookColor(color)) = existing {
+            let identity = crate::io::dxf::join_color_book_name(
+                Some(&color.book_name),
+                Some(&color.color_name),
+            );
+            if identity
+                .as_ref()
+                .is_some_and(|identity| identity.eq_ignore_ascii_case(name))
+                && color.color == common.color
+            {
+                return;
+            }
+        }
+        missing.push((owner, attribute_index, common.color, name.clone()));
+    };
+    for entity in document.entities() {
+        let owner = entity.common().handle;
+        collect(owner, None, entity.common());
+        if let crate::entities::EntityType::Insert(insert) = entity {
+            for (index, attribute) in insert.attributes.iter().enumerate() {
+                collect(owner, Some(index), &attribute.common);
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if document.version < DxfVersion::AC1018 {
+        return Err(DxfError::NotImplemented(
+            "Named entity colors require DWG R2004 or later".to_string(),
+        ));
+    }
+    let output = document.to_mut();
+    output.synchronize_handle_allocator();
+    for (entity_handle, attribute_index, color, name) in missing {
+        let (book_name, color_name) = crate::io::dxf::split_color_book_name(&name);
+        let book_name = book_name.unwrap_or_default();
+        let color_name = color_name.unwrap_or_default();
+        let existing = output
+            .objects
+            .iter()
+            .find_map(|(handle, object)| match object {
+                ObjectType::BookColor(value)
+                    if value.book_name == book_name
+                        && value.color_name == color_name
+                        && value.color == color =>
+                {
+                    Some(*handle)
+                }
+                _ => None,
+            });
+        let handle = existing.unwrap_or_else(|| {
+            let handle = output.allocate_handle();
+            let mut value = BookColor::new();
+            value.handle = handle;
+            value.owner = output.header.named_objects_dict_handle;
+            value.color = color;
+            value.book_name = book_name;
+            value.color_name = color_name;
+            output.objects.insert(handle, ObjectType::BookColor(value));
+            handle
+        });
+        if let Some(entity) = output.get_entity_mut(entity_handle) {
+            let common = if let Some(index) = attribute_index {
+                let crate::entities::EntityType::Insert(insert) = entity else {
+                    continue;
+                };
+                &mut insert.attributes[index].common
+            } else {
+                entity.common_mut()
+            };
+            common.color_book_handle = Some(handle);
+        }
+    }
+    Ok(())
 }
 
 /// Repair relationships that are stored in both directions in a DWG database.
@@ -508,8 +744,8 @@ fn prepare_surface_classes(document: &mut std::borrow::Cow<'_, CadDocument>) {
 /// assigns `layer.name` through `layers.iter_mut()` leaves the entry reachable
 /// only under its old name. The entity writer resolves an entity's layer by
 /// name, so every entity on that layer would be written with a NULL layer hard
-/// pointer — a required reference — and AutoCAD asks to recover the drawing
-/// (issue #80). Repair the output copy only; the caller's document is untouched.
+/// pointer — a required reference — and produces an invalid drawing (issue
+/// #80). Repair the output copy only; the caller's document is untouched.
 ///
 /// Shared with the DXF writer: the stale key desyncs the same name lookups
 /// there, leaving entities pointing at a layer name the LAYER table no longer
@@ -521,10 +757,209 @@ pub(crate) fn prepare_table_keys(document: &mut std::borrow::Cow<'_, CadDocument
     document.to_mut().resync_table_keys();
 }
 
-/// Remove style dictionaries only before the versions introducing their
-/// objects: TABLESTYLE in R2004 and MLEADERSTYLE in R2007.
+fn prepare_roundtrip_records(document: &mut std::borrow::Cow<'_, CadDocument>) {
+    use crate::objects::{ObjectType, XRecordValue};
+    if document.version < DxfVersion::AC1024 {
+        return;
+    }
+    let key_of = |value: &XRecordValue| value.as_string().map(str::to_string);
+    let mut drops: Vec<(Handle, Handle, String, bool)> = Vec::new();
+    for (handle, object) in &document.objects {
+        let roundtrip_owner = match object {
+            ObjectType::VisualStyle(style) => style.properties.len() >= 58,
+            ObjectType::TableStyle(style) => !style.modern_overrides.is_empty(),
+            _ => false,
+        };
+        if !roundtrip_owner {
+            continue;
+        }
+        let Some(dictionary) = document.extension_dictionary_handle(*handle) else {
+            continue;
+        };
+        let Some(ObjectType::Dictionary(entries)) = document.objects.get(&dictionary) else {
+            continue;
+        };
+        let is_visual_style = matches!(object, ObjectType::VisualStyle(_));
+        for (name, child) in &entries.entries {
+            let drop = match (name.as_str(), document.objects.get(child)) {
+                (
+                    "ACAD_ROUNDTRIP_2008_TABLESTYLE_CELLSTYLEMAP",
+                    Some(ObjectType::DataObject(_)),
+                ) => !is_visual_style,
+                ("ACAD_XREC_ROUNDTRIP", Some(ObjectType::XRecord(record))) => {
+                    let prefix = if is_visual_style {
+                        "RTVS"
+                    } else {
+                        "ACAD_ROUNDTRIP_PRE2007_TABLESTYLE"
+                    };
+                    record
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.code == 102)
+                        .filter_map(|entry| key_of(&entry.value))
+                        .all(|key| key.starts_with(prefix) || (!is_visual_style && key.is_empty()))
+                        && record.entries.iter().any(|entry| entry.code == 102)
+                }
+                _ => false,
+            };
+            if drop {
+                drops.push((*handle, dictionary, name.clone(), is_visual_style));
+            }
+        }
+    }
+    if drops.is_empty() {
+        return;
+    }
+    let document = document.to_mut();
+    for (owner, dictionary, name, is_visual_style) in drops {
+        let mut now_empty = false;
+        if let Some(ObjectType::Dictionary(entries)) = document.objects.get_mut(&dictionary) {
+            if let Some(child) = entries.get(&name) {
+                entries.entries.retain(|(entry, _)| *entry != name);
+                entries.hard_owner_entries.retain(|entry| *entry != name);
+                now_empty = entries.entries.is_empty();
+                document.objects.remove(&child);
+            }
+        }
+        if is_visual_style && now_empty {
+            document.objects.remove(&dictionary);
+            document.xdic_by_handle.remove(&owner);
+            if let Some(ObjectType::VisualStyle(style)) = document.objects.get_mut(&owner) {
+                style.xdictionary_handle = None;
+            }
+        }
+    }
+}
+
+/// The DXF class name an entity is declared under in the CLASSES section.
+fn entity_class_name(entity: &crate::entities::EntityType) -> &str {
+    match entity {
+        crate::entities::EntityType::Surface(surface) => surface.kind.dxf_name(),
+        crate::entities::EntityType::Extended(entity) => entity.class_name(),
+        crate::entities::EntityType::Underlay(entity) => entity.entity_name(),
+        crate::entities::EntityType::Hatch(hatch) if hatch.is_mpolygon => "MPOLYGON",
+        crate::entities::EntityType::Insert(insert) if insert.view_rep_handle.is_some() => {
+            "ACDBVIEWREPBLOCKREFERENCE"
+        }
+        _ => entity.as_entity().entity_type(),
+    }
+}
+
+/// Walk `document.objects` in handle order.
+///
+/// `objects` is a `HashMap`, so it iterates in an order seeded per instance:
+/// reading the same file twice and writing both gives two different orders.
+/// The callers below turn that walk into on-disk structure - the class table
+/// is positional (`500 + index`, see `DxfClassCollection::add_or_update`) and
+/// names the type code of every class-registered record - so a random walk
+/// would hand out a different type code on every write. Lowest handle first
+/// makes the result the same file after file.
+fn objects_in_handle_order(document: &CadDocument) -> Vec<(Handle, &crate::objects::ObjectType)> {
+    let mut objects: Vec<_> = document
+        .objects
+        .iter()
+        .map(|(handle, obj)| (*handle, obj))
+        .collect();
+    objects.sort_by_key(|(handle, _)| handle.value());
+    objects
+}
+
+/// Shrink the class table to the pre-R2013 profile, keeping every class a
+/// record of the document is written under.
+///
+/// Classes are positional: the writer numbers them 500 + index, and each
+/// class-registered record takes its type code from that number. A class the
+/// profile would drop while an entity or object still uses it leaves the
+/// record without a valid type code, so it is kept, after the profile.
+fn prepare_legacy_classes(document: &mut CadDocument) {
+    let entity_classes = document.entities().map(entity_class_name);
+    let object_classes = objects_in_handle_order(document)
+        .into_iter()
+        .flat_map(|(_, object)| {
+            crate::io::dwg::dwg_stream_writers::object_writer::objects::object_class_names(object)
+        });
+    // FIELD / FIELDLIST records exist from R2004 on and are written from the
+    // document's field table, not from `objects`.
+    let field_classes: &[&str] = if document.version >= DxfVersion::AC1018 {
+        &["FIELD", "FIELDLIST"]
+    } else {
+        &[]
+    };
+    let field_classes = field_classes
+        .iter()
+        .map(|name| std::borrow::Cow::Owned(name.to_string()));
+    let mut seen = std::collections::HashSet::new();
+    let required: Vec<_> = entity_classes
+        .map(std::borrow::Cow::Borrowed)
+        .chain(object_classes)
+        .chain(field_classes)
+        .filter_map(|name| document.classes.get_by_name(&name).cloned())
+        .filter(|class| seen.insert(class.dxf_name.to_ascii_uppercase()))
+        .collect();
+
+    document.classes.retain_legacy_dwg_classes();
+    for mut class in required {
+        if !document.classes.contains(&class.dxf_name) {
+            class.class_number = 0;
+            document.classes.add_or_update(class);
+        }
+    }
+}
+
+/// Class names of objects whose class the table lacks.
+fn missing_object_class_names(document: &CadDocument) -> Vec<Vec<std::borrow::Cow<'_, str>>> {
+    objects_in_handle_order(document)
+        .into_iter()
+        .map(|(_, object)| {
+            crate::io::dwg::dwg_stream_writers::object_writer::objects::object_class_names(object)
+        })
+        .filter(|names| !names.iter().any(|name| document.classes.contains(name)))
+        .collect()
+}
+
+/// True when an object the defaults can declare has no class in the table.
+fn has_missing_object_classes(document: &CadDocument) -> bool {
+    let defaults = crate::classes::default_classes();
+    missing_object_class_names(document).iter().any(|names| {
+        defaults.iter().any(|class| {
+            names
+                .iter()
+                .any(|name| class.dxf_name.eq_ignore_ascii_case(name))
+        })
+    })
+}
+
+/// Declare the class of every object whose source file never used that
+/// class. Such records take their type code from the class table; without an
+/// entry they fall back to a fixed or placeholder code (500 for dynamic block
+/// records), which readers resolve to another class or drop: an evaluated
+/// dynamic block reference then loses its link to the definition.
+fn add_missing_object_classes(document: &mut CadDocument) {
+    let defaults = crate::classes::default_classes();
+    let missing: Vec<_> = missing_object_class_names(document)
+        .into_iter()
+        .filter_map(|names| {
+            defaults
+                .iter()
+                .find(|class| {
+                    names
+                        .iter()
+                        .any(|name| class.dxf_name.eq_ignore_ascii_case(name))
+                })
+                .cloned()
+        })
+        .collect();
+    for mut class in missing {
+        class.class_number = 0;
+        document.classes.add_or_update(class);
+    }
+}
+
+/// Bring a document into shape for a version older than the one it came from.
+///
+/// R14 and older expect a VxTable record per viewport. Style dictionaries are
+/// removed before the version that introduced their objects.
 fn prepare_legacy_document(document: &mut CadDocument) {
-    use crate::objects::ObjectType;
     if document.version <= DxfVersion::AC1014 {
         let missing: Vec<_> = document
             .entities()
@@ -535,7 +970,7 @@ fn prepare_legacy_document(document: &mut CadDocument) {
                         .iter()
                         .any(|record| record.viewport == viewport.common.handle) =>
                 {
-                    Some((viewport.common.handle, viewport.status.is_on))
+                    Some((viewport.common.handle, viewport.is_on()))
                 }
                 _ => None,
             })
@@ -560,14 +995,12 @@ fn prepare_legacy_document(document: &mut CadDocument) {
         }
     }
 
-    // A document read from an R2004 (AC1018) DWG that already carried
-    // ACAD_MLEADERSTYLE (AutoCAD writes it there when saving as 2004, with
-    // the MLEADERSTYLE class declared) must keep it: the reader parsed those
-    // records with the same pre-R2010 layout the writer emits, and dropping
-    // them silently loses every multileader style in the file.  Only a
-    // document that did not come from such a file gets the legacy cleanup.
-    let keep_mleader_style = document.dwg_source_version == Some(document.version)
-        && document.version >= DxfVersion::AC1018
+    // TABLESTYLE is an R2004 object. MLEADERSTYLE is an R2007 object.
+    // R2004 saves keep ACAD_MLEADERSTYLE when that class is already declared,
+    // in the pre-R2010 record layout. Older saves drop the dictionary and the
+    // style object it holds.
+    use crate::objects::ObjectType;
+    let keep_mleader_style = document.version >= DxfVersion::AC1018
         && document.classes.get_by_name("MLEADERSTYLE").is_some();
     let root_handle = document.header.named_objects_dict_handle;
     let mut obsolete = Vec::new();
@@ -691,8 +1124,9 @@ fn uses_paged_format(version: DxfVersion) -> bool {
 /// dictionary, causing IntelliCAD (and other CAD apps) to report
 /// "null object id" for every object.
 ///
-/// Also updates EXTMIN/EXTMAX from the computed model-space extents so that
-/// "Zoom Extents" works correctly when the file is first opened.
+/// A document without EXTMIN/EXTMAX (the 1e20 defaults) gets the computed
+/// model-space extents, so that "Zoom Extents" works when the file is first
+/// opened; extents the document holds are kept.
 fn prepare_header(
     document: &CadDocument,
     handle_map: &[(u64, u32)],
@@ -778,28 +1212,8 @@ fn prepare_header(
     if let Some(br) = document.block_records.get("*Model_Space") {
         h.model_space_block_handle = br.handle;
     }
-    if let Some(br) = document.block_records.get("*Paper_Space") {
-        h.paper_space_block_handle = br.handle;
-    }
-
-    // ── Dimension arrow blocks: the name in the variable, the handle in the file ──
-    {
-        let find = |value: &str| -> Handle {
-            if value.is_empty() {
-                return Handle::NULL;
-            }
-            document
-                .block_records
-                .get(&crate::document::arrow_block_name_from_variable(value))
-                .or_else(|| document.block_records.get(value))
-                .map(|b| b.handle)
-                .unwrap_or(Handle::NULL)
-        };
-        h.dim_arrow_block_handle = find(&h.dim_arrow_block);
-        h.dim_arrow_block1_handle = find(&h.dim_arrow_block1);
-        h.dim_arrow_block2_handle = find(&h.dim_arrow_block2);
-        h.dim_leader_arrow_block_handle = find(&h.dim_leader_arrow_block);
-    }
+    h.paper_space_block_handle =
+        super::dwg_stream_writers::object_writer::paper_space_block_handle(document);
 
     // ── Sync current style handles (validate against actual objects) ──
     // CLAYER: must point to an actual layer; fall back to "0" if invalid
@@ -959,6 +1373,12 @@ fn prepare_header(
         }
     }
 
+    // DIMBLK / DIMBLK1 / DIMBLK2 / DIMLDRBLK. DXF stores the names; a DWG
+    // stores the block handles. A null handle is the default closed-filled arrow.
+    // A name such as ArchTick selects the block _ArchTick, and a handle that
+    // names no block is cleared.
+    crate::document::apply_dimension_arrow_header(&document.block_records, &mut h);
+
     // ── Correct HANDSEED ──
     let max_handle = handle_map.iter().map(|&(ha, _)| ha).max().unwrap_or(0);
     if h.handle_seed <= max_handle {
@@ -966,9 +1386,23 @@ fn prepare_header(
     }
 
     // ── Update model-space extents ──
+    // Extents the document already holds (read from a file, or set by the
+    // caller) are kept: EXTMIN/EXTMAX are what the authoring application last
+    // computed, and the entity bounding boxes are no substitute (an XLINE or
+    // RAY is unbounded, and block references are boxed by their insertion
+    // point). Only a document without extents gets the computed ones.
+    let (min, max) = (h.model_space_extents_min, h.model_space_extents_max);
+    let has_extents = [min.x, min.y, min.z, max.x, max.y, max.z]
+        .iter()
+        .all(|c| c.is_finite() && c.abs() < 1e20)
+        && min.x <= max.x
+        && min.y <= max.y
+        && min.z <= max.z;
     if let Some(ref ext) = extents {
-        h.model_space_extents_min = ext.min;
-        h.model_space_extents_max = ext.max;
+        if !has_extents {
+            h.model_space_extents_min = ext.min;
+            h.model_space_extents_max = ext.max;
+        }
     }
 
     h
@@ -1054,9 +1488,9 @@ fn write_ac15<W: Write + Seek>(
 
     // ── Section: Header (uses synced + corrected header) ──
     let maint = document.maintenance_version;
-    let header_encoding =
-        crate::io::dxf::code_page::encoding_from_code_page(&document.header.code_page)
-            .unwrap_or(encoding_rs::WINDOWS_1252);
+    let header_encoding = crate::io::dxf::code_page::encoding_from_dwg_code_page(
+        crate::io::dxf::code_page::dwg_code_page_index(&document.header.code_page),
+    );
     let header_data = header_writer::write_header_with_encoding(
         version,
         &corrected_header,
@@ -1121,7 +1555,7 @@ fn write_ac18<W: Write + Seek>(
     // R2010+ per-section "extra RL" (which locates the header/classes string
     // stream) on `maintenance_version > 3`. A fresh document defaults to 0,
     // which for R2013 (AC1027) omits that RL and makes the header string
-    // stream unreadable in AutoCAD/TrueView. Use the canonical per-version
+    // stream unreadable in ACAD/TrueView. Use the canonical per-version
     // value so R2013 files are always well-formed.
     let maint = aux_header_writer::dwg_maintenance_version(version) as u8;
 
@@ -1160,9 +1594,9 @@ fn write_ac18<W: Write + Seek>(
     let corrected_header = prepare_header(document, &handle_map_u32, &extents);
 
     // ── Section: Header (uses synced + corrected header) ──
-    let header_encoding =
-        crate::io::dxf::code_page::encoding_from_code_page(&document.header.code_page)
-            .unwrap_or(encoding_rs::WINDOWS_1252);
+    let header_encoding = crate::io::dxf::code_page::encoding_from_dwg_code_page(
+        crate::io::dxf::code_page::dwg_code_page_index(&document.header.code_page),
+    );
     let header_data = header_writer::write_header_with_encoding(
         version,
         &corrected_header,
@@ -1184,7 +1618,8 @@ fn write_ac18<W: Write + Seek>(
     )?;
 
     // ── Section: SummaryInfo ──
-    let summary_data = build_summary_info(version);
+    let summary_data =
+        build_summary_info(version, &document.summary_info, summary_encoding(document));
     fhw.add_section(
         output,
         section_names::SUMMARY_INFO,
@@ -1362,7 +1797,8 @@ fn write_ac21_impl<W: Write + Seek>(
     // from ac21_section_info, so no page_size or compressed flag needed.
 
     // SummaryInfo
-    let summary_data = build_summary_info(version);
+    let summary_data =
+        build_summary_info(version, &document.summary_info, summary_encoding(document));
     fhw.add_section(output, section_names::SUMMARY_INFO, &summary_data)?;
 
     // Preview
@@ -1415,9 +1851,9 @@ fn write_ac21_impl<W: Write + Seek>(
     // Classes
     let classes = reconciled_classes(document, &class_instance_counts, class_counts_complete);
     let maint = document.maintenance_version;
-    let header_encoding =
-        crate::io::dxf::code_page::encoding_from_code_page(&document.header.code_page)
-            .unwrap_or(encoding_rs::WINDOWS_1252);
+    let header_encoding = crate::io::dxf::code_page::encoding_from_dwg_code_page(
+        crate::io::dxf::code_page::dwg_code_page_index(&document.header.code_page),
+    );
     let classes_data =
         classes_writer::write_classes_with_encoding(version, &classes, maint, header_encoding);
     fhw.add_section(output, section_names::CLASSES, &classes_data)?;
@@ -1507,7 +1943,12 @@ fn build_template(description: &[u8], measurement: i16) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-/// Build SummaryInfo section data (AC18+ only).
+fn summary_encoding(document: &CadDocument) -> crate::io::dxf::code_page::LegacyEncoding {
+    crate::io::dxf::code_page::encoding_from_dwg_code_page(
+        crate::io::dxf::code_page::dwg_code_page_index(&document.header.code_page),
+    )
+}
+
 ///
 /// Writes empty summary info fields (all empty strings).
 ///
@@ -1518,22 +1959,45 @@ fn build_template(description: &[u8], measurement: i16) -> Result<Vec<u8>> {
 /// **AC1021 (R2007)**: UTF-16LE strings.
 ///   Format: UInt16(char_count_incl_null) + UTF-16LE chars.
 ///   Empty → UInt16(1) + 0x00 0x00 = 4 bytes.
-fn build_summary_info(version: DxfVersion) -> Vec<u8> {
+fn build_summary_info(
+    version: DxfVersion,
+    info: &SummaryInfo,
+    encoding: crate::io::dxf::code_page::LegacyEncoding,
+) -> Vec<u8> {
     let mut data = Vec::with_capacity(128);
     let is_utf16 = version >= DxfVersion::AC1021;
 
-    // 8 × empty strings
-    // Title, Subject, Author, Keywords, Comments, LastSavedBy, RevisionNumber, HyperlinkBase
-    for _ in 0..8 {
-        data.extend_from_slice(&1u16.to_le_bytes()); // char/byte count including null
+    // The UInt16 count includes the terminating null; longer text is cut.
+    let push_text = |data: &mut Vec<u8>, text: &str| {
         if is_utf16 {
+            let units: Vec<u16> = text.encode_utf16().take(u16::MAX as usize - 1).collect();
+            data.extend_from_slice(&(units.len() as u16 + 1).to_le_bytes());
+            for unit in units {
+                data.extend_from_slice(&unit.to_le_bytes());
+            }
             // UTF-16LE null terminator: 2 bytes
-            data.push(0);
-            data.push(0);
+            data.extend_from_slice(&[0, 0]);
         } else {
+            let mut bytes = crate::io::dxf::code_page::encode_legacy_string(text, encoding);
+            bytes.truncate(u16::MAX as usize - 1);
+            data.extend_from_slice(&(bytes.len() as u16 + 1).to_le_bytes());
+            data.extend_from_slice(&bytes);
             // ANSI null terminator: 1 byte
             data.push(0);
         }
+    };
+
+    for text in [
+        &info.title,
+        &info.subject,
+        &info.author,
+        &info.keywords,
+        &info.comments,
+        &info.last_saved_by,
+        &info.revision_number,
+        &info.hyperlink_base,
+    ] {
+        push_text(&mut data, text);
     }
 
     // Total editing time: 2 × Int32 (zeros)
@@ -1548,8 +2012,18 @@ fn build_summary_info(version: DxfVersion) -> Vec<u8> {
     data.extend_from_slice(&0i32.to_le_bytes());
     data.extend_from_slice(&0i32.to_le_bytes());
 
-    // Property count: Int16 (0)
-    data.extend_from_slice(&0u16.to_le_bytes());
+    // Custom properties: Int16 count, then name/value string pairs
+    let properties: Vec<&(String, String)> = info
+        .custom_properties
+        .iter()
+        .filter(|(name, value)| !(name.is_empty() && value.is_empty()))
+        .take(u16::MAX as usize)
+        .collect();
+    data.extend_from_slice(&(properties.len() as u16).to_le_bytes());
+    for (name, value) in properties {
+        push_text(&mut data, name);
+        push_text(&mut data, value);
+    }
 
     // 2 × Int32 (trailing zeros)
     data.extend_from_slice(&0i32.to_le_bytes());
@@ -1690,31 +2164,35 @@ fn build_acds_prototype(sab_entries: &[(Handle, Vec<u8>)]) -> Vec<u8> {
 
 /// Build the AcDsPrototype_1b file header ("jard", 128 bytes).
 ///
-/// Fourteen little-endian `RL` fields per the ODA datastore layout (field names
-/// follow libredwg's `acds.spec`), then zero padding to 128 bytes. A strict
-/// reader validates these; a wrong `ds_version` in particular
-/// made the whole section read as "invalid data". The segment ordering emitted
+/// Fourteen little-endian 32-bit fields in ODA §24.1 order, followed by zero
+/// padding to the declared header size. Data storage revision is distinct
+/// from the preceding version field. The segment ordering emitted
 /// by [`build_acds_prototype`] is fixed (segidx=1, _data_=2, thumbnail=3,
 /// datidx=4, schdat=5, schidx=6, search=7), so the `*_segidx` pointers are
 /// constant.
 fn build_acds_jard_header(segidx_offset: u32, file_size: u32) -> Vec<u8> {
-    let mut h = vec![0u8; 128];
-    h[0..4].copy_from_slice(b"jard"); // file_signature
-    h[4..8].copy_from_slice(&128u32.to_le_bytes()); // file_header_size
-    h[8..12].copy_from_slice(&2u32.to_le_bytes()); // unknown_1 (always 2)
-    h[12..16].copy_from_slice(&2u32.to_le_bytes()); // version (always 2)
-    h[16..20].copy_from_slice(&0u32.to_le_bytes()); // unknown_2 (always 0)
-    h[20..24].copy_from_slice(&1u32.to_le_bytes()); // ds_version (datastore revision)
-    h[24..28].copy_from_slice(&segidx_offset.to_le_bytes()); // segidx_offset
-    h[28..32].copy_from_slice(&0u32.to_le_bytes()); // segidx_unknown
-    h[32..36].copy_from_slice(&8u32.to_le_bytes()); // num_segidx (null + 7 segments)
-    h[36..40].copy_from_slice(&6u32.to_le_bytes()); // schidx_segidx
-    h[40..44].copy_from_slice(&4u32.to_le_bytes()); // datidx_segidx
-    h[44..48].copy_from_slice(&7u32.to_le_bytes()); // search_segidx
-    h[48..52].copy_from_slice(&0u32.to_le_bytes()); // prvsav_segidx
-    h[52..56].copy_from_slice(&file_size.to_le_bytes()); // file_size
-                                                         // Remaining bytes are zero (padding to file_header_size).
-    h
+    let fields = [
+        u32::from_le_bytes(*b"jard"), // file signature
+        128,                          // file header size
+        2,                            // unknown 1
+        2,                            // version
+        0,                            // unknown 2
+        1,                            // data storage revision
+        segidx_offset,                // segment index offset
+        0,                            // segment index unknown
+        8,                            // segment index entry count (null + 7)
+        6,                            // schema index segment index
+        4,                            // data index segment index
+        7,                            // search segment index
+        0,                            // previous save index
+        file_size,
+    ];
+    let mut header = Vec::with_capacity(fields[1] as usize);
+    for field in fields {
+        header.extend_from_slice(&field.to_le_bytes());
+    }
+    header.resize(fields[1] as usize, 0);
+    header
 }
 
 /// Build `_data_` segment id=2 containing one SAB record per ACIS entity.
@@ -2077,6 +2555,61 @@ mod tests {
     use crate::types::{DxfVersion, Handle};
 
     #[test]
+    fn unchanged_history_keeps_source_bytes_without_hiding_edits() {
+        use crate::objects::{
+            DynamicBlockData, DynamicBlockObject, ObjectType, SolidHistoryOperation,
+            SolidHistorySweep,
+        };
+        use crate::{
+            entities::{EntityType, Line},
+            types::Vector3,
+            DwgReader,
+        };
+        use std::io::Cursor;
+        let mut doc = CadDocument::new();
+        let mut history = DynamicBlockObject::new("ACSH_EXTRUSION_CLASS", "AcDbShExtrusion");
+        history.handle = doc.allocate_handle();
+        let handle = history.handle;
+        history.data = DynamicBlockData::SolidHistoryNode(SolidHistoryOperation::Extrusion(
+            SolidHistorySweep {
+                direction: Vector3::UNIT_Z,
+                ..Default::default()
+            },
+        ));
+        doc.objects
+            .insert(handle, ObjectType::DynamicBlock(history));
+        let mut source =
+            DwgReader::from_stream(Cursor::new(DwgWriter::write_to_vec(&doc).unwrap()))
+                .read()
+                .unwrap();
+        let original = source.raw_records[&handle.value()].1.data.clone();
+        source
+            .add_entity(EntityType::Line(Line::from_points(
+                Vector3::ZERO,
+                Vector3::UNIT_X,
+            )))
+            .unwrap();
+        let saved = DwgReader::from_stream(Cursor::new(DwgWriter::write_to_vec(&source).unwrap()))
+            .read()
+            .unwrap();
+        assert_eq!(saved.raw_records[&handle.value()].1.data, original);
+        assert_eq!(saved.model_space_entities().count(), 1);
+        let ObjectType::DynamicBlock(history) = source.objects.get_mut(&handle).unwrap() else {
+            panic!("History missing")
+        };
+        let DynamicBlockData::SolidHistoryNode(SolidHistoryOperation::Extrusion(history)) =
+            &mut history.data
+        else {
+            panic!("Extrusion missing")
+        };
+        history.direction = Vector3::new(0.0, 0.0, 12.0);
+        let edited = DwgReader::from_stream(Cursor::new(DwgWriter::write_to_vec(&source).unwrap()))
+            .read()
+            .unwrap();
+        assert_ne!(edited.raw_records[&handle.value()].1.data, original);
+        assert_eq!(edited.objects[&handle], source.objects[&handle]);
+    }
+    #[test]
     fn acds_record_table_indexes_each_length_prefixed_blob() {
         for count in [1, 2, 7, 8, 16] {
             let entries: Vec<_> = (0..count)
@@ -2114,6 +2647,136 @@ mod tests {
                 expected_offset += 4 + blob.len();
             }
         }
+    }
+
+    fn class_names(classes: &crate::classes::DxfClassCollection) -> Vec<String> {
+        classes
+            .iter()
+            .map(|class| class.dxf_name.to_ascii_uppercase())
+            .collect()
+    }
+
+    fn layer_filter_document() -> CadDocument {
+        use crate::objects::{ClassObject, ClassObjectData, LayerFilter, ObjectType};
+
+        let mut document = CadDocument::new();
+        let mut filter = ClassObject::new(ClassObjectData::LayerFilter(LayerFilter {
+            names: vec!["WALLS".into()],
+        }));
+        filter.handle = document.allocate_handle();
+        document
+            .objects
+            .insert(filter.handle, ObjectType::ClassObject(filter));
+        document
+    }
+
+    #[test]
+    fn legacy_class_table_keeps_the_classes_objects_are_written_under() {
+        let mut document = layer_filter_document();
+        document.version = DxfVersion::AC1024;
+        let mut legacy = document.classes.clone();
+        legacy.retain_legacy_dwg_classes();
+        assert!(!legacy.contains("LAYERFILTER"));
+
+        prepare_legacy_classes(&mut document);
+
+        // The legacy profile first, then the class the layer filter needs.
+        let mut expected = class_names(&legacy);
+        expected.push("LAYERFILTER".to_string());
+        assert_eq!(class_names(&document.classes), expected);
+    }
+
+    #[test]
+    fn legacy_write_keeps_class_registered_objects() {
+        use crate::objects::{ClassObjectData, ObjectType};
+
+        let mut document = layer_filter_document();
+        document.version = DxfVersion::AC1024;
+        let bytes = DwgWriter::write_to_vec(&document).unwrap();
+        let decoded = crate::io::dwg::DwgReader::from_stream(Cursor::new(bytes))
+            .read()
+            .unwrap();
+
+        let filters: Vec<_> = decoded
+            .objects
+            .values()
+            .filter_map(|object| match object {
+                ObjectType::ClassObject(object) => match &object.data {
+                    ClassObjectData::LayerFilter(filter) => Some(filter.names.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(filters, [vec!["WALLS".to_string()]]);
+    }
+
+    #[test]
+    fn same_version_legacy_write_keeps_the_source_class_table() {
+        let mut document = CadDocument::new();
+        document.version = DxfVersion::AC1024;
+        document.dwg_source_version = Some(DxfVersion::AC1024);
+
+        let bytes = DwgWriter::write_to_vec(&document).unwrap();
+        let decoded = crate::io::dwg::DwgReader::from_stream(Cursor::new(bytes))
+            .read()
+            .unwrap();
+
+        assert_eq!(
+            class_names(&decoded.classes),
+            class_names(&document.classes)
+        );
+        for class in document.classes.iter() {
+            assert_eq!(
+                decoded
+                    .classes
+                    .get_by_name(&class.dxf_name)
+                    .map(|c| c.class_number),
+                Some(class.class_number),
+                "{} was renumbered",
+                class.dxf_name
+            );
+        }
+    }
+
+    #[test]
+    fn object_without_its_class_gets_it_declared_instead_of_written_as_class_500() {
+        use crate::objects::{ClassObjectData, ObjectType};
+
+        let mut document = layer_filter_document();
+        document.version = DxfVersion::AC1024;
+        document.dwg_source_version = Some(DxfVersion::AC1024);
+        let mut classes = crate::classes::DxfClassCollection::new();
+        for class in document.classes.iter() {
+            if !class.dxf_name.eq_ignore_ascii_case("LAYERFILTER") {
+                classes.push_preserving(class.clone());
+            }
+        }
+        let numbers: Vec<_> = classes
+            .iter()
+            .map(|class| (class.dxf_name.clone(), class.class_number))
+            .collect();
+        document.classes = classes;
+        let source_objects = document.objects.len();
+
+        let bytes = DwgWriter::write_to_vec(&document).unwrap();
+        let decoded = crate::io::dwg::DwgReader::from_stream(Cursor::new(bytes))
+            .read()
+            .unwrap();
+
+        assert_eq!(decoded.objects.len(), source_objects);
+        assert!(decoded.classes.contains("LAYERFILTER"));
+        for (name, number) in numbers {
+            assert_eq!(
+                decoded.classes.get_by_name(&name).map(|c| c.class_number),
+                Some(number)
+            );
+        }
+        assert!(decoded.objects.values().any(|object| matches!(
+            object,
+            ObjectType::ClassObject(o)
+                if matches!(&o.data, ClassObjectData::LayerFilter(f) if f.names == ["WALLS"])
+        )));
     }
 
     #[test]
@@ -2186,7 +2849,7 @@ mod tests {
         path.boundary_handles.push(boundary);
         hatch.paths.push(path);
         let hatch_handle = document
-            .add_entity(EntityType::Hatch(hatch))
+            .add_entity(EntityType::Hatch(Box::new(hatch)))
             .expect("hatch");
 
         let mut prepared = std::borrow::Cow::Borrowed(&document);
@@ -2295,7 +2958,11 @@ mod tests {
 
     #[test]
     fn test_build_summary_info_ac18() {
-        let d = build_summary_info(DxfVersion::AC1018);
+        let d = build_summary_info(
+            DxfVersion::AC1018,
+            &SummaryInfo::default(),
+            encoding_rs::WINDOWS_1252.into(),
+        );
         // 8 × 3 bytes (u16(1) + ANSI null) + 8 + 16 + 2 + 8 = 58
         assert_eq!(d.len(), 58);
         assert_eq!(u16::from_le_bytes([d[0], d[1]]), 1);
@@ -2306,7 +2973,11 @@ mod tests {
 
     #[test]
     fn test_build_summary_info_ac21() {
-        let d = build_summary_info(DxfVersion::AC1021);
+        let d = build_summary_info(
+            DxfVersion::AC1021,
+            &SummaryInfo::default(),
+            encoding_rs::WINDOWS_1252.into(),
+        );
         // 8 × 4 bytes (u16(1) + UTF-16LE null) + 8 + 16 + 2 + 8 = 66
         assert_eq!(d.len(), 66);
         // First string: u16(1) + 00 00
@@ -2315,6 +2986,31 @@ mod tests {
         assert_eq!(d[3], 0);
         // Next string starts at offset 4
         assert_eq!(u16::from_le_bytes([d[4], d[5]]), 1);
+    }
+
+    #[test]
+    fn test_build_summary_info_writes_properties() {
+        let info = SummaryInfo {
+            title: "Kanal S\u{fc}d".into(),
+            custom_properties: vec![
+                ("Plan".into(), "B-1".into()),
+                (String::new(), String::new()),
+            ],
+            ..SummaryInfo::default()
+        };
+        // R2004: drawing code page, one byte per character
+        let d = build_summary_info(DxfVersion::AC1018, &info, encoding_rs::WINDOWS_1252.into());
+        assert_eq!(u16::from_le_bytes([d[0], d[1]]), 10);
+        assert_eq!(&d[2..12], b"Kanal S\xfcd\0");
+        // Seven empty strings, 24 bytes of timers, then one property (the empty pair is skipped)
+        let count_at = 12 + 7 * 3 + 24;
+        assert_eq!(u16::from_le_bytes([d[count_at], d[count_at + 1]]), 1);
+        assert_eq!(&d[count_at + 2..count_at + 9], b"\x05\0Plan\0");
+        assert_eq!(d.len(), count_at + 2 + 7 + 6 + 8);
+        // R2007+: UTF-16LE, count in code units
+        let d = build_summary_info(DxfVersion::AC1021, &info, encoding_rs::WINDOWS_1252.into());
+        assert_eq!(u16::from_le_bytes([d[0], d[1]]), 10);
+        assert_eq!(u16::from_le_bytes([d[16], d[17]]), 0xfc);
     }
 
     #[test]
@@ -2868,5 +3564,130 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    fn constraint_group_document(version: DxfVersion) -> CadDocument {
+        use crate::objects::{
+            Assoc2dConstraintGroup, AssocAction, AssocConstraintNode, AssocConstraintNodeData,
+            AssociativeData, AssociativeObject, ObjectType,
+        };
+
+        let mut document = CadDocument::new();
+        document.version = version;
+        let handle = document.allocate_handle();
+        let owner = document.header.named_objects_dict_handle;
+        document.objects.insert(
+            handle,
+            ObjectType::Associative(AssociativeObject {
+                handle,
+                owner,
+                dxf_name: "ASSOC2DCONSTRAINTGROUP".to_string(),
+                cpp_class_name: "AcDbAssoc2dConstraintGroup".to_string(),
+                data: AssociativeData::ConstraintGroup(Assoc2dConstraintGroup {
+                    action: AssocAction {
+                        class_version: 2,
+                        ..Default::default()
+                    },
+                    version: 2,
+                    nodes: vec![
+                        AssocConstraintNode {
+                            status: 1,
+                            connections: vec![7],
+                            ..Default::default()
+                        },
+                        AssocConstraintNode {
+                            node_id: 1,
+                            class_name: "AcFixedConstraint".to_string(),
+                            status: 3,
+                            data: AssocConstraintNodeData::Geometrical {
+                                owner_id: 0,
+                                is_implied: false,
+                                is_active: true,
+                            },
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        );
+        document
+    }
+
+    fn constraint_group_of(document: &CadDocument) -> &crate::objects::Assoc2dConstraintGroup {
+        use crate::objects::{AssociativeData, AssociativeObject, ObjectType};
+        document
+            .objects
+            .values()
+            .find_map(|object| match object {
+                ObjectType::Associative(AssociativeObject {
+                    data: AssociativeData::ConstraintGroup(group),
+                    ..
+                }) => Some(group),
+                _ => None,
+            })
+            .expect("constraint group should round-trip")
+    }
+
+    #[test]
+    fn constraint_group_below_r2013_round_trips_without_serialized_root() {
+        use crate::objects::{AssocConstraintNode, AssocConstraintNodeData};
+        use crate::DwgReader;
+        use std::io::Cursor;
+
+        let document = constraint_group_document(DxfVersion::AC1018);
+        let decoded = DwgReader::from_stream(Cursor::new(
+            DwgWriter::write_to_vec(&document).expect("write DWG"),
+        ))
+        .read()
+        .expect("read DWG");
+        let group = constraint_group_of(&decoded);
+
+        assert_eq!(group.nodes.len(), 2);
+        assert_eq!(
+            group.nodes[0],
+            AssocConstraintNode::default(),
+            "pre-R2013 layouts serialize no root node; the reader rebuilds a placeholder"
+        );
+        assert_eq!(group.nodes[1].node_id, 1);
+        assert_eq!(group.nodes[1].class_name, "AcFixedConstraint");
+        assert_eq!(group.nodes[1].status, 3);
+        assert!(matches!(
+            group.nodes[1].data,
+            AssocConstraintNodeData::Geometrical {
+                is_active: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn constraint_group_r2013_plus_round_trips_with_serialized_root() {
+        use crate::objects::AssocConstraintNodeData;
+        use crate::DwgReader;
+        use std::io::Cursor;
+
+        let document = constraint_group_document(DxfVersion::AC1032);
+        let decoded = DwgReader::from_stream(Cursor::new(
+            DwgWriter::write_to_vec(&document).expect("write DWG"),
+        ))
+        .read()
+        .expect("read DWG");
+        let group = constraint_group_of(&decoded);
+
+        assert_eq!(group.nodes.len(), 2);
+        assert_eq!(group.nodes[0].node_id, 0);
+        assert_eq!(group.nodes[0].status, 1);
+        assert_eq!(group.nodes[0].connections, vec![7]);
+        assert_eq!(group.nodes[1].class_name, "AcFixedConstraint");
+        assert_eq!(group.nodes[1].status, 3);
+        assert!(matches!(
+            group.nodes[1].data,
+            AssocConstraintNodeData::Geometrical {
+                is_active: true,
+                ..
+            }
+        ));
     }
 }

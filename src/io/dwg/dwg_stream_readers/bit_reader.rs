@@ -22,6 +22,7 @@ use std::sync::Arc;
 /// - `position`: Current byte read position in the stream
 /// - `bit_shift`: Current bit offset within the current byte (0–7)
 /// - `last_byte`: The most recently read byte from the stream
+#[derive(Clone)]
 pub struct DwgBitReader {
     /// Source data buffer.
     data: Arc<[u8]>,
@@ -35,11 +36,8 @@ pub struct DwgBitReader {
     version: DwgVersion,
     /// Exact DXF version (for R2013+/R2018+ sub-version checks).
     dxf_version: DxfVersion,
-    /// Code page for non-Unicode strings: the encoding to transcode with,
-    /// plus whether it is the drawing's declared code page or a stand-in.
-    /// The MIF gate in `decode_legacy_text` needs both; see
-    /// [`crate::io::dxf::code_page::LegacyCodePage`].
-    encoding: crate::io::dxf::code_page::LegacyCodePage,
+    /// Text encoding for non-Unicode strings.
+    encoding: crate::io::dxf::code_page::LegacyEncoding,
     /// Whether the text stream is empty (R2007+ flag).
     pub is_empty: bool,
     /// Text stream bit position for R2007+ three-stream merge.
@@ -47,6 +45,10 @@ pub struct DwgBitReader {
     text_stream_pos: i64,
     /// One-past-the-end bit position of the R2007+ text stream.
     text_stream_end_pos: i64,
+    /// Exclusive boundary of this stream, which may end inside a byte.
+    end_bit: i64,
+    /// First decoding error; checked before accepting a decoded record.
+    error: std::sync::OnceLock<String>,
 }
 
 impl DwgBitReader {
@@ -60,15 +62,15 @@ impl DwgBitReader {
     /// sharing avoids three full record copies per cursor set.
     pub fn from_shared(data: Arc<[u8]>, version: DwgVersion, dxf_version: DxfVersion) -> Self {
         Self {
+            end_bit: (data.len() as i64).saturating_mul(8),
+            error: std::sync::OnceLock::new(),
             data,
             position: 0,
             bit_shift: 0,
             last_byte: 0,
             version,
             dxf_version,
-            // No code page was named, so no escape is presumed to be
-            // content. `from_shared_with_encoding` supplies the real one.
-            encoding: crate::io::dxf::code_page::LegacyCodePage::unknown(encoding_rs::WINDOWS_1252),
+            encoding: encoding_rs::WINDOWS_1252.into(),
             is_empty: false,
             text_stream_pos: -1,
             text_stream_end_pos: -1,
@@ -79,10 +81,10 @@ impl DwgBitReader {
         data: Arc<[u8]>,
         version: DwgVersion,
         dxf_version: DxfVersion,
-        encoding: crate::io::dxf::code_page::LegacyCodePage,
+        encoding: impl Into<crate::io::dxf::code_page::LegacyEncoding>,
     ) -> Self {
         let mut reader = Self::from_shared(data, version, dxf_version);
-        reader.encoding = encoding;
+        reader.encoding = encoding.into();
         reader
     }
 
@@ -91,17 +93,17 @@ impl DwgBitReader {
         data: Vec<u8>,
         version: DwgVersion,
         dxf_version: DxfVersion,
-        encoding: crate::io::dxf::code_page::LegacyCodePage,
+        encoding: impl Into<crate::io::dxf::code_page::LegacyEncoding>,
     ) -> Self {
         let mut r = Self::new(data, version, dxf_version);
-        r.encoding = encoding;
+        r.encoding = encoding.into();
         r
     }
 
     /// Decode bytes using the document's legacy text code page.
     pub fn decode_legacy_text(&self, bytes: &[u8]) -> String {
         let (decoded, _, _) = self.encoding.decode(bytes);
-        crate::io::dxf::code_page::decode_mif_escapes(&decoded, self.encoding)
+        self.encoding.decode_escapes(&decoded)
     }
 
     /// Get the DWG version.
@@ -141,6 +143,64 @@ impl DwgBitReader {
         self.data.len()
     }
 
+    /// Check the accumulated stream error without changing cursor state.
+    pub fn check_error(&self) -> crate::error::Result<()> {
+        match self.error.get() {
+            Some(message) => Err(crate::error::DxfError::Parse(message.clone())),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn has_error(&self) -> bool {
+        self.error.get().is_some()
+    }
+
+    pub(crate) fn invalidate(&self, message: impl Into<String>) {
+        self.error.get_or_init(|| message.into());
+    }
+
+    pub(crate) fn set_end_bit(&mut self, end: i64) {
+        if end < 0 || end > (self.data.len() as i64).saturating_mul(8) {
+            self.invalidate("DWG stream boundary exceeds record data");
+        } else {
+            self.end_bit = end;
+        }
+    }
+
+    pub fn remaining_bits(&self) -> i64 {
+        if self.has_error() {
+            return 0;
+        }
+        self.end_bit.saturating_sub(self.position_in_bits()).max(0)
+    }
+
+    #[inline]
+    fn require_bits(&self, bits: usize) -> bool {
+        if self.has_error() {
+            return false;
+        }
+        if self.position_in_bits() < 0 || bits as u128 > self.remaining_bits() as u128 {
+            self.invalidate(format!(
+                "Truncated DWG stream at bit {}: requested {} bits, {} remain",
+                self.position_in_bits(),
+                bits,
+                self.remaining_bits()
+            ));
+            return false;
+        }
+        true
+    }
+
+    fn require_bytes(&self, length: usize) -> bool {
+        match length.checked_mul(8) {
+            Some(bits) => self.require_bits(bits),
+            None => {
+                self.invalidate("DWG byte length overflows stream bounds");
+                false
+            }
+        }
+    }
+
     /// Clone the entire underlying data buffer.
     ///
     /// Used to extract the raw merged-stream record bytes for
@@ -151,12 +211,20 @@ impl DwgBitReader {
 
     /// Set the stream position (byte-level) and reset bit shift.
     pub fn set_position(&mut self, pos: usize) {
+        if pos > self.data.len() {
+            self.invalidate("DWG seek exceeds input data");
+            return;
+        }
         self.position = pos;
         self.bit_shift = 0;
     }
 
     /// Set position by bit offset.
     pub fn set_position_in_bits(&mut self, pos: i64) {
+        if pos < 0 || pos > (self.data.len() as i64).saturating_mul(8) {
+            self.invalidate("DWG bit seek exceeds input data");
+            return;
+        }
         self.position = (pos >> 3) as usize;
         self.bit_shift = (pos & 7) as u8;
 
@@ -176,6 +244,7 @@ impl DwgBitReader {
             self.last_byte = self.data[self.position];
             self.position += 1;
         } else {
+            self.invalidate("Read past the end of DWG data");
             self.last_byte = 0;
         }
     }
@@ -192,6 +261,9 @@ impl DwgBitReader {
     ///
     /// Port of `DwgStreamReaderBase.ReadByte`.
     pub fn read_byte(&mut self) -> u8 {
+        if !self.require_bits(8) {
+            return 0;
+        }
         if self.bit_shift == 0 {
             self.advance_byte();
             self.last_byte
@@ -204,6 +276,9 @@ impl DwgBitReader {
 
     /// Read `length` bytes, applying the current bit shift.
     pub fn read_bytes(&mut self, length: usize) -> Vec<u8> {
+        if !self.require_bytes(length) {
+            return Vec::new();
+        }
         let mut arr = vec![0u8; length];
         self.apply_shift_to_arr(&mut arr);
         arr
@@ -220,6 +295,9 @@ impl DwgBitReader {
 
     /// Read a single bit (B type).
     pub fn read_bit(&mut self) -> bool {
+        if !self.require_bits(1) {
+            return false;
+        }
         if self.bit_shift == 0 {
             self.advance_byte();
             let result = (self.last_byte & 128) == 128;
@@ -244,6 +322,9 @@ impl DwgBitReader {
 
     /// Read a 2-bit value (BB type).
     pub fn read_2bits(&mut self) -> u8 {
+        if !self.require_bits(2) {
+            return 0;
+        }
         if self.bit_shift == 0 {
             self.advance_byte();
             let value = self.last_byte >> 6;
@@ -307,6 +388,26 @@ impl DwgBitReader {
         }
     }
 
+    /// Read a BitShort when the stream may end before the value is complete.
+    ///
+    /// Unlike `read_bit_short`, this leaves the reader valid and returns
+    /// `None` when the prefix or its payload is truncated.  Auxiliary DWG
+    /// records sometimes omit optional tails, so callers can keep the fields
+    /// decoded before that tail without turning the whole record into an
+    /// unknown object.
+    pub fn try_read_bit_short(&mut self) -> Option<i16> {
+        if self.remaining_bits() < 2 {
+            return None;
+        }
+        match self.read_2bits() {
+            0 if self.remaining_bits() >= 16 => Some(self.read_raw_short()),
+            1 if self.remaining_bits() >= 8 => Some(self.read_byte() as i16),
+            2 => Some(0),
+            3 => Some(256),
+            _ => None,
+        }
+    }
+
     /// Read a BitShort and interpret as bool (non-zero = true).
     pub fn read_bit_short_as_bool(&mut self) -> bool {
         self.read_bit_short() != 0
@@ -331,6 +432,19 @@ impl DwgBitReader {
                 // 11: not used
                 0 // graceful fallback
             }
+        }
+    }
+
+    /// Read a BitLong without recording an error for a truncated payload.
+    pub fn try_read_bit_long(&mut self) -> Option<i32> {
+        if self.remaining_bits() < 2 {
+            return None;
+        }
+        match self.read_2bits() {
+            0 if self.remaining_bits() >= 32 => Some(self.read_raw_long() as i32),
+            1 if self.remaining_bits() >= 8 => Some(self.read_byte() as i32),
+            2 => Some(0),
+            _ => Some(0),
         }
     }
 
@@ -414,44 +528,40 @@ impl DwgBitReader {
 
     /// Read a raw short (RS type) — 2 bytes, little-endian.
     pub fn read_raw_short(&mut self) -> i16 {
-        let b0 = self.read_byte() as u16;
-        let b1 = self.read_byte() as u16;
-        (b0 | (b1 << 8)) as i16
+        i16::from_le_bytes([self.read_byte(), self.read_byte()])
     }
 
     /// Read a raw unsigned short.
     pub fn read_raw_ushort(&mut self) -> u16 {
-        let b0 = self.read_byte() as u16;
-        let b1 = self.read_byte() as u16;
-        b0 | (b1 << 8)
+        u16::from_le_bytes([self.read_byte(), self.read_byte()])
     }
 
-    /// Read a raw long (RL type) — 4 bytes, little-endian, returns as i64 (matching the reference ReadRawLong → long).
+    /// Read a raw long (RL type).
+    ///
+    /// The DWG field is a signed 32-bit integer. The return type is `i64` so
+    /// callers can use it next to handles without an extra cast. The sign of
+    /// the 32-bit value is preserved.
     pub fn read_raw_long(&mut self) -> i64 {
-        let b0 = self.read_byte() as u32;
-        let b1 = self.read_byte() as u32;
-        let b2 = self.read_byte() as u32;
-        let b3 = self.read_byte() as u32;
-        (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) as i32 as i64
+        i64::from(i32::from_le_bytes([
+            self.read_byte(),
+            self.read_byte(),
+            self.read_byte(),
+            self.read_byte(),
+        ]))
     }
 
-    /// Read a raw unsigned long (RD is actually 4 bytes in the reference ReadRawULong).
+    /// Read a raw unsigned long. The DWG field is 4 bytes.
     pub fn read_raw_ulong(&mut self) -> u64 {
-        let b0 = self.read_byte() as u64;
-        let b1 = self.read_byte() as u64;
-        let b2 = self.read_byte() as u64;
-        let b3 = self.read_byte() as u64;
-        b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        u64::from(u32::from_le_bytes([
+            self.read_byte(),
+            self.read_byte(),
+            self.read_byte(),
+            self.read_byte(),
+        ]))
     }
 
     /// Read a raw double (RD type) — 8 bytes, little-endian IEEE 754.
     pub fn read_raw_double(&mut self) -> f64 {
-        // Read directly into a stack array: this is the hottest primitive in
-        // pass-2 decoding (every coordinate goes through here), and the
-        // previous `read_bytes(8)` did a heap allocation per double. On a
-        // 9 MB drawing (~82k records, ~1.6M doubles) that was ~45% of load
-        // time and, with rayon workers contending on the allocator lock,
-        // dominated the profile. Behaviour is byte-for-byte identical.
         let mut arr = [0u8; 8];
         self.apply_shift_to_arr(&mut arr);
         f64::from_le_bytes(arr)
@@ -560,6 +670,10 @@ impl DwgBitReader {
             loop {
                 shift += 7;
                 let b = self.read_byte();
+                if shift >= 64 || (b & 0x7F) as u64 > (u64::MAX >> shift) {
+                    self.invalidate("DWG modular char overflow");
+                    return 0;
+                }
                 value |= ((b & 0x7F) as u64) << shift;
                 if (b & 0x80) == 0 {
                     break;
@@ -592,6 +706,10 @@ impl DwgBitReader {
             loop {
                 total_shift += 7;
                 let b = self.read_byte();
+                if total_shift >= 63 {
+                    self.invalidate("DWG signed modular char overflow");
+                    return 0;
+                }
                 if (b & 0x80) != 0 {
                     sum |= ((b & 0x7F) as i64) << total_shift;
                 } else {
@@ -614,6 +732,10 @@ impl DwgBitReader {
         let mut value = (b1 as i32) | (((b2 & 0x7F) as i32) << 8);
 
         while !flag {
+            if shift > 16 {
+                self.invalidate("DWG modular short overflow");
+                return 0;
+            }
             let b1 = self.read_byte();
             let b2 = self.read_byte();
             flag = (b2 & 0x80) == 0;
@@ -685,14 +807,16 @@ impl DwgBitReader {
 
     /// Read `length` big-endian handle bytes and convert to u64.
     fn read_handle_bytes(&mut self, length: usize) -> u64 {
-        // Handle values are at most 8 bytes (u64). If counter > 8
-        // we're reading corrupt data; clamp to avoid panics.
-        let length = length.min(8);
+        // Handle values are at most 8 bytes (u64). Reject a corrupt length.
+        if length > 8 {
+            self.invalidate("DWG handle exceeds 64 bits");
+            return 0;
+        }
         let raw = self.read_bytes(length);
         // Convert from big-endian to u64
         let mut arr = [0u8; 8];
-        for i in 0..length {
-            arr[length - 1 - i] = raw[i];
+        for (i, byte) in raw.iter().enumerate() {
+            arr[length - 1 - i] = *byte;
         }
         u64::from_le_bytes(arr)
     }
@@ -729,11 +853,9 @@ impl DwgBitReader {
             let _encoding_key = self.read_byte();
             let bytes = self.read_bytes(text_length as usize);
             // Decode using the reader's encoding; legacy strings may embed
-            // MIF \U+XXXX escapes for characters outside the code page.
-            // Escapes naming a representable character are content, not
-            // transport, and stay literal.
+            // CIF \U+XXXX escapes for characters outside the code page.
             let (decoded, _, _) = self.encoding.decode(&bytes);
-            crate::io::dxf::code_page::decode_mif_escapes(&decoded, self.encoding)
+            self.encoding.decode_escapes(&decoded)
         }
     }
 
@@ -761,7 +883,7 @@ impl DwgBitReader {
                         .chunks_exact(2)
                         .map(|c| u16::from_le_bytes([c[0], c[1]]))
                         .collect();
-                    String::from_utf16_lossy(&utf16).replace('\0', "")
+                    decode_mif(String::from_utf16_lossy(&utf16).replace('\0', ""))
                 };
                 // Save updated text stream position
                 self.text_stream_pos = self.position_in_bits();
@@ -780,7 +902,7 @@ impl DwgBitReader {
                     .chunks_exact(2)
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect();
-                String::from_utf16_lossy(&utf16).replace('\0', "")
+                decode_mif(String::from_utf16_lossy(&utf16).replace('\0', ""))
             }
         } else {
             // Pre-R2007: BS length + encoded bytes
@@ -790,10 +912,62 @@ impl DwgBitReader {
             }
             let bytes = self.read_bytes(length as usize);
             let (decoded, _, _) = self.encoding.decode(&bytes);
-            // Legacy strings may embed MIF \U+XXXX escapes for characters
-            // outside the code page; only those decode back to Unicode.
-            crate::io::dxf::code_page::decode_mif_escapes(&decoded.replace('\0', ""), self.encoding)
+            // Legacy strings may embed CIF \U+XXXX escapes for characters
+            // outside the code page — decode them into Unicode chars.
+            self.encoding.decode_escapes(&decoded.replace('\0', ""))
         }
+    }
+
+    /// Read variable text without poisoning the stream when an optional value
+    /// is truncated.  The cursor may advance over a partial prefix, but no
+    /// stream error is recorded and the caller can continue with another
+    /// stream (for example, the main data stream after a text-stream tail).
+    pub fn try_read_variable_text(&mut self) -> Option<String> {
+        if self.dxf_version >= DxfVersion::AC1021 {
+            if self.text_stream_pos >= 0 {
+                let saved_pos = self.position_in_bits();
+                self.set_position_in_bits(self.text_stream_pos);
+                let result = self.try_read_unicode_text();
+                self.text_stream_pos = self.position_in_bits();
+                self.set_position_in_bits(saved_pos);
+                result
+            } else {
+                self.try_read_unicode_text()
+            }
+        } else {
+            let Some(length) = self.try_read_bit_short() else {
+                return None;
+            };
+            if length <= 0 {
+                return Some(String::new());
+            }
+            let length = length as usize;
+            if self.remaining_bits() < (length as i64).saturating_mul(8) {
+                return None;
+            }
+            let bytes = self.read_bytes(length);
+            let (decoded, _, _) = self.encoding.decode(&bytes);
+            Some(self.encoding.decode_escapes(&decoded.replace('\0', "")))
+        }
+    }
+
+    fn try_read_unicode_text(&mut self) -> Option<String> {
+        let char_count = self.try_read_bit_short()?;
+        if char_count <= 0 {
+            return Some(String::new());
+        }
+        let byte_count = (char_count as usize).checked_mul(2)?;
+        if self.remaining_bits() < (byte_count as i64).saturating_mul(8) {
+            return None;
+        }
+        let bytes = self.read_bytes(byte_count);
+        let utf16: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        Some(decode_mif(
+            String::from_utf16_lossy(&utf16).replace('\0', ""),
+        ))
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -843,74 +1017,39 @@ impl DwgBitReader {
         }
     }
 
-    /// Read an EnColor (entity color with transparency).
+    /// Read the entity color (ENC) record described by ODA §2.11.
     ///
-    /// Returns (Color, Transparency, bool has_color_handle).
+    /// AutoCAD probes (reC/a2004..a2018) resolve two ambiguities in the
+    /// specification: the packed color is BL, and a DBCOLOR reference suppresses
+    /// that BL. Transparency follows the packed color when both are present.
+    /// The caller reads the optional DBCOLOR handle from the handle stream.
     pub fn read_en_color(&mut self) -> (Color, Transparency, bool) {
-        if self.dxf_version >= DxfVersion::AC1018 {
-            // R2004+
-            let size = self.read_bit_short();
-            let mut transparency = Transparency::BY_LAYER;
+        let word = self.read_bit_short();
+        if self.dxf_version < DxfVersion::AC1018 {
+            return (Color::from_index(word), Transparency::BY_LAYER, false);
+        }
 
-            if size != 0 {
-                let flags = (size as u16) & 0xFF00;
-
-                // 0x4000: AcDbColor handle reference (read from the handle
-                // section by the caller). When present, NO rgb value follows
-                // in the data stream.
-                let is_book_color = (flags & 0x4000) > 0;
-
-                // A true/complex color rgb (BL) is present ONLY when the color
-                // is not a book-color reference (0x4000) but has the 0x8000
-                // flag. A book color carries its rgb via the handle instead.
-                //
-                // Field order in the data stream is rgb/color FIRST, then the
-                // transparency BL. (An entity with both a true colour and a
-                // transparency has flags 0x8000|0x2000 = 0xA000; the rgb long
-                // precedes the transparency long.)
-                let color = if is_book_color {
-                    Color::from_index((size & 0x0FFF) as i16)
-                } else if (flags & 0x8000) > 0 {
-                    // Complex/true color BL follows in main stream.
-                    // The BL uses the same packed format as CMC:
-                    //   0xC0000000 = ByLayer, flag byte bit 0 set = ACI index,
-                    //   otherwise = true RGB color.
-                    let rgb = self.read_bit_long() as u32;
-                    let arr = rgb.to_le_bytes();
-                    if rgb == 0xC000_0000 {
-                        Color::ByLayer
-                    } else if (rgb & 0x0100_0000) != 0 {
-                        // Indexed color (flag byte 0xC3 has bit 0 set)
-                        Color::from_index(arr[0] as i16)
-                    } else {
-                        // True color RGB (flag byte 0xC2)
-                        Color::from_rgb(arr[2], arr[1], arr[0])
-                    }
-                } else {
-                    // ACI color index (lower 12 bits)
-                    Color::from_index((size & 0x0FFF) as i16)
-                };
-
-                // 0x2000: transparency (BL) — read AFTER the rgb/color-book
-                // value, matching the entity ENC field order.
-                if (flags & 0x2000) > 0 {
-                    let value = self.read_bit_long();
-                    transparency = Transparency::from_alpha_value(value as u32);
-                }
-
-                (color, transparency, is_book_color)
-            } else {
-                (Color::ByBlock, Transparency::BY_LAYER, false)
+        let word = word as u16;
+        let has_book = word & 0x4000 != 0;
+        let has_rgb = word & 0x8000 != 0 && !has_book;
+        let color = if has_rgb {
+            let packed = self.read_bit_long() as u32;
+            match packed >> 24 {
+                0xC0 => Color::ByLayer,
+                0xC1 => Color::ByBlock,
+                0xC3 => Color::from_index((packed & 0xFF) as i16),
+                0xC8 => Color::None,
+                _ => Color::from_true_color_value(packed as i32),
             }
         } else {
-            // Pre-R2004
-            let color_number = self.read_bit_short();
-            (
-                Color::from_index(color_number),
-                Transparency::BY_LAYER,
-                false,
-            )
-        }
+            Color::from_index((word & 0x1FFF) as i16)
+        };
+        let transparency = if word & 0x2000 != 0 {
+            Transparency::from_alpha_value(self.read_bit_long() as u32)
+        } else {
+            Transparency::BY_LAYER
+        };
+        (color, transparency, has_book)
     }
 
     /// Read a color by index (BS → Color).
@@ -989,9 +1128,15 @@ impl DwgBitReader {
             // String stream present
             let (length, size) = self.apply_flag_to_position(position);
             let start_pos = length - size;
+            if start_pos < 0 || length > position || position >= self.end_bit {
+                self.invalidate("Invalid DWG text-stream size");
+                self.is_empty = true;
+                return 0;
+            }
             self.text_stream_pos = start_pos;
             self.text_stream_end_pos = length;
             self.set_position_in_bits(start_pos);
+            self.set_end_bit(length);
             start_pos
         } else {
             // No string stream — mark as empty and go to end
@@ -1006,7 +1151,7 @@ impl DwgBitReader {
 
     /// Bits remaining in the separate R2007+ text stream.
     pub fn text_stream_remaining_bits(&self) -> i64 {
-        if self.text_stream_pos < 0 || self.text_stream_end_pos < 0 {
+        if self.has_error() || self.text_stream_pos < 0 || self.text_stream_end_pos < 0 {
             0
         } else {
             (self.text_stream_end_pos - self.text_stream_pos).max(0)
@@ -1051,6 +1196,10 @@ impl DwgBitReader {
     /// Apply the current bit shift to a raw byte array read from the stream.
     fn apply_shift_to_arr(&mut self, arr: &mut [u8]) {
         let length = arr.len();
+        if !self.require_bytes(length) {
+            arr.fill(0);
+            return;
+        }
         // Read raw bytes from stream
         let start = self.position;
         if start >= self.data.len() {
@@ -1311,7 +1460,7 @@ mod tests {
         let mut w = make_writer(DxfVersion::AC1015);
         let reference = 3.14;
         // Case 00: stored == reference → 2 bits
-        // Writer: write_bit_double_with_default(stored=3.14, reference=3.14)
+        // Writer stores 3.14 against the reference default.
         w.write_bit_double_with_default(3.14, reference);
         // Case 11: stored=100.5 is very different from reference=3.14 → full RD
         w.write_bit_double_with_default(100.5, reference);
@@ -1321,5 +1470,18 @@ mod tests {
         assert!((v1 - 3.14).abs() < 1e-10, "v1 = {}", v1);
         let v2 = r.read_bit_double_with_default(reference);
         assert!((v2 - 100.5).abs() < 1e-10, "v2 = {}", v2);
+    }
+}
+
+/// R2007+ text is UTF-16, which can hold any character, so a `\U+XXXX` in it
+/// can only be content (AutoCAD stores `94\U+00B0` as nine literal characters
+/// in an R2018 save, where an R2004 save of the same drawing has the escape on
+/// disk and the code page holds the degree sign). Only the `\M+` double-byte
+/// escapes are transport here.
+fn decode_mif(text: String) -> String {
+    if text.contains("\\M+") {
+        crate::io::dxf::code_page::decode_mif_escapes(&text)
+    } else {
+        text
     }
 }
