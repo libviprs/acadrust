@@ -25,6 +25,7 @@ use crate::types::{Color, DxfVersion, Handle, LineWeight, Vector3};
 use crate::xdata::{ExtendedData, ExtendedDataRecord, XDataValue};
 
 use super::stream_writer::{DxfStreamWriter, DxfStreamWriterExt};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 /// Sanitize a symbol table record name: strip control characters and
@@ -5108,18 +5109,20 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
 
         // Associated entities (boundary handles)
         // Filter to only valid handles if valid_handles is populated
-        let valid_boundary_handles: Vec<Handle> = if self.valid_handles.is_empty() {
-            path.boundary_handles.clone()
+        let valid_boundary_handles: Cow<'_, [Handle]> = if self.valid_handles.is_empty() {
+            Cow::Borrowed(&path.boundary_handles)
         } else {
-            path.boundary_handles
-                .iter()
-                .copied()
-                .filter(|h| *h != Handle::NULL && self.valid_handles.contains(h))
-                .collect()
+            Cow::Owned(
+                path.boundary_handles
+                    .iter()
+                    .copied()
+                    .filter(|h| *h != Handle::NULL && self.valid_handles.contains(h))
+                    .collect(),
+            )
         };
         self.writer
             .write_i32(97, valid_boundary_handles.len() as i32)?;
-        for h in &valid_boundary_handles {
+        for h in valid_boundary_handles.as_ref() {
             self.writer.write_handle(330, *h)?;
         }
 
