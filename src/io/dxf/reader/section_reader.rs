@@ -9804,6 +9804,11 @@ impl<'a> SectionReader<'a> {
                         layer.line_weight = LineWeight::from_value(lw);
                     }
                 }
+                390 => {
+                    if let Ok(h) = u64::from_str_radix(pair.value_string.trim(), 16) {
+                        layer.plotstyle_handle = Handle::new(h);
+                    }
+                }
                 1001 => {
                     self.reader.push_back(pair);
                     let (xdata, next_pair) = self.read_extended_data()?;
@@ -11680,6 +11685,14 @@ impl<'a> SectionReader<'a> {
             370 => {
                 if let Some(weight) = pair.as_i16() {
                     common.line_weight = LineWeight::from_value(weight);
+                }
+                Ok(true)
+            }
+            // Named plot style: the handle of its ACDBPLACEHOLDER (R2000+).
+            390 => {
+                if let Ok(h) = u64::from_str_radix(pair.value_string.trim(), 16) {
+                    common.plotstyle_flags = 0b11;
+                    common.plotstyle_handle = Some(Handle::new(h));
                 }
                 Ok(true)
             }
