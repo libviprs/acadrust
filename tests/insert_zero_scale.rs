@@ -26,3 +26,16 @@ fn a_stored_zero_scale_reads_back_as_zero() {
     assert_eq!(ins[0].y_scale().to_bits(), 0.0f64.to_bits(), "the file stores 0.0, the reader returned {:e}", ins[0].y_scale());
     assert_eq!(ins[0].z_scale().to_bits(), 1.0f64.to_bits());
 }
+#[test]
+fn the_checked_setters_still_refuse_zero() {
+    let mut i = acadrust::entities::Insert::new("B", acadrust::types::Vector3::new(0.0, 0.0, 0.0));
+    i.set_y_scale(0.0);
+    assert_eq!(i.y_scale(), 1e-12);
+}
+
+#[test]
+fn the_unchecked_setter_stores_what_it_is_given() {
+    let mut i = acadrust::entities::Insert::new("B", acadrust::types::Vector3::new(0.0, 0.0, 0.0));
+    i.set_scale_unchecked(1.0, 0.0, -2.5);
+    assert_eq!((i.x_scale(), i.y_scale(), i.z_scale()), (1.0, 0.0, -2.5));
+}
