@@ -275,7 +275,7 @@ impl DwgObjectReader {
     }
 
     /// Decode an already captured merged record without adding file framing.
-    pub(crate) fn read_raw_record(
+    pub fn read_raw_record(
         &self,
         data: &[u8],
         handle_bits: i64,
