@@ -241,7 +241,7 @@ fn read_dgn_stroke_pattern_dxf(
     let mut end_widths = take_all_dgn_properties(properties, subclass, 45);
     let mut width_modes = take_all_dgn_properties(properties, subclass, 94);
     let mut cap_modes = take_all_dgn_properties(properties, subclass, 95);
-    let mut strokes = Vec::with_capacity(count);
+    let mut strokes = Vec::with_capacity(count.min(100_000));
     for _ in 0..count {
         strokes.push(DgnLsStroke {
             is_dash: dgn_bool(take_first(&mut dash)),
@@ -15916,13 +15916,17 @@ impl<'a> SectionReader<'a> {
                 }
                 97 => {
                     // Number of source boundary objects
-                    let num_handles = pair.as_i32().unwrap_or(0);
+                    let num_handles = pair.as_i32().unwrap_or(0).max(0) as usize;
+                    current_path_handles.reserve(num_handles.min(100_000));
                     for _ in 0..num_handles {
                         if let Some(hp) = self.reader.read_pair()? {
                             if hp.code == 330 {
                                 if let Some(h) = hp.as_handle() {
                                     current_path_handles.push(Handle::new(h));
                                 }
+                            } else {
+                                self.reader.push_back(hp);
+                                break;
                             }
                         }
                     }
@@ -16237,7 +16241,9 @@ impl<'a> SectionReader<'a> {
         }
 
         // Read knot values (code 40)
-        for _ in 0..num_knots {
+        let knot_count = num_knots.max(0) as usize;
+        edge.knots.reserve(knot_count.min(100_000));
+        for _ in 0..knot_count {
             if let Some(p) = self.reader.read_pair()? {
                 if p.code == 40 {
                     edge.knots.push(p.as_double().unwrap_or(0.0));
@@ -16249,7 +16255,9 @@ impl<'a> SectionReader<'a> {
         }
 
         // Read control points (codes 10/20, with optional weight 42)
-        for _ in 0..num_control_points {
+        let control_point_count = num_control_points.max(0) as usize;
+        edge.control_points.reserve(control_point_count.min(100_000));
+        for _ in 0..control_point_count {
             let mut x = 0.0;
             let mut y = 0.0;
             let mut w = 1.0;
@@ -16259,7 +16267,7 @@ impl<'a> SectionReader<'a> {
                     x = p.as_double().unwrap_or(0.0);
                 } else {
                     self.reader.push_back(p);
-                    continue;
+                    break;
                 }
             }
             if let Some(p) = self.reader.read_pair()? {
@@ -16267,6 +16275,7 @@ impl<'a> SectionReader<'a> {
                     y = p.as_double().unwrap_or(0.0);
                 } else {
                     self.reader.push_back(p);
+                    break;
                 }
             }
             // Peek for optional weight (code 42)
@@ -16290,7 +16299,9 @@ impl<'a> SectionReader<'a> {
         }
 
         // Read fit points (codes 11/21)
-        for _ in 0..num_fit_points {
+        let fit_point_count = num_fit_points.max(0) as usize;
+        edge.fit_points.reserve(fit_point_count.min(100_000));
+        for _ in 0..fit_point_count {
             let mut x = 0.0;
             let mut y = 0.0;
             if let Some(p) = self.reader.read_pair()? {
@@ -16298,7 +16309,7 @@ impl<'a> SectionReader<'a> {
                     x = p.as_double().unwrap_or(0.0);
                 } else {
                     self.reader.push_back(p);
-                    continue;
+                    break;
                 }
             }
             if let Some(p) = self.reader.read_pair()? {
@@ -16306,6 +16317,7 @@ impl<'a> SectionReader<'a> {
                     y = p.as_double().unwrap_or(0.0);
                 } else {
                     self.reader.push_back(p);
+                    break;
                 }
             }
             edge.fit_points.push(Vector2::new(x, y));
@@ -16351,13 +16363,14 @@ impl<'a> SectionReader<'a> {
             }
         }
 
+        let vertex_count = num_vertices.max(0) as usize;
         let mut edge = crate::entities::hatch::PolylineEdge {
-            vertices: Vec::with_capacity(num_vertices as usize),
+            vertices: Vec::with_capacity(vertex_count.min(100_000)),
             is_closed,
         };
 
         // Read vertices: 10/20 (coords), optional 42 (bulge)
-        for _ in 0..num_vertices {
+        for _ in 0..vertex_count {
             let mut x = 0.0;
             let mut y = 0.0;
             let mut bulge = 0.0;
@@ -16366,7 +16379,7 @@ impl<'a> SectionReader<'a> {
                     x = p.as_double().unwrap_or(0.0);
                 } else {
                     self.reader.push_back(p);
-                    continue;
+                    break;
                 }
             }
             if let Some(p) = self.reader.read_pair()? {
@@ -16374,6 +16387,7 @@ impl<'a> SectionReader<'a> {
                     y = p.as_double().unwrap_or(0.0);
                 } else {
                     self.reader.push_back(p);
+                    break;
                 }
             }
             if has_bulge {
