@@ -13449,6 +13449,7 @@ impl<'a> SectionReader<'a> {
         let mut x_direction = PointReader::new();
         let mut rotation_from_code50 = None;
         let mut reading_columns = false;
+        let mut has_group_71 = false;
 
         while let Some(pair) = self.reader.read_pair()? {
             if pair.code == 0 {
@@ -13524,6 +13525,7 @@ impl<'a> SectionReader<'a> {
                             9 => AttachmentPoint::BottomRight,
                             _ => AttachmentPoint::TopLeft,
                         };
+                        has_group_71 = true;
                     }
                 }
                 72 => {
@@ -13626,14 +13628,16 @@ impl<'a> SectionReader<'a> {
                 }
                 // R2018+ column/layout companion — its codes shadow the
                 // entity's own, so it must not fall through this match. The
-                // embedded object carries the MTEXT column layout, and its
-                // attachment point is the one CAD applications render from
-                // (ZWCAD writes a different value in group 71 for such texts).
+                // embedded object carries the MTEXT column layout. Group 70
+                // provides a fallback attachment point when the entity's group 71
+                // is absent; when group 71 is present it takes precedence (#249).
                 101 => {
                     let (columns, attachment) = self.read_mtext_embedded_object()?;
                     mtext.column_data = columns;
-                    if let Some(attachment) = attachment {
-                        mtext.attachment_point = attachment;
+                    if !has_group_71 {
+                        if let Some(attachment) = attachment {
+                            mtext.attachment_point = attachment;
+                        }
                     }
                     reading_columns = false;
                 }
