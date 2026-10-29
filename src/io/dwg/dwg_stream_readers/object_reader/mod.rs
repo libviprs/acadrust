@@ -822,6 +822,11 @@ impl DwgObjectReader {
         self.handle_map.get(&handle).copied()
     }
 
+    /// Replace the handle map, keeping the object section.
+    pub(crate) fn set_handle_map(&mut self, handle_map: HashMap<u64, i64>) {
+        self.handle_map = handle_map;
+    }
+
     /// Get the DWG version.
     pub fn version(&self) -> DwgVersion {
         self.version
