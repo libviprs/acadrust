@@ -2451,7 +2451,7 @@ impl<R: Read + Seek> DwgReader<R> {
         if compr_len < 0 {
             // Negative ComprLen means data is stored uncompressed (raw).
             // |ComprLen| = raw data length. Copy directly from offset 0x20.
-            let raw_len = (-compr_len) as usize;
+            let raw_len = compr_len.unsigned_abs() as usize;
             let src_start = 32; // offset 0x20 in decoded data
             let copy_len = raw_len
                 .min(0x110)
