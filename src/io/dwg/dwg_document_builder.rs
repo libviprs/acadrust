@@ -1339,6 +1339,38 @@ impl DwgDocumentBuilder {
                 }
             }
 
+            // The header names the model and paper space records by handle. A damaged name
+            // would turn the drawing into an ordinary block: give the records back their
+            // canonical names, and report it.
+            for (active, canonical) in [
+                (active_model, "*Model_Space"),
+                (active_paper, "*Paper_Space"),
+            ] {
+                if active.is_null() {
+                    continue;
+                }
+                for entry in &mut parsed_entries {
+                    let ParsedEntry::Block(h, data) = entry else {
+                        continue;
+                    };
+                    if Handle::from(*h) != active || data.name.eq_ignore_ascii_case(canonical) {
+                        continue;
+                    }
+                    let message = format!(
+                        "Block record {:#X} is the header's {canonical} but is named {:?}; renamed {canonical}",
+                        *h, data.name
+                    );
+                    self.notifications
+                        .notify(NotificationType::Warning, message.clone());
+                    let mut diagnostic =
+                        ReadDiagnostic::new("space-block-renamed", ReadStage::Objects, message);
+                    diagnostic.record_handle = Some(*h);
+                    push_read_diagnostic(&mut diagnostics, diagnostic);
+                    data.name = canonical.to_string();
+                    maps.blocks.insert(*h, data.name.clone());
+                }
+            }
+
             // Collect (index, handle, name) for all Block entries
             let block_info: Vec<(usize, u64, String)> = parsed_entries
                 .iter()
@@ -2397,10 +2429,10 @@ impl DwgDocumentBuilder {
                         e.vertices = verts
                             .into_iter()
                             .filter_map(|v| {
-                                if let PendingVertex::V3D(d, _ec) = v {
+                                if let PendingVertex::V3D(d, ec) = v {
                                     Some(crate::entities::polyline3d::Vertex3DPolyline {
                                         handle: d.handle,
-                                        layer: String::new(),
+                                        layer: ec.layer,
                                         position: d.position,
                                         flags: d.flags as i32,
                                     })
@@ -2448,13 +2480,11 @@ impl DwgDocumentBuilder {
                         e.vertices = verts
                             .into_iter()
                             .filter_map(|v| {
-                                if let PendingVertex::V3D(d, _ec) = v {
-                                    let mut c = crate::entities::EntityCommon::new();
-                                    c.handle = d.handle;
+                                if let PendingVertex::V3D(d, ec) = v {
                                     Some(crate::entities::polygon_mesh::PolygonMeshVertex {
-                                        common: c,
+                                        common: *ec,
                                         location: d.position,
-                                        flags: 0,
+                                        flags: i16::from(d.flags),
                                     })
                                 } else {
                                     None
