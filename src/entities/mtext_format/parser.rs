@@ -82,6 +82,14 @@ impl MTextParser {
         self.ctx_stack.last_mut().unwrap()
     }
 
+    /// Hand the current paragraph to the document, recording the span
+    /// properties in effect at its end (see [`MTextParagraph::end_properties`]).
+    fn end_paragraph(&mut self) {
+        let mut paragraph = std::mem::take(&mut self.current_paragraph);
+        paragraph.end_properties = self.current_props().clone();
+        self.document.push_paragraph(paragraph);
+    }
+
     /// Parse with full MTEXT formatting: all control codes are recognized
     /// whether or not the content is wrapped in `{...}`.
     fn parse_formatted(mut self, merge_spans: bool) -> MTextDocument {
@@ -114,14 +122,20 @@ impl MTextParser {
         // starts a new span), `%%d`/`%%p`/`%%c` and `%%%%` resolve to symbols,
         // `%%nnn` is a decimal character code, and `\P`/`\p` break paragraphs.
         // Underscoring/overscoring turn off automatically at the string end.
+        let stroke_properties = |u: bool, o: bool| {
+            let mut props = SpanProperties::default();
+            props.set_underline(u);
+            props.set_overline(o);
+            props
+        };
         let flush = |para: &mut MTextParagraph, text: &mut String, u: bool, o: bool| {
             if text.is_empty() {
                 return;
             }
-            let mut props = SpanProperties::default();
-            props.set_underline(u);
-            props.set_overline(o);
-            para.push_span(MTextSpan::new(std::mem::take(text), props));
+            para.push_span(MTextSpan::new(
+                std::mem::take(text),
+                stroke_properties(u, o),
+            ));
         };
 
         let n = self.chars.len();
@@ -196,6 +210,9 @@ impl MTextParser {
                 && (self.chars[self.pos + 1] == 'P' || self.chars[self.pos + 1] == 'p')
             {
                 flush(&mut para, &mut text, underline, overline);
+                // `%%u`/`%%o` carry across the break; at the string end they
+                // turn off, so the last paragraph keeps the default.
+                para.end_properties = stroke_properties(underline, overline);
                 self.document.push_paragraph(std::mem::take(&mut para));
                 self.pos += 2;
                 continue;
@@ -264,8 +281,7 @@ impl MTextParser {
                         Some('J') => {
                             self.pos += 2;
                             self.flush_current_span(merge_spans);
-                            self.document
-                                .push_paragraph(std::mem::take(&mut self.current_paragraph));
+                            self.end_paragraph();
                         }
                         Some('M') => {
                             self.pos += 2;
@@ -281,8 +297,7 @@ impl MTextParser {
                     // or the caret form `^J`.
                     self.pos += 1;
                     self.flush_current_span(merge_spans);
-                    self.document
-                        .push_paragraph(std::mem::take(&mut self.current_paragraph));
+                    self.end_paragraph();
                 }
                 '\t' => {
                     // Keep the tab character; the layout engine resolves it to
@@ -305,8 +320,7 @@ impl MTextParser {
         // End of input — flush remaining
         self.flush_current_span(merge_spans);
         if !self.current_paragraph.is_empty() {
-            self.document
-                .push_paragraph(std::mem::take(&mut self.current_paragraph));
+            self.end_paragraph();
         }
     }
 
@@ -484,8 +498,7 @@ impl MTextParser {
             'P' => {
                 self.pos += 1;
                 self.flush_current_span(false);
-                self.document
-                    .push_paragraph(std::mem::take(&mut self.current_paragraph));
+                self.end_paragraph();
                 // Span properties (color, font, bold, height, etc.) carry over
                 // to the next paragraph. Only paragraph-level properties are
                 // per-paragraph (set via \p...; control codes).
@@ -501,8 +514,7 @@ impl MTextParser {
             'N' => {
                 self.pos += 1;
                 self.flush_current_span(false);
-                self.document
-                    .push_paragraph(std::mem::take(&mut self.current_paragraph));
+                self.end_paragraph();
                 // Span properties carry over, same as \P — the one difference
                 // is that what follows opens a new column, so mark it. Drop the
                 // mark and `\N` is indistinguishable from `\P` downstream.
@@ -922,8 +934,7 @@ impl MTextParser {
         if expr.trim().is_empty() {
             self.pos = start_pos;
             self.flush_current_span(false);
-            self.document
-                .push_paragraph(std::mem::take(&mut self.current_paragraph));
+            self.end_paragraph();
             self.current_props_mut()
                 .clone_from(&SpanProperties::default());
             return;
