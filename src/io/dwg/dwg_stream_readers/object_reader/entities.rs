@@ -887,7 +887,10 @@ pub(crate) fn read_proxy_payload(
 ) {
     let object_data_bits = reader.main_remaining_bits() as u32;
     let mut object_data = vec![0u8; object_data_bits.div_ceil(8) as usize];
-    for bit_index in 0..object_data_bits as usize {
+    let whole = object_data_bits as usize / 8;
+    let bytes = reader.read_bytes(whole);
+    object_data[..bytes.len()].copy_from_slice(&bytes);
+    for bit_index in whole * 8..object_data_bits as usize {
         if reader.read_bit() {
             object_data[bit_index / 8] |= 0x80 >> (bit_index % 8);
         }
@@ -1435,6 +1438,10 @@ pub fn read_spline(
                 fit_points.push(reader.read_3bit_double());
             }
         }
+    }
+
+    if scenario != 1 && !closed && fit_points.len() >= 3 && fit_points.first() == fit_points.last() {
+        closed = true;
     }
 
     SplineData {
@@ -5738,12 +5745,16 @@ pub fn read_surface(
     has_ds_data: bool,
     kind: SurfaceKind,
 ) -> SurfaceEntityData {
+    // The optional extra modeler block belongs to AcDs-backed (R2013+) surfaces.
+    // On inline pre-R2013 ACIS surfaces, the next fields are the surface isoline counts;
+    // probing them inside read_acis_entity_impl shifts the record by one bit.
+    let allow_extra = has_ds_data || version.r2013_plus(dxf_version);
     let Some(mut acis) = read_acis_entity_impl(
         reader,
         version,
         dxf_version,
         has_ds_data,
-        false,
+        allow_extra,
         false,
         None,
     ) else {
@@ -6501,5 +6512,54 @@ mod tests {
             missing_reader.check_error().is_err()
                 || missing_reader.position_in_bits() != missing_end
         );
+    }
+
+    /// `shift` bits are read first, so the payload starts off a byte boundary
+    /// and, for most shifts, ends in trailing bits.
+    fn proxy_reader(dwg: DwgVersion, dxf: DxfVersion, shift: u32, size: usize) -> DwgMergedReader {
+        let mut reader = make_reader(dwg, dxf, |writer| {
+            for _ in 0..shift {
+                writer.write_bit(true);
+            }
+            let bytes: Vec<u8> = (0..size)
+                .map(|i| (i as u8).wrapping_mul(37) ^ 0xA5)
+                .collect();
+            writer.write_bytes(&bytes);
+        });
+        for _ in 0..shift {
+            assert!(reader.read_bit());
+        }
+        reader
+    }
+
+    #[test]
+    fn a_proxy_payload_matches_reading_it_bit_by_bit() {
+        for (dwg, dxf) in [
+            (DwgVersion::AC15, DxfVersion::AC1015),
+            (DwgVersion::AC18, DxfVersion::AC1018),
+        ] {
+            for shift in 0..8 {
+                for size in [0, 1, 2, 16, 257] {
+                    let mut oracle = proxy_reader(dwg, dxf, shift, size);
+                    let bits = oracle.main_remaining_bits() as u32;
+                    let mut expected = vec![0u8; bits.div_ceil(8) as usize];
+                    for bit in 0..bits as usize {
+                        if oracle.read_bit() {
+                            expected[bit / 8] |= 0x80 >> (bit % 8);
+                        }
+                    }
+
+                    let mut reader = proxy_reader(dwg, dxf, shift, size);
+                    let (payload, _, _) = read_proxy_payload(&mut reader, 1);
+                    assert_eq!(
+                        payload,
+                        crate::objects::ProxyPayload::from_bits(&expected, bits),
+                        "{dxf:?} shift {shift} size {size}"
+                    );
+                    assert_eq!(reader.main_remaining_bits(), 0);
+                    assert!(reader.check_error().is_ok());
+                }
+            }
+        }
     }
 }

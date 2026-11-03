@@ -41,8 +41,10 @@ use crate::io::dwg::dwg21_metadata::Dwg21CompressedMetadata;
 use crate::io::dwg::dwg_version::DwgVersion;
 use crate::io::dwg::parallel::{map_ordered, worker_count};
 use crate::io::dwg::reed_solomon::reed_solomon_decode;
+use crate::io::dwg::shard_plan::ShardState;
 use crate::io::dwg::size_limits::{
-    size_from_file, MAX_DATA_PAGE_SIZE, MAX_SECTION_SIZE, MAX_SYSTEM_PAGE_SIZE,
+    size_from_file, try_vec_with_capacity, try_zeroed_vec, MAX_DATA_PAGE_SIZE, MAX_SECTION_SIZE,
+    MAX_SYSTEM_PAGE_SIZE,
 };
 use crate::io::read::{push_read_diagnostic, ReadDiagnostic, ReadStage, SourceFormat};
 use crate::notification::{NotificationCollection, NotificationType};
@@ -144,17 +146,26 @@ fn decode_ac21_page(
     block_size: usize,
     compressed_size: u64,
     uncompressed_size: u64,
-) -> Vec<u8> {
-    let mut compressed_data = vec![0u8; total_size];
+    decryption_key: Option<&[u8]>,
+) -> Result<Vec<u8>, DxfError> {
+    let mut compressed_data = try_zeroed_vec(total_size, "AC21 compressed page data")?;
     reed_solomon_decode(encoded, &mut compressed_data, factor, block_size);
+    if let Some(key) = decryption_key {
+        let mut rc4 = crate::io::dwg::security::Rc4::new(key);
+        let decrypt_len = (compressed_size as usize).min(compressed_data.len());
+        rc4.apply(&mut compressed_data[..decrypt_len]);
+    }
     if compressed_size == uncompressed_size {
         compressed_data.truncate(uncompressed_size as usize);
-        return compressed_data;
+        return Ok(compressed_data);
     }
 
-    let mut padded_source = vec![0u8; compressed_data.len() + 64];
+    let mut padded_source = try_zeroed_vec(compressed_data.len() + 64, "AC21 padded page data")?;
     padded_source[..compressed_data.len()].copy_from_slice(&compressed_data);
-    let mut decompressed_data = vec![0u8; uncompressed_size as usize + 64];
+    let mut decompressed_data = try_zeroed_vec(
+        uncompressed_size as usize + 64,
+        "AC21 decompressed page data",
+    )?;
     decompress_ac21(
         &padded_source,
         0,
@@ -162,7 +173,7 @@ fn decode_ac21_page(
         &mut decompressed_data,
     );
     decompressed_data.truncate(uncompressed_size as usize);
-    decompressed_data
+    Ok(decompressed_data)
 }
 
 /// Results from reading a DWG file header.
@@ -298,6 +309,19 @@ pub struct DwgReadOptions {
     /// that fits in the object record.
     #[cfg_attr(feature = "serde", serde(default))]
     pub max_mesh_face_indices: Option<usize>,
+    /// Upper bound on the decompressed bytes one read may allocate for
+    /// sections and system pages (page map, section map).
+    ///
+    /// Each section's declared output size is charged against this budget
+    /// before its buffer is allocated, so a file whose pages add up to
+    /// gigabytes fails with a `DxfError` instead of exhausting memory. The
+    /// budget is shared by every section in one read and is reset when a read
+    /// starts. `None` keeps the previous per-section behaviour.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub max_decompressed_bytes: Option<usize>,
+    /// Optional password for decrypting password-protected DWG files.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub password: Option<String>,
 }
 
 impl Default for DwgReadOptions {
@@ -306,6 +330,8 @@ impl Default for DwgReadOptions {
             failsafe: false,
             max_mesh_faces: None,
             max_mesh_face_indices: None,
+            max_decompressed_bytes: None,
+            password: None,
         }
     }
 }
@@ -329,6 +355,21 @@ impl DwgReadOptions {
     /// Store every MESH face that fits in its object record.
     pub fn with_unlimited_mesh(self) -> Self {
         self.with_mesh_limits(usize::MAX, usize::MAX)
+    }
+
+    /// Limit the total decompressed bytes one read may allocate.
+    ///
+    /// `usize::MAX` effectively removes the limit while still using the
+    /// fallible allocation path.
+    pub fn with_max_decompressed_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_decompressed_bytes = Some(max_bytes);
+        self
+    }
+
+    /// Set a password for decrypting password-protected DWG files.
+    pub fn with_password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
+        self
     }
 
     /// Budget applied while reading MESH entities.
@@ -904,6 +945,13 @@ pub struct DwgReader<R: Read + Seek> {
     /// read_with_stats diagnostic accumulator as an argument. Keep these
     /// diagnostics on the reader and drain them when assembling ReadStats.
     pending_diagnostics: Vec<ReadDiagnostic>,
+    /// Decompressed bytes already charged against DwgReadOptions::max_decompressed_bytes in
+    /// the current read.
+    decompressed_bytes_used: usize,
+    /// State of a [`Self::read_sharded`] call between shards.
+    shard: Option<ShardState>,
+    /// Derived decryption key for password-protected drawings.
+    pub decryption_key: Option<Vec<u8>>,
 }
 
 impl DwgReader<File> {
@@ -928,6 +976,9 @@ impl DwgReader<File> {
             legacy_font_resolver: None,
             r12_code_page: None,
             pending_diagnostics: Vec::new(),
+            decompressed_bytes_used: 0,
+            shard: None,
+            decryption_key: None,
         })
     }
 }
@@ -951,6 +1002,9 @@ impl DwgReader<Cursor<memmap2::Mmap>> {
             legacy_font_resolver: None,
             r12_code_page: None,
             pending_diagnostics: Vec::new(),
+            decompressed_bytes_used: 0,
+            shard: None,
+            decryption_key: None,
         })
     }
 }
@@ -1005,6 +1059,9 @@ impl<R: Read + Seek> DwgReader<R> {
             legacy_font_resolver: None,
             r12_code_page: None,
             pending_diagnostics: Vec::new(),
+            decompressed_bytes_used: 0,
+            shard: None,
+            decryption_key: None,
         }
     }
 
@@ -1019,6 +1076,9 @@ impl<R: Read + Seek> DwgReader<R> {
             legacy_font_resolver: None,
             r12_code_page: None,
             pending_diagnostics: Vec::new(),
+            decompressed_bytes_used: 0,
+            shard: None,
+            decryption_key: None,
         }
     }
 
@@ -1027,6 +1087,12 @@ impl<R: Read + Seek> DwgReader<R> {
     /// The callback may run from Rayon worker threads while object records are
     /// decoded, so it must be thread-safe and should only perform cheap atomic
     /// updates.
+    /// Set a password for decrypting password-protected DWG files.
+    pub fn with_password(mut self, password: impl Into<String>) -> Self {
+        self.options.password = Some(password.into());
+        self
+    }
+
     pub fn set_progress_callback(&mut self, progress: std::sync::Arc<dyn Fn(u16) + Send + Sync>) {
         self.progress = Some(progress);
     }
@@ -1036,6 +1102,26 @@ impl<R: Read + Seek> DwgReader<R> {
         if let Some(progress) = &self.progress {
             progress(value.min(1000));
         }
+    }
+
+    /// Ensure the decryption key is derived and verified if the file is password-protected.
+    pub fn ensure_decryption_key(&mut self, info: &DwgFileHeaderInfo) -> Result<(), DxfError> {
+        if self.decryption_key.is_some() {
+            return Ok(());
+        }
+        if !info.section_descriptors.iter().any(|s| s.name == "AcDb:Security") {
+            return Ok(());
+        }
+        let sec_data = self.get_section_buffer("AcDb:Security", info)?;
+        let sec_info = crate::io::dwg::security::DwgSecurityInfo::parse(&sec_data)?;
+        let Some(pwd) = &self.options.password else {
+            return Err(DxfError::Decryption(
+                "Drawing is password protected; please provide a password".to_string(),
+            ));
+        };
+        let key = sec_info.derive_key(pwd)?;
+        self.decryption_key = Some(key);
+        Ok(())
     }
 
     /// Read the DWG file and reconstruct a `CadDocument`.
@@ -1065,6 +1151,26 @@ impl<R: Read + Seek> DwgReader<R> {
         diagnostic.source_offset = source_offset;
         diagnostic.source_offset_basis = Some("file-byte".to_owned());
         push_read_diagnostic(&mut self.pending_diagnostics, diagnostic);
+    }
+
+    /// Charge decompressed bytes against the per-read budget before allocating them.
+    fn charge_decompressed_bytes(
+        &mut self,
+        bytes: usize,
+        what: impl std::fmt::Display,
+    ) -> Result<(), DxfError> {
+        let Some(limit) = self.options.max_decompressed_bytes else {
+            return Ok(());
+        };
+        let used = self.decompressed_bytes_used;
+        let remaining = limit.saturating_sub(used);
+        if bytes > remaining {
+            return Err(DxfError::InvalidFormat(format!(
+                "{what} needs {bytes} decompressed bytes but only {remaining} of the {limit}-byte budget remains; raise or remove DwgReadOptions.max_decompressed_bytes"
+            )));
+        }
+        self.decompressed_bytes_used = used + bytes;
+        Ok(())
     }
 
     /// Recover as much usable drawing data as possible and apply conservative
@@ -1105,6 +1211,65 @@ impl<R: Read + Seek> DwgReader<R> {
         )
     }
 
+    /// Read the file in shards of at most `max_entities` model-space entity
+    /// records each, passing each shard's document to `each` before the next
+    /// shard is decoded, so only one shard's entities are held at a time.
+    ///
+    /// Every shard is a complete document with the header, classes, tables,
+    /// block records and non-entity objects of the whole file. Model-space
+    /// entities are divided between the shards in the order of the model
+    /// space entity list, and each stays in the same shard as its child
+    /// records (attributes, vertices, faces and sequence end); a shard holds
+    /// more than `max_entities` records only when one entity's children
+    /// exceed the limit. Block contents and paper-space entities are read
+    /// with the first shard.
+    ///
+    /// The handle map and the decompressed object section are read once and
+    /// shared by every shard. A drawing whose model space fits in one shard,
+    /// and a drawing older than R2004, is read as one shard, exactly as
+    /// [`Self::read_with_stats`] reads it.
+    ///
+    /// Returns the number of shards read. An error from `each` stops the read
+    /// and is returned.
+    ///
+    /// ```rust,no_run
+    /// use acadrust::DwgReader;
+    ///
+    /// # fn main() -> acadrust::Result<()> {
+    /// let mut reader = DwgReader::from_file("large.dwg")?;
+    /// let mut entities = 0;
+    /// let shards = reader.read_sharded(10_000, |shard| {
+    ///     entities += shard.document.model_space_entities().count();
+    ///     Ok(())
+    /// })?;
+    /// println!("{entities} model-space entities in {shards} shards");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn read_sharded<F>(
+        &mut self,
+        max_entities: usize,
+        mut each: F,
+    ) -> std::result::Result<usize, DxfError>
+    where
+        F: FnMut(crate::io::read::ReadOutcome) -> std::result::Result<(), DxfError>,
+    {
+        self.shard = Some(ShardState::new(max_entities));
+        let mut shards = 0;
+        let result = loop {
+            if let Err(error) = self.read_with_stats().and_then(&mut each) {
+                break Err(error);
+            }
+            shards += 1;
+            match self.shard.as_mut() {
+                Some(shard) if shard.index + 1 < shard.count() => shard.index += 1,
+                _ => break Ok(shards),
+            }
+        };
+        self.shard = None;
+        result
+    }
+
     fn read_with_optional_visitor(
         &mut self,
         visit: Option<
@@ -1117,7 +1282,10 @@ impl<R: Read + Seek> DwgReader<R> {
         // A decoder bug must reach the caller as `DxfError`, including when
         // failsafe is on. Record-level failures are handled inside the builder.
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.read_drawing(visit))) {
-            Ok(result) => result,
+            Ok(result) => result.map(|mut outcome| {
+                current_style_names(&mut outcome.document);
+                outcome
+            }),
             Err(payload) => Err(DxfError::Parse(format!(
                 "DWG reader failed: {}",
                 crate::io::dwg::unwind_message(payload.as_ref())
@@ -1138,6 +1306,7 @@ impl<R: Read + Seek> DwgReader<R> {
         let perf = std::env::var_os("PERF").is_some();
         let total_started = web_time::Instant::now();
         let mut diagnostics = Vec::new();
+        self.decompressed_bytes_used = 0;
         self.report_progress(0);
 
         // AC1009/R12 predates the section-map/object-stream model used by the
@@ -1261,6 +1430,22 @@ impl<R: Read + Seek> DwgReader<R> {
                 info.page_records.len(),
             );
         }
+        if info.section_descriptors.iter().any(|s| s.name == "AcDb:Security") {
+            if let Err(e) = self.ensure_decryption_key(&info) {
+                if !self.options.failsafe {
+                    return Err(e);
+                }
+                report_read_error(
+                    &mut self.notifications,
+                    &mut diagnostics,
+                    "decryption-failed",
+                    ReadStage::FileHeader,
+                    Some("AcDb:Security"),
+                    format!("Failed to decrypt drawing: {}", e),
+                );
+            }
+        }
+
         let dxf_version = crate::types::DxfVersion::parse(&info.version_string)
             .unwrap_or(crate::types::DxfVersion::Unknown);
         self.report_progress(20);
@@ -1359,69 +1544,89 @@ impl<R: Read + Seek> DwgReader<R> {
         }
         self.report_progress(40);
 
-        // 4. Read Handle Map (AcDb:Handles)
-        let mut handles_section_read = false;
-        let handle_map = match self.get_section_buffer("AcDb:Handles", &info) {
-            Ok(handle_buf) => {
-                handles_section_read = true;
-                match crate::io::dwg::dwg_stream_readers::handle_reader::read_handles(&handle_buf) {
-                    Ok(mut hm) => {
-                        // AC15: Handle offsets are absolute file positions.
-                        // Convert to buffer-relative by subtracting the objects
-                        // section base offset.
-                        if info.objects_base_offset != 0 {
-                            let base = info.objects_base_offset;
-                            for offset in hm.values_mut() {
-                                *offset -= base;
+        // 4. Read Handle Map (AcDb:Handles). The later shards of a sharded
+        //    read reuse the handles and object section the first one read.
+        let resumed = self.shard.as_mut().and_then(ShardState::resume);
+        let mut handles_section_read = resumed.is_some();
+        let (cached_objects, handle_count, handle_map) = match resumed {
+            Some((objects, handle_count, handle_map)) => (Some(objects), handle_count, handle_map),
+            None => {
+                let handle_map = match self.get_section_buffer("AcDb:Handles", &info) {
+                    Ok(handle_buf) => {
+                        handles_section_read = true;
+                        match crate::io::dwg::dwg_stream_readers::handle_reader::read_handle_map(
+                            &handle_buf,
+                        ) {
+                            Ok(mut hm) => {
+                                // AC15: Handle offsets are absolute file positions.
+                                // Convert to buffer-relative by subtracting the objects
+                                // section base offset.
+                                if info.objects_base_offset != 0 {
+                                    let base = info.objects_base_offset;
+                                    for offset in hm.values_mut() {
+                                        *offset -= base;
+                                    }
+                                }
+                                hm
+                            }
+                            Err(e) => {
+                                report_read_error(
+                                    &mut self.notifications,
+                                    &mut diagnostics,
+                                    "handles-decode-failed",
+                                    ReadStage::Handles,
+                                    Some("AcDb:Handles"),
+                                    format!("Failed to read handles: {}", e),
+                                );
+                                Default::default()
                             }
                         }
-                        hm
                     }
                     Err(e) => {
                         report_read_error(
                             &mut self.notifications,
                             &mut diagnostics,
-                            "handles-decode-failed",
+                            "handles-extract-failed",
                             ReadStage::Handles,
                             Some("AcDb:Handles"),
-                            format!("Failed to read handles: {}", e),
+                            format!("Failed to extract handles section: {}", e),
                         );
-                        std::collections::HashMap::new()
+                        Default::default()
                     }
-                }
-            }
-            Err(e) => {
-                report_read_error(
-                    &mut self.notifications,
-                    &mut diagnostics,
-                    "handles-extract-failed",
-                    ReadStage::Handles,
-                    Some("AcDb:Handles"),
-                    format!("Failed to extract handles section: {}", e),
-                );
-                std::collections::HashMap::new()
+                };
+                (None, handle_map.len(), handle_map)
             }
         };
         self.report_progress(50);
 
         // 5. Read Objects (AcDb:AcDbObjects) and build document
-        let handle_count = handle_map.len();
         let mut objects_section_read = false;
         let mut record_stream_read = false;
         let mut decoded_source_records = 0usize;
         let mut skipped_source_records = 0usize;
         let objects_started = web_time::Instant::now();
         if !handle_map.is_empty() {
-            match self.get_section_buffer("AcDb:AcDbObjects", &info) {
+            let objects_buf = match cached_objects {
+                Some(objects) => Ok(objects),
+                None => self
+                    .get_section_buffer("AcDb:AcDbObjects", &info)
+                    .map(std::sync::Arc::new),
+            };
+            match objects_buf {
                 Ok(objects_buf) => {
                     objects_section_read = true;
-                    match crate::io::dwg::dwg_stream_readers::object_reader::DwgObjectReader::with_encoding(
-                    objects_buf,
+                    match crate::io::dwg::dwg_stream_readers::object_reader::DwgObjectReader::with_handle_map(
+                    std::sync::Arc::clone(&objects_buf),
                     dxf_version,
                     handle_map,
                     crate::io::dxf::code_page::encoding_from_dwg_code_page(info.code_page),
                 ) {
                     Ok(mut obj_reader) => {
+                        if let Some(shard) =
+                            self.shard.as_mut().filter(|shard| shard.objects.is_none())
+                        {
+                            shard.plan_first(&mut obj_reader, objects_buf, handle_count, &document);
+                        }
                         record_stream_read = true;
                         obj_reader.set_mesh_budget(self.options.mesh_budget());
                         let mut builder = crate::io::dwg::dwg_document_builder::DwgDocumentBuilder::new(obj_reader);
@@ -1548,12 +1753,14 @@ impl<R: Read + Seek> DwgReader<R> {
                         // Guard against a garbage size before allocating.
                         if overall > 0 && overall < 64 * 1024 * 1024 {
                             let total = crate::io::dwg::preview::container_len(overall);
-                            let mut buf = vec![0u8; total];
-                            if self.stream.seek(SeekFrom::Start(base)).is_ok()
-                                && self.stream.read_exact(&mut buf).is_ok()
-                            {
-                                document.preview =
-                                    crate::io::dwg::preview::parse_preview(&buf, base);
+                            // Best-effort: an allocation failure leaves the preview empty.
+                            if let Ok(mut buf) = try_zeroed_vec(total, "DWG preview") {
+                                if self.stream.seek(SeekFrom::Start(base)).is_ok()
+                                    && self.stream.read_exact(&mut buf).is_ok()
+                                {
+                                    document.preview =
+                                        crate::io::dwg::preview::parse_preview(&buf, base);
+                                }
                             }
                         }
                     }
@@ -1618,12 +1825,14 @@ impl<R: Read + Seek> DwgReader<R> {
                         // Guard against a garbage size before allocating.
                         if overall > 0 && overall < 64 * 1024 * 1024 {
                             let total = crate::io::dwg::preview::container_len(overall);
-                            let mut buf = vec![0u8; total];
-                            if self.stream.seek(SeekFrom::Start(base)).is_ok()
-                                && self.stream.read_exact(&mut buf).is_ok()
-                            {
-                                document.preview =
-                                    crate::io::dwg::preview::parse_preview(&buf, base);
+                            // Best-effort: an allocation failure leaves the preview empty.
+                            if let Ok(mut buf) = try_zeroed_vec(total, "DWG preview") {
+                                if self.stream.seek(SeekFrom::Start(base)).is_ok()
+                                    && self.stream.read_exact(&mut buf).is_ok()
+                                {
+                                    document.preview =
+                                        crate::io::dwg::preview::parse_preview(&buf, base);
+                                }
                             }
                         }
                     }
@@ -1700,6 +1909,7 @@ impl<R: Read + Seek> DwgReader<R> {
     /// # Returns
     /// A `DwgFileHeaderInfo` containing all extracted data.
     pub fn read_file_header(&mut self) -> Result<DwgFileHeaderInfo, DxfError> {
+        self.decompressed_bytes_used = 0;
         self.stream.seek(SeekFrom::Start(0))?;
 
         // Read version string (6 bytes)
@@ -2074,7 +2284,13 @@ impl<R: Read + Seek> DwgReader<R> {
             decomp_size,
             1..=MAX_SYSTEM_PAGE_SIZE,
         )?;
-        let mut compressed = vec![0u8; comp_size as usize];
+        let output_size = if compression == 2 {
+            decomp_size
+        } else {
+            comp_size as usize
+        };
+        self.charge_decompressed_bytes(output_size, "AC18 page map")?;
+        let mut compressed = try_zeroed_vec(comp_size as usize, "AC18 page map compressed data")?;
         self.stream.read_exact(&mut compressed)?;
 
         // Decompress
@@ -2161,7 +2377,14 @@ impl<R: Read + Seek> DwgReader<R> {
             decomp_size,
             1..=MAX_SYSTEM_PAGE_SIZE,
         )?;
-        let mut compressed = vec![0u8; comp_size as usize];
+        let output_size = if compression == 2 {
+            decomp_size
+        } else {
+            comp_size as usize
+        };
+        self.charge_decompressed_bytes(output_size, "AC18 section map")?;
+        let mut compressed =
+            try_zeroed_vec(comp_size as usize, "AC18 section map compressed data")?;
         self.stream.read_exact(&mut compressed)?;
 
         // Decompress
@@ -2292,7 +2515,7 @@ impl<R: Read + Seek> DwgReader<R> {
         if compr_len < 0 {
             // Negative ComprLen means data is stored uncompressed (raw).
             // |ComprLen| = raw data length. Copy directly from offset 0x20.
-            let raw_len = (-compr_len) as usize;
+            let raw_len = compr_len.unsigned_abs() as usize;
             let src_start = 32; // offset 0x20 in decoded data
             let copy_len = raw_len
                 .min(0x110)
@@ -2376,11 +2599,12 @@ impl<R: Read + Seek> DwgReader<R> {
             metadata.pages_map_size_compressed,
             1..=MAX_SYSTEM_PAGE_SIZE,
         )?;
-        size_from_file(
+        let decompressed_size = size_from_file(
             "AC21 page map decompressed size",
             metadata.pages_map_size_uncompressed,
             1..=MAX_SYSTEM_PAGE_SIZE,
         )?;
+        self.charge_decompressed_bytes(decompressed_size, "AC21 page map")?;
         let page_buffer = self.get_page_buffer(
             metadata.pages_map_offset,
             metadata.pages_map_size_compressed,
@@ -2447,11 +2671,12 @@ impl<R: Read + Seek> DwgReader<R> {
             metadata.sections_map_size_compressed,
             1..=MAX_SYSTEM_PAGE_SIZE,
         )?;
-        size_from_file(
+        let decompressed_size = size_from_file(
             "AC21 section map decompressed size",
             metadata.sections_map_size_uncompressed,
             1..=MAX_SYSTEM_PAGE_SIZE,
         )?;
+        self.charge_decompressed_bytes(decompressed_size, "AC21 section map")?;
         let section_buffer = self.get_page_buffer_at(
             seeker as u64,
             metadata.sections_map_size_compressed,
@@ -2591,21 +2816,22 @@ impl<R: Read + Seek> DwgReader<R> {
         // Read encoded data from file
         self.stream
             .seek(SeekFrom::Start(AC21_FILE_HEADER_SIZE + page_offset))?;
-        let mut encoded_buffer = vec![0u8; read_length];
+        let mut encoded_buffer = try_zeroed_vec(read_length, "AC21 encoded page data")?;
         let bytes_read = self.stream.read(&mut encoded_buffer)?;
         if bytes_read < read_length {
             // Pad remaining with zeros
             encoded_buffer[bytes_read..].fill(0);
         }
 
-        Ok(decode_ac21_page(
+        decode_ac21_page(
             &encoded_buffer,
             total_size,
             factor,
             block_size,
             compressed_size,
             uncompressed_size,
-        ))
+            None,
+        )
     }
 
     /// Get the merged decompressed buffer for a named section (AC21).
@@ -2661,7 +2887,13 @@ impl<R: Read + Seek> DwgReader<R> {
                     )));
                 }
                 self.stream.seek(SeekFrom::Start(offset as u64))?;
-                let mut buf = vec![0u8; requested_size.min(available as usize)];
+                let read_size = requested_size.min(available as usize);
+                self.charge_decompressed_bytes(
+                    read_size,
+                    format_args!("AC15 section '{}'", section_name),
+                )?;
+                let mut buf =
+                    try_zeroed_vec(read_size, format_args!("AC15 section '{}'", section_name))?;
                 if failsafe {
                     let mut filled = 0usize;
                     let mut read_error = None;
@@ -2749,6 +2981,10 @@ impl<R: Read + Seek> DwgReader<R> {
                 DxfError::Parse(format!("Section '{}' not found in file", section_name))
             })?;
 
+        if section.encrypted != 0 && self.decryption_key.is_none() {
+            self.ensure_decryption_key(info)?;
+        }
+
         // Field 0x00 ("Data size") holds the total section data size.
         // Field 0x08 ("Max size") is the page partition size per spec §5.4.
         // We truncate to the total data size, not the page size.
@@ -2784,7 +3020,17 @@ impl<R: Read + Seek> DwgReader<R> {
             page_total,
             0..=MAX_SECTION_SIZE,
         )?;
-        let mut result = Vec::with_capacity(total_size.min(page_total));
+        // Charge the larger of the declared section size and the sum of its
+        // pages, so a section that declares padding is still budgeted.
+        self.charge_decompressed_bytes(
+            total_size.max(page_total),
+            format_args!("AC21 section '{}'", section_name),
+        )?;
+        // The pages append at most `page_total` bytes, so reserve that once,
+        // fallibly: later `extend_from_slice`/`resize` calls cannot reallocate
+        // (and so cannot hit the aborting allocator path) within this capacity.
+        let mut result =
+            try_vec_with_capacity(page_total, format_args!("AC21 section '{}'", section_name))?;
 
         // encoding=1 (stored): contiguous data followed by non-interleaved RS
         // parity. Reading only the payload deliberately skips that parity.
@@ -2827,8 +3073,22 @@ impl<R: Read + Seek> DwgReader<R> {
                             self.stream.seek(SeekFrom::Start(
                                 AC21_FILE_HEADER_SIZE + page_offset as u64,
                             ))?;
-                            let mut bytes = vec![0u8; fill_size];
+                            let mut bytes = try_zeroed_vec(
+                                fill_size,
+                                format_args!("AC21 page {}", page.page_number),
+                            )?;
                             self.stream.read_exact(&mut bytes)?;
+                            if section.encrypted != 0 {
+                                if let Some(key) = &self.decryption_key {
+                                    let mut rc4 = crate::io::dwg::security::Rc4::new(key);
+                                    rc4.apply(&mut bytes);
+                                } else {
+                                    return Err(DxfError::Decryption(format!(
+                                        "Section '{}' is encrypted but no decryption key is available",
+                                        section_name
+                                    )));
+                                }
+                            }
                             Ok(bytes)
                         })();
                         match read {
@@ -2844,7 +3104,10 @@ impl<R: Read + Seek> DwgReader<R> {
                                     self.stream.seek(SeekFrom::Start(
                                         AC21_FILE_HEADER_SIZE + page_offset as u64,
                                     ))?;
-                                    let mut bytes = vec![0u8; read_length];
+                                    let mut bytes = try_zeroed_vec(
+                                        read_length,
+                                        format_args!("AC21 page {}", page.page_number),
+                                    )?;
                                     let read = self.stream.read(&mut bytes)?;
                                     bytes[read..].fill(0);
                                     Ok(bytes)
@@ -2885,6 +3148,11 @@ impl<R: Read + Seek> DwgReader<R> {
                 });
             }
 
+            let key_ref = if section.encrypted != 0 {
+                self.decryption_key.as_deref()
+            } else {
+                None
+            };
             let decoded = map_ordered(prepared, |page| {
                 let data = match page.payload {
                     PagePayload::Ready(bytes) => Ok(bytes),
@@ -2894,14 +3162,16 @@ impl<R: Read + Seek> DwgReader<R> {
                         factor,
                         compressed_size,
                         uncompressed_size,
-                    } => Ok(decode_ac21_page(
+                    } => decode_ac21_page(
                         &bytes,
                         total_size,
                         factor,
                         block_size,
                         compressed_size,
                         uncompressed_size,
-                    )),
+                        key_ref,
+                    )
+                    .map_err(|error| error.to_string()),
                     PagePayload::Failed(error) => Err(error),
                 };
                 (page.number, page.fill_size, data)
@@ -2970,6 +3240,10 @@ impl<R: Read + Seek> DwgReader<R> {
                 DxfError::Parse(format!("Section '{}' not found in AC18 file", section_name))
             })?;
 
+        if section.encrypted != 0 && self.decryption_key.is_none() {
+            self.ensure_decryption_key(info)?;
+        }
+
         // compressed_size field actually holds the total uncompressed section data size
         let total_size = size_from_file(
             format_args!("AC18 section '{}' size", section_name),
@@ -3009,7 +3283,12 @@ impl<R: Read + Seek> DwgReader<R> {
             );
         }
 
-        let mut result = vec![0u8; total_size];
+        self.charge_decompressed_bytes(
+            total_size,
+            format_args!("AC18 section '{}'", section_name),
+        )?;
+        let mut result =
+            try_zeroed_vec(total_size, format_args!("AC18 section '{}'", section_name))?;
         let batch_pages = worker_count().saturating_mul(2);
         let mut skipped_pages = 0usize;
 
@@ -3062,8 +3341,22 @@ impl<R: Read + Seek> DwgReader<R> {
                     }
 
                     // Read compressed data
-                    let mut compressed = vec![0u8; data_compressed_size as usize];
+                    let mut compressed = try_zeroed_vec(
+                        data_compressed_size as usize,
+                        format_args!("AC18 page {} compressed data", page_number),
+                    )?;
                     self.stream.read_exact(&mut compressed)?;
+                    if section.encrypted != 0 {
+                        if let Some(key) = &self.decryption_key {
+                            let mut rc4 = crate::io::dwg::security::Rc4::new(key);
+                            rc4.apply(&mut compressed);
+                        } else {
+                            return Err(DxfError::Decryption(format!(
+                                "Section '{}' is encrypted but no decryption key is available",
+                                section_name
+                            )));
+                        }
+                    }
 
                     Ok((data_offset as usize, compressed))
                 })();
@@ -3768,5 +4061,19 @@ mod section_recovery_tests {
         assert!(reader
             .get_section_buffer("AcDb:Header", &ac18_info(7))
             .is_err());
+    }
+}
+
+/// The current text and dimension styles' names from their handles: a DWG stores only the handles, and the
+/// names stayed "Standard", so a drawing read from DWG lost its current styles (and wrote them as Standard).
+/// Ported from CADCraft's DWG bridge (storytold/cadcraft #1051; MIT OR Apache-2.0).
+fn current_style_names(doc: &mut crate::document::CadDocument) {
+    let h = doc.header.current_text_style_handle;
+    if let Some(s) = doc.text_styles.iter().find(|s| !h.is_null() && s.handle == h) {
+        doc.header.current_text_style_name = s.name.clone();
+    }
+    let h = doc.header.current_dimstyle_handle;
+    if let Some(s) = doc.dim_styles.iter().find(|s| !h.is_null() && s.handle == h) {
+        doc.header.current_dimstyle_name = s.name.clone();
     }
 }
