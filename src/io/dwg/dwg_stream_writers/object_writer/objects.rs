@@ -180,13 +180,11 @@ fn transcode_xrecord_xdata(
             }
             let source_code_page = raw[p] as u16;
             p += 1;
-            // The escapes in `raw` were written against the SOURCE code page,
-            // so the source encoding decides which are transport.
-            let source_encoding =
-                crate::io::dxf::code_page::encoding_from_dwg_code_page(source_code_page);
-            let s = source_encoding.decode(&raw[p..p + len]).0.into_owned();
+            let source = crate::io::dxf::code_page::encoding_from_dwg_code_page(source_code_page);
+            let s = source.decode(&raw[p..p + len]).0.into_owned();
             p += len;
-            source_encoding.decode_escapes(&s)
+            // The escapes were written against the source code page, not the target.
+            crate::io::dxf::code_page::decode_legacy_escapes_in(&s, source)
         };
         if tgt_unicode {
             let utf16: Vec<u16> = text.encode_utf16().take(u16::MAX as usize).collect();
@@ -347,9 +345,9 @@ impl<'a> DwgObjectWriter<'a> {
     /// class, whatever that is) or 0, so readers resolve it to another class
     /// or drop it: it is left out instead.
     pub(super) fn lacks_object_class(&self, object: &ObjectType) -> bool {
-        // A save back to the version the drawing came from keeps the class
-        // numbers it carries, so only a save to another version leaves such an
-        // object out (libviprs/acadsharp-rs-tests#112).
+        // A save back to the version the drawing came from has no downgrade to
+        // protect against, so the object stays. Only a save to another version
+        // leaves it out.
         if self.document.dwg_source_version == Some(self.dxf_version) {
             return false;
         }

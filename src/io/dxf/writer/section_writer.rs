@@ -4290,8 +4290,6 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         if polyline.end_width != 0.0 {
             self.writer.write_double(41, polyline.end_width)?;
         }
-        // The extrusion of the OCS the vertices are in (the LWPOLYLINE form has
-        // always written it; the heavy form dropped it, libviprs/acadsharp-rs-tests#160).
         self.write_normal(polyline.normal)?;
 
         // XDATA precedes the child VERTEX/SEQEND records.
@@ -4562,33 +4560,31 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             }
             return Ok(());
         }
-        // Column data has a home in the format only from R2007. R2018 keeps it in
-        // the embedded object above; R2007 to R2013 keep it in the ACAD extended
-        // data written with the other XDATA (`mtext_column_xdata`); below that
-        // there is nowhere. It used to be the group codes 75, 76, 78, 79, 48, 49
-        // and 50 in the entity itself, and group 50 is the rotation there:
-        // ACadSharp and ezdxf took the last one, a column height, for it
-        // (libviprs/acadsharp-rs-tests#113).
+        // Columns are not written as group codes here: 75, 76, 78, 79, 48, 49
+        // and a 50 per column height. Group 50 is the rotation of the entity,
+        // and readers that keep the last one took a column height for it. From
+        // R2007 AutoCAD keeps the columns in ACAD extended data (see
+        // `mtext_column_xdata`); below that there are none.
         self.write_normal(mtext.normal)?;
         Ok(())
     }
 
     /// The ACAD extended data AutoCAD 2007 to 2013 keeps an MTEXT's columns in.
     /// None when the entity has no columns, the version cannot carry them, or
-    /// the entity already holds a record of its own (a drawing read from DXF
-    /// keeps AutoCAD's, which is written back as it is).
+    /// the entity already holds a column block of its own (a drawing read from
+    /// AutoCAD keeps that one, which is written back as it is).
     fn mtext_column_xdata(&self, mtext: &MText) -> Option<ExtendedDataRecord> {
         let cols = &mtext.column_data;
         if cols.column_type == 0
             || self.dxf_version < DxfVersion::AC1021
-            || self.dxf_version > DxfVersion::AC1027
+            || self.dxf_version >= DxfVersion::AC1032
         {
             return None;
         }
         if mtext.common.extended_data.records().iter().any(|r| {
-            r.values.iter().any(|v| {
-                matches!(v, XDataValue::String(s) if s == "ACAD_MTEXT_COLUMN_INFO_BEGIN")
-            })
+            r.values
+                .iter()
+                .any(|v| matches!(v, XDataValue::String(s) if s == "ACAD_MTEXT_COLUMN_INFO_BEGIN"))
         }) {
             return None;
         }
