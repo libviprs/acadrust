@@ -6031,7 +6031,7 @@ mod tests {
         assert!(!output.is_empty());
     }
 
-    // ── legacy TABLE cells below R2007 (libviprs/acadsharp-rs-tests#112) ──
+    // ── legacy TABLE cells below R2007 ──
     //
     // ACadSharp reads a cell as: type, edge flags, merge bits, rotation, the
     // value handle, then the text only when that handle is 0, then the style.

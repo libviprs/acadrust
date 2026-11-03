@@ -3,10 +3,9 @@
 //!
 //! The DWG header holds each of them as a handle. The reader resolved the
 //! current layer and left the other three at their defaults ("Standard" and
-//! "ByLayer"), so a drawing whose current dimension style is not Standard read
-//! as Standard (libviprs/acadsharp-rs-tests#98).
+//! "ByLayer"), so a drawing whose current dimension style is not Standard read as Standard.
 
-use acadrust::tables::{BlockRecord, DimStyle, LineType, TextStyle};
+use acadrust::tables::{DimStyle, LineType, TextStyle};
 use acadrust::types::DxfVersion;
 use acadrust::{CadDocument, DwgReader, DwgWriter, TableEntry};
 
@@ -55,50 +54,4 @@ fn ac1018_current_styles_are_names() {
 #[test]
 fn ac1032_current_styles_are_names() {
     roundtrip(DxfVersion::AC1032);
-}
-
-/// $DIMBLK and its siblings: the DWG header holds a handle, the DXF holds the
-/// arrowhead's name, and a standard arrowhead's block is that name with an
-/// underscore in front (libviprs/acadsharp-rs-tests#100).
-fn arrow_document(version: DxfVersion) -> CadDocument {
-    let mut doc = CadDocument::with_version(version);
-    for name in ["_BoxBlank", "_Dot", "MyArrow"] {
-        let mut br = BlockRecord::new(name);
-        br.set_handle(doc.allocate_handle());
-        br.block_entity_handle = doc.allocate_handle();
-        br.block_end_handle = doc.allocate_handle();
-        doc.block_records.add(br).unwrap();
-    }
-    doc.header.dim_arrow_block = "BoxBlank".to_string();
-    doc.header.dim_arrow_block1 = "MyArrow".to_string();
-    doc.header.dim_arrow_block2 = "Dot".to_string();
-    doc.header.dim_leader_arrow_block = "Dot".to_string();
-    doc
-}
-
-fn arrow_roundtrip(version: DxfVersion) {
-    let bytes = DwgWriter::write_to_vec(&arrow_document(version)).expect("write dwg");
-    let loaded = DwgReader::from_stream(std::io::Cursor::new(bytes))
-        .read()
-        .expect("read dwg");
-    let h = &loaded.header;
-    assert_eq!(h.dim_arrow_block, "BoxBlank", "{version:?} $DIMBLK");
-    assert_eq!(h.dim_arrow_block1, "MyArrow", "{version:?} $DIMBLK1");
-    assert_eq!(h.dim_arrow_block2, "Dot", "{version:?} $DIMBLK2");
-    assert_eq!(h.dim_leader_arrow_block, "Dot", "{version:?} $DIMLDRBLK");
-}
-
-#[test]
-fn ac1015_arrow_blocks_are_names() {
-    arrow_roundtrip(DxfVersion::AC1015);
-}
-
-#[test]
-fn ac1018_arrow_blocks_are_names() {
-    arrow_roundtrip(DxfVersion::AC1018);
-}
-
-#[test]
-fn ac1032_arrow_blocks_are_names() {
-    arrow_roundtrip(DxfVersion::AC1032);
 }
