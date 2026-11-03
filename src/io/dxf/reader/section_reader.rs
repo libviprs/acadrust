@@ -3071,6 +3071,7 @@ impl<'a> SectionReader<'a> {
                     if let Some(p) = self.reader.read_pair()? {
                         if let Some(v) = p.as_i16() {
                             hdr.dim_fit = v;
+                            dimatfit_seen = true;
                         }
                     }
                 }
@@ -3411,9 +3412,11 @@ impl<'a> SectionReader<'a> {
                     if let Some(p) = self.reader.read_pair()? {
                         if let Some(v) = header_int(&p) {
                             hdr.dim_fit_r13 = v;
-                            // $DIMFIT also fed dim_fit before, and files that
-                            // predate $DIMATFIT rely on it.
-                            hdr.dim_fit = v;
+                            // R13/R14 files only have $DIMFIT, so it feeds dim_fit
+                            // until a $DIMATFIT says otherwise.
+                            if !dimatfit_seen {
+                                hdr.dim_fit = v;
+                            }
                         }
                     }
                 }

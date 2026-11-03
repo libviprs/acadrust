@@ -578,7 +578,13 @@ pub fn decode_cif_escapes(text: &str) -> String {
 /// existed. A lone surrogate names no scalar, so no encoder can have escaped
 /// one: it is content under any encoding and crosses verbatim.
 pub fn decode_cif_escapes_in(text: &str, encoding: impl CodePageGate) -> String {
-    decode_cif_escapes_inner(text, Some(encoding.gate()))
+    let encoding = encoding.gate();
+    // UTF-8 holds every character, so nothing in it was ever written as
+    // transport and its escapes are all text.
+    if encoding == LegacyEncoding::Whatwg(encoding_rs::UTF_8) {
+        return text.to_string();
+    }
+    decode_cif_escapes_inner(text, Some(encoding))
 }
 
 /// [`decode_legacy_escapes`] for text read from a drawing whose code page is
@@ -604,11 +610,7 @@ impl CodePageGate for LegacyEncoding {
 
 impl CodePageGate for &'static Encoding {
     fn gate(self) -> LegacyEncoding {
-        if self == encoding_rs::UTF_8 {
-            LegacyEncoding::Whatwg(self)
-        } else {
-            LegacyEncoding::WhatwgExact(self)
-        }
+        LegacyEncoding::Whatwg(self)
     }
 }
 

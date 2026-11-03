@@ -680,10 +680,6 @@ pub struct HeaderVariables {
     pub dim_linetype1_name: String,
     /// DIMLTEX2 - name of the second extension line linetype
     pub dim_linetype2_name: String,
-    /// DIMFIT - the R13 fit variable that R2000 replaced with DIMATFIT
-    pub dim_fit_r13: i16,
-    /// DIMUNIT - the R13 unit format variable that R2000 replaced with DIMLUNIT
-    pub dim_unit: i16,
     /// DIMTXTDIRECTION - text reads right to left
     pub dim_text_direction: bool,
     /// DIMALTMZF - alternate units zero suppression scale factor
@@ -694,12 +690,8 @@ pub struct HeaderVariables {
     pub dim_mzf: f64,
     /// DIMMZS - zero suppression text
     pub dim_mzs: String,
-    /// UNITMODE
-    pub unit_mode: i16,
     /// CSHADOW
     pub cast_shadow: i16,
-    /// PUCSBASE - name of the UCS the paper space orthographic origins are relative to
-    pub paper_ucs_base: String,
     /// UCSORGTOP, BOTTOM, LEFT, RIGHT, FRONT, BACK
     pub ucs_ortho_origins: [Vector3; 6],
     /// PUCSORGTOP, BOTTOM, LEFT, RIGHT, FRONT, BACK
@@ -1105,24 +1097,16 @@ impl Default for HeaderVariables {
             dim_linetype_name: String::from("ByBlock"),
             dim_linetype1_name: String::from("ByBlock"),
             dim_linetype2_name: String::from("ByBlock"),
-            dim_fit_r13: 0,
-            dim_unit: 0,
             dim_text_direction: false,
             dim_alt_mzf: 0.0,
             dim_alt_mzs: String::new(),
             dim_mzf: 0.0,
             dim_mzs: String::new(),
-            unit_mode: 0,
             cast_shadow: 0,
-            paper_ucs_base: String::new(),
             ucs_ortho_origins: [Vector3::ZERO; 6],
             paper_ucs_ortho_origins: [Vector3::ZERO; 6],
             dim_arrow_block2_handle: Handle::NULL,
             dim_leader_arrow_block_handle: Handle::NULL,
-            dim_text_style_name: String::from("Standard"),
-            dim_linetype_name: String::from("ByBlock"),
-            dim_linetype1_name: String::from("ByBlock"),
-            dim_linetype2_name: String::from("ByBlock"),
             dim_line_weight: -2,     // ByBlock
             dim_ext_line_weight: -2, // ByBlock
 
