@@ -112,8 +112,11 @@ fn system_page(bytes: &[u8], kind: u32) -> usize {
 fn rewrite_section_map(bytes: &[u8], edit: impl Fn(&str, Vec<u8>) -> Vec<u8>) -> Vec<u8> {
     let at = system_page(bytes, SECTION_MAP);
     let size = i32_at(bytes, at + 4) as usize;
-    let room = i32_at(bytes, at + 8) as usize;
-    let map = decompress_ac18(&bytes[at + 20..at + 20 + room], size);
+    let compressed = i32_at(bytes, at + 8) as usize;
+    let map = decompress_ac18(&bytes[at + 20..at + 20 + compressed], size);
+    // The page is padded to a 0x20 boundary after its 20-byte header and data: the rewritten
+    // map may use that padding too.
+    let room = ((20 + compressed + 0x1F) & !0x1F) - 20;
     let mut out = map[..20].to_vec();
     let mut pos = 20;
     for _ in 0..i32_at(&map, 0) {
@@ -274,4 +277,18 @@ fn ac21_map_sizes_are_checked_before_allocation() {
             );
         }
     }
+}
+
+#[test]
+fn ac21_header_min_compr_len_does_not_overflow() {
+    let bytes = dwg(DxfVersion::AC1021);
+    let mut decoded: Vec<u8> = (0..RS_BLOCKS * RS_DATA)
+        .map(|i| bytes[rs_index(i)])
+        .collect();
+    put_i32(&mut decoded, 0x18, i32::MIN);
+    let mut bad_bytes = bytes.clone();
+    for (i, byte) in decoded.into_iter().enumerate() {
+        bad_bytes[rs_index(i)] = byte;
+    }
+    let _ = DwgReader::from_stream(Cursor::new(bad_bytes)).read();
 }

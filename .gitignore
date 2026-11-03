@@ -17,6 +17,7 @@ Thumbs.db
 # Test files
 /test_files/
 /samples/
+/budweiser/
 
 *.dxf
 *.dxb

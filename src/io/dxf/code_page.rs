@@ -99,9 +99,14 @@ impl LegacyEncoding {
 
     /// Whether this encoding holds `ch`, so that [`encode_legacy_string`] writes
     /// it as bytes instead of a `\U+XXXX` escape.
+    ///
+    /// The bytes must also decode back to `ch`: WHATWG Shift_JIS encodes U+00A5
+    /// to `0x5C` without an error, and that byte reads back as a backslash.
     pub fn can_encode(self, ch: char) -> bool {
         let mut buf = [0u8; 4];
-        !self.encode(ch.encode_utf8(&mut buf)).2
+        let text: &str = ch.encode_utf8(&mut buf);
+        let (bytes, _, unmappable) = self.encode(text);
+        !unmappable && self.decode(&bytes).0 == text
     }
 
     pub fn decode<'a>(self, bytes: &'a [u8]) -> (Cow<'a, str>, Self, bool) {
@@ -825,7 +830,7 @@ mod tests {
 
     #[test]
     fn test_gated_cif_decode_follows_the_code_page() {
-        let w1252 = encoding_rs::WINDOWS_1252;
+        let w1252 = encoding_from_code_page("ANSI_1252").unwrap();
         // Held by the page: content, copied as written (hex case included).
         assert_eq!(decode_cif_escapes_in(r"94\U+00B0", w1252), r"94\U+00B0");
         assert_eq!(decode_cif_escapes_in(r"94\U+00b0", w1252), r"94\U+00b0");
@@ -843,11 +848,16 @@ mod tests {
         // The same character is held by one page and not by another.
         assert_eq!(decode_cif_escapes_in(r"\U+0411", w1252), "\u{411}");
         assert_eq!(
-            decode_cif_escapes_in(r"\U+0411", encoding_rs::WINDOWS_1251),
+            decode_cif_escapes_in(r"\U+0411", encoding_from_code_page("ANSI_1251").unwrap()),
             r"\U+0411"
         );
-        // No code page to ask in UTF-8: every escape decodes.
-        assert_eq!(decode_cif_escapes_in(r"\U+0041", encoding_rs::UTF_8), "A");
+        // A bare row names no code page, so it asks nothing.
+        assert_eq!(decode_cif_escapes_in(r"94\U+00B0", encoding_rs::WINDOWS_1252), "94\u{B0}");
+        // UTF-8 holds every character, so its escapes are text.
+        assert_eq!(
+            decode_cif_escapes_in(r"\U+0041", encoding_rs::UTF_8),
+            r"\U+0041"
+        );
         // An OEM page is asked too.
         assert_eq!(
             decode_cif_escapes_in(r"\U+00E9", LegacyEncoding::Oem(437)),
