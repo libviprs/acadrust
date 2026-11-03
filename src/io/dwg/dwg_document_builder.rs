@@ -3563,10 +3563,9 @@ impl DwgDocumentBuilder {
             .map(|layer| layer.name.clone())
             .unwrap_or_default();
 
-        // The DWG header holds the current text style, linetype and dimension
-        // style as handles too, and the DXF reader gives their names. Resolve
-        // them the same way, and leave the default when a handle names nothing
-        // (a header that points at an entry the file does not hold).
+        // The current text style, linetype and dimension style are handles in
+        // the DWG header too, and the DXF reader gives their names. Resolve them
+        // the same way, and keep the default when a handle names nothing.
         if let Some(style) = document
             .text_styles
             .iter()
@@ -4170,7 +4169,11 @@ impl DwgDocumentBuilder {
                     let block_name = maps.block_name(data.insert.block_handle);
                     let mut e = Insert::new(block_name, data.insert.insert_point);
                     e.common = entity_common;
-                    e.set_scale_unchecked(data.insert.x_scale, data.insert.y_scale, data.insert.z_scale);
+                    e.set_scale_unchecked(
+                        data.insert.x_scale,
+                        data.insert.y_scale,
+                        data.insert.z_scale,
+                    );
                     e.rotation = data.insert.rotation;
                     e.normal = data.insert.normal;
                     e.column_count = data.column_count as u16;

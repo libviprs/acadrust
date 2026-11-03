@@ -39,12 +39,6 @@ fn matrix_from_dxf_4x3(v: &[f64]) -> Matrix4 {
     }
 }
 
-/// A header integer, which AutoCAD writes as an int in one version and as a bool
-/// (group code 290) in another.
-fn header_int(p: &super::stream_reader::DxfCodePair) -> Option<i16> {
-    p.as_i16().or_else(|| p.as_bool().map(i16::from))
-}
-
 fn parse_dxf_handle(value: &str) -> Handle {
     u64::from_str_radix(value.trim(), 16)
         .map(Handle::new)
@@ -1666,8 +1660,6 @@ impl<'a> SectionReader<'a> {
                             "$UCSICON" => state.ucs_icon = value,
                             "$UNITMODE" => {
                                 state.unit_mode = value;
-                                // The DWG header carries UNITMODE as a variable of its
-                                // own, so the document holds it there as well.
                                 hdr.unit_mode = value;
                             }
                             _ => unreachable!(),
@@ -1692,13 +1684,7 @@ impl<'a> SectionReader<'a> {
                     if let Some(p) = self.reader.read_pair()? {
                         document.version = DxfVersion::from_version_string(&p.value_string);
                         if document.version >= DxfVersion::AC1021 {
-                            // UTF-8 is the file's own encoding and holds every
-                            // character, so a `\U+XXXX` in it is content.
-                            self.reader.set_encoding(
-                                crate::io::dxf::code_page::LegacyEncoding::WhatwgExact(
-                                    encoding_rs::UTF_8,
-                                ),
-                            );
+                            self.reader.set_encoding(encoding_rs::UTF_8.into());
                         } else if code_page_seen {
                             if let Some(encoding) =
                                 crate::io::dxf::code_page::encoding_from_code_page(&hdr.code_page)
@@ -1709,10 +1695,8 @@ impl<'a> SectionReader<'a> {
                     }
                 }
                 "$ACADMAINTVER" => {
-                    if let Some(p) = self.reader.read_pair()? {
-                        if let Some(v) = p.as_int() {
-                            hdr.acad_maintenance_version = v as i32;
-                        }
+                    if let Some(v) = self.reader.read_pair()?.and_then(|p| p.as_int()) {
+                        hdr.acad_maintenance_version = v as i32;
                     }
                 }
                 "$REQUIREDVERSIONS" => {
@@ -2166,9 +2150,7 @@ impl<'a> SectionReader<'a> {
                 }
                 "$XCLIPFRAME" => {
                     if let Some(p) = self.reader.read_pair()? {
-                        // AutoCAD writes it under 290 (a bool); older writers
-                        // and the reference's attribute say 280 (an integer).
-                        if let Some(v) = p.as_i16().or_else(|| p.as_bool().map(i16::from)) {
+                        if let Some(v) = p.as_i16() {
                             hdr.xclip_frame = v;
                         }
                     }
@@ -3071,10 +3053,18 @@ impl<'a> SectionReader<'a> {
                     }
                 }
                 "$DIMATFIT" => {
-                    if let Some(p) = self.reader.read_pair()? {
-                        if let Some(v) = p.as_i16() {
+                    if let Some(v) = self.reader.read_pair()?.and_then(|p| p.as_i16()) {
+                        hdr.dim_fit = v;
+                        dimatfit_seen = true;
+                    }
+                }
+                // R13/R14 files only have $DIMFIT, so it feeds dim_fit until a
+                // $DIMATFIT says otherwise.
+                "$DIMFIT" => {
+                    if let Some(v) = self.reader.read_pair()?.and_then(|p| p.as_i16()) {
+                        hdr.dim_fit_r13 = v;
+                        if !dimatfit_seen {
                             hdr.dim_fit = v;
-                            dimatfit_seen = true;
                         }
                     }
                 }
@@ -3408,21 +3398,6 @@ impl<'a> SectionReader<'a> {
                     }
                 }
 
-                // ── Variables the DWG header carries and the DXF reader used to skip ──
-                // (libviprs/acadsharp-rs-tests#102). The integer ones are an int or a
-                // bool by the version of AutoCAD that wrote the file.
-                "$DIMFIT" => {
-                    if let Some(p) = self.reader.read_pair()? {
-                        if let Some(v) = header_int(&p) {
-                            hdr.dim_fit_r13 = v;
-                            // R13/R14 files only have $DIMFIT, so it feeds dim_fit
-                            // until a $DIMATFIT says otherwise.
-                            if !dimatfit_seen {
-                                hdr.dim_fit = v;
-                            }
-                        }
-                    }
-                }
                 _ => {
                     // Skip unknown header variable value(s) – consume until next code 9 or code 0
                     self.skip_header_variable()?;
