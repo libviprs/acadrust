@@ -79,15 +79,13 @@ impl<R: Read + Seek> DxfTextReader<R> {
                 }
             }
         };
-        // Characters outside the code page arrive as escapes; one naming a
-        // character the declared code page can hold is content and stays.
+        // Characters outside the code page arrive as MIF escapes.
         let line = if crate::io::dxf::code_page::has_legacy_escape(&line) {
             match self.encoding {
-                Some(encoding) => encoding.decode_escapes(&line),
-                // UTF-8 text can hold any character, so a `\U+XXXX` in it is
-                // content (see `decode_mif` in the DWG bit reader); only the
-                // `\M+` double-byte escapes are transport.
-                None => crate::io::dxf::code_page::decode_mif_escapes(&line),
+                Some(encoding) => {
+                    crate::io::dxf::code_page::decode_legacy_escapes_in(&line, encoding)
+                }
+                None => crate::io::dxf::code_page::decode_legacy_escapes(&line),
             }
         } else {
             line

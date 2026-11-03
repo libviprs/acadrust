@@ -430,43 +430,20 @@ impl MTextParser {
 
             // Unicode escape: \U+XXXX
             'U' if self.pos + 1 < self.chars.len() && self.chars[self.pos + 1] == '+' => {
-                // AutoCAD's `\U+XXXX` takes exactly four hex digits, which is
-                // what `decode_cif_escapes_in` enforces at the transport layer
-                // (`src/io/dxf/code_page.rs`). Consuming every following
-                // hex digit instead turns `20\U+00B0C` into U+0B0C, and a code
-                // point that is not a scalar must come back out as the text the
-                // file holds rather than disappear.
-                //
-                // The two layers decode `\U+XXXX` on purpose, and they are not
-                // redundant: the transport layer decodes only escapes the
-                // declared code page could not have held, because an escape it
-                // *can* hold is drawing content; this layer is MTEXT content
-                // formatting, where every well-formed escape is a character of
-                // the text. So the rule they must agree on is the shape of the
-                // escape — four digits, malformed stays literal, a lone
-                // surrogate crosses as its seven characters — and that rule is
-                // spelled the same way in both.
+                // `\U+XXXX` is exactly four hex digits; anything else stays literal.
                 let start = self.pos + 2;
                 let scalar = self
                     .chars
                     .get(start..start + 4)
                     .filter(|d| d.iter().all(char::is_ascii_hexdigit))
-                    .and_then(|d| {
-                        let hex: String = d.iter().collect();
-                        u32::from_str_radix(&hex, 16).ok()
-                    })
+                    .and_then(|d| u32::from_str_radix(&d.iter().collect::<String>(), 16).ok())
                     .and_then(char::from_u32);
-                match scalar {
-                    Some(ch) => {
-                        self.pos = start + 4;
-                        self.text_buf.push(ch);
-                    }
-                    None => {
-                        // Not a well-formed escape: emit `\U+` verbatim and let
-                        // the rest of the run be ordinary text.
-                        self.text_buf.push_str("\\U+");
-                        self.pos = start;
-                    }
+                if let Some(ch) = scalar {
+                    self.pos = start + 4;
+                    self.text_buf.push(ch);
+                } else {
+                    self.text_buf.push_str("\\U+");
+                    self.pos = start;
                 }
             }
 
@@ -1848,19 +1825,74 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_paragraph_keeps_the_span_properties_at_its_break() {
+        // A group closed before the break does not apply to the empty line.
+        let doc = parse_mtext(r"{\H2x;Title}\P\PBody", false);
+        assert_eq!(doc.paragraphs.len(), 3);
+        assert!(doc.paragraphs[1].is_empty());
+        assert_eq!(doc.paragraphs[1].end_properties.height, None);
+        // A code before the break does.
+        let doc = parse_mtext(r"\H2x;\PA", false);
+        assert!(doc.paragraphs[0].is_empty());
+        assert_eq!(
+            doc.paragraphs[0].end_properties.height,
+            Some(MTextScalar::Factor(2.0))
+        );
+        // Inside a group the break takes the group's properties.
+        let doc = parse_mtext(r"{\C1;A\P\PB}", false);
+        assert!(doc.paragraphs[1].is_empty());
+        assert_eq!(
+            doc.paragraphs[1].end_properties.color,
+            Some(MTextColor::Index(1))
+        );
+    }
+
+    #[test]
+    fn every_paragraph_break_records_the_span_properties_in_effect() {
+        for (text, kind) in [
+            (r"\H3;A\PB", r"\P"),
+            (r"\H3;A\NB", r"\N"),
+            ("\\H3;A^JB", "^J"),
+            ("\\H3;A\nB", "line feed"),
+            (r"\H3;A\p;B", r"\p;"),
+        ] {
+            let doc = parse_mtext(text, false);
+            assert_eq!(
+                doc.paragraphs[0].end_properties.height,
+                Some(MTextScalar::Absolute(3.0)),
+                "{kind}"
+            );
+        }
+        // The last paragraph ends at the end of the text.
+        let doc = parse_mtext(r"A\H3;", false);
+        assert_eq!(
+            doc.paragraphs[0].end_properties.height,
+            Some(MTextScalar::Absolute(3.0))
+        );
+    }
+
+    #[test]
+    fn plain_text_paragraph_end_properties_carry_the_open_strokes() {
+        // `%%u` is still in effect at the `\P`, so the first paragraph ends
+        // underlined; at the string end underscoring turns off.
+        let doc = parse_plain_text("%%uA\\PB");
+        assert!(doc.paragraphs[0].end_properties.stroke.underline());
+        assert_eq!(doc.paragraphs[1].end_properties, SpanProperties::default());
+    }
+
+    #[test]
     fn a_unicode_escape_takes_exactly_four_hex_digits() {
-        // `\U+XXXX` is four digits, so the `C` of `20°C` is text and not a
-        // fifth digit. The transport layer leaves a representable escape in the
-        // value on a faithful code page (`io/dxf/code_page.rs`), which is how
-        // this string reaches the parser from an ANSI_1252 drawing.
         assert_eq!(parse_mtext(r"20\U+00B0C", false).to_plain_text(), "20°C");
         assert_eq!(parse_mtext(r"\U+00B12", false).to_plain_text(), "±2");
-        // A run that is not four hex digits is not an escape at all, so the
-        // characters the file holds stay in the text.
         assert_eq!(parse_mtext(r"\U+00GZ", false).to_plain_text(), r"\U+00GZ");
         assert_eq!(parse_mtext(r"\U+00B", false).to_plain_text(), r"\U+00B");
-        // A code point that is not a scalar is text the file holds, not text to drop.
         assert_eq!(parse_mtext(r"\U+D800", false).to_plain_text(), r"\U+D800");
+    }
+
+    #[test]
+    fn test_parse_mif_escape() {
+        let doc = parse_mtext(r"\M+5BCFE\M+5BAC5", false);
+        assert_eq!(doc.to_plain_text(), "件号");
     }
 
     // ========================================================================

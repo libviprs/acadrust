@@ -413,7 +413,7 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
     }
 
     w.write_bit(h.display_silhouette);
-    w.write_bit(h.create_ellipse_as_polyline); // PELLIPSE
+    w.write_bit(h.create_ellipse_as_polyline);
     w.write_bit_short(h.proxy_graphics);
 
     if r13_14_only(v) {
@@ -559,9 +559,9 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
         // PUCSBASE
         w.write_handle_ref(DwgReferenceType::HardPointer, Handle::NULL);
 
-        // Paper space orthographic origins (6 × 3BD): top, bottom, left, right, front, back
+        // Paper space orthographic origins (6 × 3BD) — default zeros
         for origin in &h.paper_ucs_ortho_origins {
-            w.write_3bit_double(*origin);
+            w.write_3bit_double(*origin); // PUCSORGTOP, BOTTOM, LEFT, RIGHT, FRONT, BACK
         }
     }
 
@@ -586,9 +586,9 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
         // UCSBASE
         w.write_handle_ref(DwgReferenceType::HardPointer, Handle::NULL);
 
-        // Model space orthographic origins (6 × 3BD): top, bottom, left, right, front, back
+        // Model space orthographic origins (6 × 3BD) — default zeros
         for origin in &h.ucs_ortho_origins {
-            w.write_3bit_double(*origin);
+            w.write_3bit_double(*origin); // UCSORGTOP, BOTTOM, LEFT, RIGHT, FRONT, BACK
         }
 
         // DIMPOST, DIMAPOST
@@ -645,10 +645,14 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
 
     // R2007+ dimension extras
     if r2007_plus(v) {
-        w.write_bit_double(h.dim_fixed_ext_line_length); // DIMFXL
-        w.write_bit_double(h.dim_jog_angle); // DIMJOGANG
-        w.write_bit_short(h.dim_text_fill); // DIMTFILL
-        w.write_cm_color(&h.dim_text_fill_color); // DIMTFILLCLR
+        w.write_bit_double(h.dim_fixed_ext_line_length);
+        // DIMJOGANG valid range is 5°..90°
+        w.write_bit_double(
+            h.dim_jog_angle
+                .clamp(0.0872665, std::f64::consts::FRAC_PI_2),
+        );
+        w.write_bit_short(h.dim_text_fill);
+        w.write_cm_color(&h.dim_text_fill_color);
     }
 
     // R2000+ dimension flags
@@ -728,7 +732,7 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
 
     // R2007+: DIMFXLON
     if r2007_plus(v) {
-        w.write_bit(h.dim_fixed_ext_line_on); // DIMFXLON
+        w.write_bit(h.dim_fixed_ext_line_on); // DimensionIsExtensionLineLengthFixed
     }
 
     // R2010+: extra dimension fields
@@ -889,13 +893,22 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
 
         w.write_bit_double(h.steps_per_second);
         w.write_bit_double(h.step_size);
-        w.write_bit_double(h.dwf_3d_precision); // 3DDWFPREC
+        w.write_bit_double(h.dwf_3d_precision.clamp(1.0, 6.0)); // 3DDWFPREC
         w.write_bit_double(h.lens_length);
         w.write_bit_double(h.camera_height);
         w.write_byte(u8::from(h.record_solid_history));
         w.write_byte(h.show_solid_history.clamp(0, 2) as u8);
-        w.write_bit_double(h.polysolid_width); // PSOLWIDTH
-        w.write_bit_double(h.polysolid_height); // PSOLHEIGHT
+        // PSOLWIDTH / PSOLHEIGHT must be positive
+        w.write_bit_double(if h.polysolid_width > 0.0 {
+            h.polysolid_width
+        } else {
+            0.25
+        });
+        w.write_bit_double(if h.polysolid_height > 0.0 {
+            h.polysolid_height
+        } else {
+            4.0
+        });
         w.write_bit_double(h.loft_angle1);
         w.write_bit_double(h.loft_angle2);
         w.write_bit_double(h.loft_magnitude1);
@@ -906,10 +919,10 @@ fn write_header_fields(w: &mut SectionWriter, v: DxfVersion, h: &HeaderVariables
         w.write_bit_double(h.longitude);
         w.write_bit_double(h.north_direction);
         w.write_bit_long(h.timezone);
-        w.write_byte(h.light_glyph_display as u8); // LIGHTGLYPHDISPLAY
-        w.write_byte(h.tile_model_light_synch as u8); // TILEMODELIGHTSYNCH
-        w.write_byte(h.dwf_frame as u8); // DWFFRAME
-        w.write_byte(h.dgn_frame as u8); // DGNFRAME
+        w.write_byte(h.light_glyph_display.min(1));
+        w.write_byte(h.tile_model_light_synch.min(1));
+        w.write_byte(h.dwf_frame.clamp(0, 2) as u8);
+        w.write_byte(h.dgn_frame.clamp(0, 2) as u8);
 
         w.write_bit(h.real_world_scale);
 

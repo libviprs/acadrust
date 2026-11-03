@@ -103,7 +103,7 @@ impl DwgBitReader {
     /// Decode bytes using the document's legacy text code page.
     pub fn decode_legacy_text(&self, bytes: &[u8]) -> String {
         let (decoded, _, _) = self.encoding.decode(bytes);
-        self.encoding.decode_escapes(&decoded)
+        crate::io::dxf::code_page::decode_legacy_escapes_in(&decoded, self.encoding)
     }
 
     /// Get the DWG version.
@@ -868,7 +868,7 @@ impl DwgBitReader {
             // Decode using the reader's encoding; legacy strings may embed
             // CIF \U+XXXX escapes for characters outside the code page.
             let (decoded, _, _) = self.encoding.decode(&bytes);
-            self.encoding.decode_escapes(&decoded)
+            crate::io::dxf::code_page::decode_legacy_escapes_in(&decoded, self.encoding)
         }
     }
 
@@ -927,7 +927,10 @@ impl DwgBitReader {
             let (decoded, _, _) = self.encoding.decode(&bytes);
             // Legacy strings may embed CIF \U+XXXX escapes for characters
             // outside the code page — decode them into Unicode chars.
-            self.encoding.decode_escapes(&decoded.replace('\0', ""))
+            crate::io::dxf::code_page::decode_legacy_escapes_in(
+                &decoded.replace('\0', ""),
+                self.encoding,
+            )
         }
     }
 
@@ -960,7 +963,10 @@ impl DwgBitReader {
             }
             let bytes = self.read_bytes(length);
             let (decoded, _, _) = self.encoding.decode(&bytes);
-            Some(self.encoding.decode_escapes(&decoded.replace('\0', "")))
+            Some(crate::io::dxf::code_page::decode_legacy_escapes_in(
+                &decoded.replace('\0', ""),
+                self.encoding,
+            ))
         }
     }
 
@@ -1558,11 +1564,8 @@ mod tests {
     }
 }
 
-/// R2007+ text is UTF-16, which can hold any character, so a `\U+XXXX` in it
-/// can only be content (AutoCAD stores `94\U+00B0` as nine literal characters
-/// in an R2018 save, where an R2004 save of the same drawing has the escape on
-/// disk and the code page holds the degree sign). Only the `\M+` double-byte
-/// escapes are transport here.
+/// R2007+ text is UTF-16 and holds every character, so a `\U+XXXX` in it is
+/// content; only the `\M+` double-byte escapes are transport.
 fn decode_mif(text: String) -> String {
     if text.contains("\\M+") {
         crate::io::dxf::code_page::decode_mif_escapes(&text)
