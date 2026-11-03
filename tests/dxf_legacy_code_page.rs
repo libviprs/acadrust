@@ -139,10 +139,10 @@ fn issue_154_the_reader_decodes_mif_escapes_of_what_the_page_cannot_hold() {
 }
 
 #[test]
-fn issue_154_an_escape_the_page_could_have_held_stays_literal() {
-    // The code page gate of libviprs/acadrust#9: 94\U+00B0 at ANSI_1250 is content.
+fn issue_154_an_escape_the_page_could_have_held_decodes_too() {
+    // AutoCAD decodes every well-formed escape in a pre-2007 drawing (#260).
     let doc = read(&minimal_dxf("ANSI_1250", b"94\\U+00B0"));
-    assert_eq!(texts_of(&doc), vec!["94\\U+00B0".to_string()]);
+    assert_eq!(texts_of(&doc), vec!["94\u{b0}".to_string()]);
 }
 
 #[test]
