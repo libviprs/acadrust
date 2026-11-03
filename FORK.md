@@ -10,8 +10,8 @@ To see the difference at any time: `git diff upstream/main origin/main --stat`.
 
 | Patch | Why libviprs needs it | Upstream status |
 | --- | --- | --- |
-| `Insert::set_scale_unchecked`, used by the DWG reader for INSERT and MINSERT (#52) | the reader reports the scale the file stores, even 0.0, instead of rewriting it to 1e-12 | not proposed yet, draft in the fork notes |
-| R2004 header trailer is optional (#60) | DWG files written by LibreDWG (the oracle fixtures) stop the header before the trailing BitLongs and fail to read | not proposed yet, draft in the fork notes |
+| `Insert::set_scale_unchecked`, used by the DWG reader for INSERT and MINSERT (#52) | the reader reports the scale the file stores, even 0.0, instead of rewriting it to 1e-12 | not proposed yet, draft written, waiting for approval |
+| R2004 header trailer is optional (#60) | DWG files written by LibreDWG (the oracle fixtures) stop the header before the trailing BitLongs and fail to read | not proposed yet, draft written, waiting for approval |
 
 ## Tests the fork adds
 
@@ -22,7 +22,7 @@ To see the difference at any time: `git diff upstream/main origin/main --stat`.
 
 `.github/workflows/ci.yml`, `Cargo.lock`, `SUITE_REV`, `tests/suite_pin_check.rs`, `tests/suite_rev_reachable.rs`,
 `tools/suite_pin_check.sh`, `tests/acadsharp/README.md`: the acadsharp-rs-tests pin. The parity suite is an
-experiment now, so these can go, but removing the suite pin is Rom's call.
+experiment now, so these can go, but removing the suite pin is the maintainer's call.
 
 ## Dropped on purpose (taken from upstream)
 
