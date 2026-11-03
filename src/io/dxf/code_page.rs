@@ -595,9 +595,10 @@ pub fn decode_legacy_escapes_in(text: &str, encoding: impl CodePageGate) -> Stri
 }
 
 /// What [`decode_cif_escapes_in`] accepts as the code page of a drawing: a
-/// [`LegacyEncoding`] as it stands, or a bare `encoding_rs` row, which a caller
-/// names deliberately and is therefore taken as the code page itself (UTF-8
-/// excepted, which has no code page to ask and decodes every escape).
+/// [`LegacyEncoding`] as it stands, or a bare `encoding_rs` row, which may only
+/// be a stand-in for the page the drawing declared and so asks nothing: every
+/// well-formed escape decodes. UTF-8 is the exception, it holds every
+/// character, so its escapes are text and stay as they are.
 pub trait CodePageGate {
     fn gate(self) -> LegacyEncoding;
 }
