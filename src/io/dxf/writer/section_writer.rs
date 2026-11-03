@@ -25,6 +25,7 @@ use crate::types::{Color, DxfVersion, Handle, LineWeight, Vector3};
 use crate::xdata::{ExtendedData, ExtendedDataRecord, XDataValue};
 
 use super::stream_writer::{DxfStreamWriter, DxfStreamWriterExt};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 /// Sanitize a symbol table record name: strip control characters and
@@ -132,6 +133,22 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             loft_reference_appid: None,
             source_dwg_context: None,
         }
+    }
+
+    /// The handle the writer gives the next record it creates itself, such as
+    /// a polyline VERTEX or a SEQEND.
+    pub fn next_handle(&self) -> u64 {
+        self.next_handle
+    }
+
+    /// Number the records the writer creates from `next` on.
+    ///
+    /// Writing several documents into one DXF (for example, the entities of
+    /// a drawing read in parts) with one writer each, pass each writer the
+    /// previous one's [`next_handle`](Self::next_handle) so the records they
+    /// create get distinct handles.
+    pub fn set_next_handle(&mut self, next: u64) {
+        self.next_handle = next;
     }
 
     /// Build the set of all handles that will appear in the output DXF.
@@ -629,6 +646,19 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         })?;
         self.write_header_variable("$DIMPOST", |w| w.write_string(1, &hdr.dim_post))?;
         self.write_header_variable("$DIMAPOST", |w| w.write_string(1, &hdr.dim_alt_post))?;
+        // A DXF header names these; a DWG stores their handles.
+        if self.dxf_version >= DxfVersion::AC1015 {
+            self.write_header_variable("$DIMTXSTY", |w| {
+                w.write_string(7, &hdr.dim_text_style_name)
+            })?;
+            self.write_header_variable("$DIMLTYPE", |w| w.write_string(6, &hdr.dim_linetype_name))?;
+            self.write_header_variable("$DIMLTEX1", |w| {
+                w.write_string(6, &hdr.dim_linetype1_name)
+            })?;
+            self.write_header_variable("$DIMLTEX2", |w| {
+                w.write_string(6, &hdr.dim_linetype2_name)
+            })?;
+        }
         for (variable, stored, handle) in [
             (
                 "$DIMBLK",
@@ -843,9 +873,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         }
 
         // === UCS ===
-        if let Some(state) = &hdr.legacy {
-            self.write_header_variable("$UNITMODE", |w| w.write_i16(70, state.unit_mode))?;
-        }
+        self.write_header_variable("$UNITMODE", |w| w.write_i16(70, hdr.unit_mode))?;
         self.write_header_variable("$UCSORG", |w| {
             let v = &hdr.model_space_ucs_origin;
             w.write_double(10, v.x)?;
@@ -3822,19 +3850,21 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
 
         // Write reactor group (filter out reactors pointing to non-existent objects)
         if !common.reactors.is_empty() {
-            let valid_reactors: Vec<Handle> = if self.valid_handles.is_empty() {
-                common.reactors.clone()
+            let valid_reactors: Cow<'_, [Handle]> = if self.valid_handles.is_empty() {
+                Cow::Borrowed(&common.reactors)
             } else {
-                common
-                    .reactors
-                    .iter()
-                    .copied()
-                    .filter(|r| self.valid_handles.contains(r))
-                    .collect()
+                Cow::Owned(
+                    common
+                        .reactors
+                        .iter()
+                        .copied()
+                        .filter(|r| self.valid_handles.contains(r))
+                        .collect(),
+                )
             };
             if !valid_reactors.is_empty() {
                 self.writer.write_string(102, "{ACAD_REACTORS")?;
-                for reactor in &valid_reactors {
+                for reactor in valid_reactors.as_ref() {
                     self.writer.write_handle(330, *reactor)?;
                 }
                 self.writer.write_string(102, "}")?;
@@ -4651,10 +4681,17 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         let flags = crate::io::dxf::spline_flags::write(spline);
         self.writer.write_i16(70, flags)?;
 
+        let (clamped_cps, clamped_knots) = spline
+            .periodic_to_clamped_cubic()
+            .map(|(cps, kts)| (Some(cps), Some(kts)))
+            .unwrap_or((None, None));
+        let control_points = clamped_cps.as_deref().unwrap_or(&spline.control_points);
+        let knots = clamped_knots.as_deref().unwrap_or(&spline.knots);
+
         self.writer.write_i16(71, spline.degree as i16)?;
-        self.writer.write_i16(72, spline.knots.len() as i16)?;
+        self.writer.write_i16(72, knots.len() as i16)?;
         self.writer
-            .write_i16(73, spline.control_points.len() as i16)?;
+            .write_i16(73, control_points.len() as i16)?;
         self.writer.write_i16(74, spline.fit_points.len() as i16)?;
 
         // Knot / control-point / fit tolerances (round-trip the stored values).
@@ -4671,12 +4708,12 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         }
 
         // Knots
-        for knot in &spline.knots {
+        for knot in knots {
             self.writer.write_double(40, *knot)?;
         }
 
         // Control points (with optional weights for rational splines)
-        for (i, point) in spline.control_points.iter().enumerate() {
+        for (i, point) in control_points.iter().enumerate() {
             self.writer.write_point3d(10, *point)?;
             if spline.flags.rational {
                 let w = spline.weights.get(i).copied().unwrap_or(1.0);
@@ -5094,18 +5131,20 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
 
         // Associated entities (boundary handles)
         // Filter to only valid handles if valid_handles is populated
-        let valid_boundary_handles: Vec<Handle> = if self.valid_handles.is_empty() {
-            path.boundary_handles.clone()
+        let valid_boundary_handles: Cow<'_, [Handle]> = if self.valid_handles.is_empty() {
+            Cow::Borrowed(&path.boundary_handles)
         } else {
-            path.boundary_handles
-                .iter()
-                .copied()
-                .filter(|h| *h != Handle::NULL && self.valid_handles.contains(h))
-                .collect()
+            Cow::Owned(
+                path.boundary_handles
+                    .iter()
+                    .copied()
+                    .filter(|h| *h != Handle::NULL && self.valid_handles.contains(h))
+                    .collect(),
+            )
         };
         self.writer
             .write_i32(97, valid_boundary_handles.len() as i32)?;
-        for h in &valid_boundary_handles {
+        for h in valid_boundary_handles.as_ref() {
             self.writer.write_handle(330, *h)?;
         }
 
@@ -5126,18 +5165,10 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 self.writer.write_double(10, arc.center.x)?;
                 self.writer.write_double(20, arc.center.y)?;
                 self.writer.write_double(40, arc.radius)?;
-                // AutoCAD stores a clockwise edge's angles as 360 minus each
-                // (ezdxf's ArcEdge says the same), so the file means the same arc.
-                let (start, end) = if arc.counter_clockwise {
-                    (super::degrees(arc.start_angle), super::degrees(arc.end_angle))
-                } else {
-                    (
-                        360.0 - super::degrees(arc.start_angle),
-                        360.0 - super::degrees(arc.end_angle),
-                    )
-                };
-                self.writer.write_double(50, start)?;
-                self.writer.write_double(51, end)?;
+                self.writer
+                    .write_double(50, super::degrees(arc.start_angle))?;
+                self.writer
+                    .write_double(51, super::degrees(arc.end_angle))?;
                 self.writer
                     .write_i16(73, if arc.counter_clockwise { 1 } else { 0 })?;
             }
@@ -7671,19 +7702,21 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
 
         // Reactors (filter out references to non-existent objects)
         if !layout.reactors.is_empty() {
-            let valid_reactors: Vec<Handle> = if self.valid_handles.is_empty() {
-                layout.reactors.clone()
+            let valid_reactors: Cow<'_, [Handle]> = if self.valid_handles.is_empty() {
+                Cow::Borrowed(&layout.reactors)
             } else {
-                layout
-                    .reactors
-                    .iter()
-                    .copied()
-                    .filter(|r| self.valid_handles.contains(r))
-                    .collect()
+                Cow::Owned(
+                    layout
+                        .reactors
+                        .iter()
+                        .copied()
+                        .filter(|r| self.valid_handles.contains(r))
+                        .collect(),
+                )
             };
             if !valid_reactors.is_empty() {
                 self.writer.write_string(102, "{ACAD_REACTORS")?;
-                for r in &valid_reactors {
+                for r in valid_reactors.as_ref() {
                     self.writer.write_handle(330, *r)?;
                 }
                 self.writer.write_string(102, "}")?;

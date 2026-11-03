@@ -30,6 +30,10 @@ use crate::types::{Color, DxfVersion, Handle, Vector2, Vector3};
 use crate::xdata::XDataValue;
 use crate::Result;
 use std::collections::{HashMap, HashSet};
+
+/// Maps the read path fills on every record. The seed is fixed for the reason
+/// on [`CadDocument::entity_index`].
+pub(crate) type FixedMap<K, V> = HashMap<K, V, foldhash::fast::FixedState>;
 use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
@@ -563,6 +567,12 @@ pub struct HeaderVariables {
     pub dim_alt_tolerance_zero_tight: i16,
     /// DIMFIT/DIMATFIT - Fit options
     pub dim_fit: i16,
+    /// DIMFIT - the R13 fit variable that R2000 replaced with DIMATFIT
+    pub dim_fit_r13: i16,
+    /// DIMUNIT - the R13 unit format variable that R2000 replaced with DIMLUNIT
+    pub dim_unit: i16,
+    /// UNITMODE - display of fractional, feet and inches units
+    pub unit_mode: i16,
     /// DIMUPT - User positioned text
     pub dim_user_positioned_text: bool,
     /// DIMPOST - Primary units suffix
@@ -628,6 +638,8 @@ pub struct HeaderVariables {
     pub paper_ucs_ortho_ref: Handle,
     /// PUCSORTHOVIEW - Paper space UCS orthographic view type
     pub paper_ucs_ortho_view: i16,
+    /// PUCSBASE - name of the UCS the paper space orthographic origins are relative to
+    pub paper_ucs_base: String,
 
     // ==================== Handles/References ====================
     /// HANDSEED - Next available handle
@@ -1034,6 +1046,9 @@ impl Default for HeaderVariables {
             dim_alt_tolerance_zero_suppression: 0,
             dim_alt_tolerance_zero_tight: 0,
             dim_fit: 3,
+            dim_fit_r13: 0,
+            dim_unit: 0,
+            unit_mode: 0,
             dim_user_positioned_text: false,
             dim_post: String::new(),
             dim_alt_post: String::new(),
@@ -1070,6 +1085,7 @@ impl Default for HeaderVariables {
             ucs_ortho_view: 0,
             paper_ucs_ortho_ref: Handle::NULL,
             paper_ucs_ortho_view: 0,
+            paper_ucs_base: String::new(),
 
             // Handles
             handle_seed: 1,
@@ -1103,6 +1119,10 @@ impl Default for HeaderVariables {
             paper_ucs_ortho_origins: [Vector3::ZERO; 6],
             dim_arrow_block2_handle: Handle::NULL,
             dim_leader_arrow_block_handle: Handle::NULL,
+            dim_text_style_name: String::from("Standard"),
+            dim_linetype_name: String::from("ByBlock"),
+            dim_linetype1_name: String::from("ByBlock"),
+            dim_linetype2_name: String::from("ByBlock"),
             dim_line_weight: -2,     // ByBlock
             dim_ext_line_weight: -2, // ByBlock
 
@@ -1365,22 +1385,22 @@ pub struct CadDocument {
 
     /// Raw EED blobs per handle — populated during DWG read, consumed during DWG write.
     /// Keyed by the object/table-entry handle. Not serialized.
-    pub(crate) eed_by_handle: HashMap<Handle, Vec<(u64, Vec<u8>)>>,
+    pub(crate) eed_by_handle: FixedMap<Handle, Vec<(u64, Vec<u8>)>>,
 
     /// Structured XDATA for objects and symbol-table records, keyed by handle.
     /// Entity XDATA lives in `EntityCommon::extended_data`.
     pub object_xdata: HashMap<Handle, crate::xdata::ExtendedData>,
 
     /// Non-entity object xdictionary handles — populated during DWG read, consumed during DWG write.
-    pub(crate) xdic_by_handle: HashMap<Handle, Handle>,
+    pub(crate) xdic_by_handle: FixedMap<Handle, Handle>,
 
     /// Non-entity object reactors — populated during DWG read, consumed during DWG write.
-    pub(crate) reactors_by_handle: HashMap<Handle, Vec<Handle>>,
+    pub(crate) reactors_by_handle: FixedMap<Handle, Vec<Handle>>,
 
     /// Original BLOCK_HEADER entity handles from the DWG binary — includes sub-entity handles
     /// (vertices, faces, SEQENDs). Keyed by BlockRecord handle. Used by the writer to produce
     /// correct owned_object_count without re-expanding from the document model.
-    pub(crate) block_entity_handles: HashMap<Handle, Vec<Handle>>,
+    pub(crate) block_entity_handles: FixedMap<Handle, Vec<Handle>>,
 
     /// DWG version this document was read from (set by the DWG reader).
     /// Verbatim raw blobs (Unknown objects, EED) are encoded for this version
@@ -1426,13 +1446,13 @@ pub struct CadDocument {
     /// so that a writer defect can be bisected by object type
     /// (`ACADRUST_RAW_EXCLUDE`).
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub(crate) raw_records: HashMap<u64, (i16, Arc<crate::entities::RawRecord>)>,
+    pub(crate) raw_records: FixedMap<u64, (i16, Arc<crate::entities::RawRecord>)>,
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub(crate) original_objects: HashMap<Handle, ObjectType>,
+    pub(crate) original_objects: FixedMap<Handle, ObjectType>,
     /// Child record -> compound entity handle, captured with `raw_records`.
     /// Exclusions must serialize each compound entity and its children together.
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub(crate) raw_record_owners: HashMap<u64, u64>,
+    pub(crate) raw_record_owners: FixedMap<u64, u64>,
 
     /// `(handle, byte length, hash)` of SAB bodies when `raw_acds_data` was
     /// captured. Used to reject stale section passthrough after geometry edits.
@@ -1607,11 +1627,11 @@ impl CadDocument {
             source_path: None,
             dgn_ls_definitions: HashMap::new(),
             dgn_ls_components: HashMap::new(),
-            eed_by_handle: HashMap::new(),
+            eed_by_handle: FixedMap::default(),
             object_xdata: HashMap::new(),
-            xdic_by_handle: HashMap::new(),
-            reactors_by_handle: HashMap::new(),
-            block_entity_handles: HashMap::new(),
+            xdic_by_handle: FixedMap::default(),
+            reactors_by_handle: FixedMap::default(),
+            block_entity_handles: FixedMap::default(),
             dwg_source_version: None,
             preview: None,
             acis_sab_handles: Vec::new(),
@@ -1619,9 +1639,9 @@ impl CadDocument {
             r12_header_raw: None,
             r12_table_usage: HashMap::new(),
             r12_block_tags: HashMap::new(),
-            raw_records: HashMap::new(),
-            original_objects: HashMap::new(),
-            raw_record_owners: HashMap::new(),
+            raw_records: FixedMap::default(),
+            original_objects: FixedMap::default(),
+            raw_record_owners: FixedMap::default(),
             raw_acds_fingerprint: Vec::new(),
             dwg_data_store_handles: HashSet::new(),
             section_view_style: None,
@@ -4523,6 +4543,335 @@ impl CadDocument {
         record_handle
     }
 
+    /// Returns the Named Objects Dictionary (root dictionary) if present.
+    pub fn named_objects_dictionary(&self) -> Option<&crate::objects::Dictionary> {
+        match self.objects.get(&self.header.named_objects_dict_handle)? {
+            ObjectType::Dictionary(dict) => Some(dict),
+            _ => None,
+        }
+    }
+
+    /// Mutable counterpart of [`CadDocument::named_objects_dictionary`].
+    pub fn named_objects_dictionary_mut(&mut self) -> Option<&mut crate::objects::Dictionary> {
+        match self.objects.get_mut(&self.header.named_objects_dict_handle)? {
+            ObjectType::Dictionary(dict) => Some(dict),
+            _ => None,
+        }
+    }
+
+    /// Ensure the Named Objects Dictionary exists, allocating and inserting a new root dictionary if missing.
+    pub fn ensure_named_objects_dictionary(&mut self) -> Handle {
+        let mut root_handle = self.header.named_objects_dict_handle;
+        if root_handle.is_null()
+            || !matches!(self.objects.get(&root_handle), Some(ObjectType::Dictionary(_)))
+        {
+            root_handle = self.allocate_handle();
+            let mut root = crate::objects::Dictionary::new();
+            root.handle = root_handle;
+            self.objects
+                .insert(root_handle, ObjectType::Dictionary(root));
+            self.header.named_objects_dict_handle = root_handle;
+        }
+        root_handle
+    }
+
+    /// Resolve a sub-dictionary by name from the Named Objects Dictionary.
+    pub fn get_subdictionary(&self, name: &str) -> Option<Handle> {
+        self.named_objects_dictionary()?.get(name)
+    }
+
+    /// Ensure a named sub-dictionary exists under the Named Objects Dictionary.
+    /// If it already exists, its handle is returned; otherwise, a new dictionary is allocated,
+    /// owned by the root dictionary, inserted into `objects`, and registered under `name`.
+    pub fn ensure_subdictionary(&mut self, name: &str) -> Handle {
+        let root_handle = self.ensure_named_objects_dictionary();
+        if let Some(ObjectType::Dictionary(root)) = self.objects.get(&root_handle) {
+            if let Some(existing) = root.get(name) {
+                if matches!(self.objects.get(&existing), Some(ObjectType::Dictionary(_))) {
+                    return existing;
+                }
+            }
+        }
+
+        let sub_handle = self.allocate_handle();
+        let mut sub_dict = crate::objects::Dictionary::new();
+        sub_dict.handle = sub_handle;
+        sub_dict.owner = root_handle;
+        self.objects
+            .insert(sub_handle, ObjectType::Dictionary(sub_dict));
+
+        if let Some(ObjectType::Dictionary(root)) = self.objects.get_mut(&root_handle) {
+            root.insert(name, sub_handle);
+        }
+
+        sub_handle
+    }
+
+    /// Remove a named sub-dictionary from the Named Objects Dictionary and remove its object from the document.
+    /// Returns the removed sub-dictionary handle if found.
+    pub fn remove_subdictionary(&mut self, name: &str) -> Option<Handle> {
+        let root_handle = self.header.named_objects_dict_handle;
+        let sub_handle = match self.objects.get_mut(&root_handle)? {
+            ObjectType::Dictionary(root) => root.remove(name)?,
+            _ => return None,
+        };
+        self.objects.remove(&sub_handle);
+        Some(sub_handle)
+    }
+
+    /// Return the group with the given name from the `ACAD_GROUP` dictionary.
+    pub fn get_group(&self, name: &str) -> Option<&crate::objects::Group> {
+        let group_dict_handle = self.header.acad_group_dict_handle;
+        let ObjectType::Dictionary(dict) = self.objects.get(&group_dict_handle)? else {
+            return None;
+        };
+        let group_handle = dict.get(name)?;
+        match self.objects.get(&group_handle)? {
+            ObjectType::Group(group) => Some(group),
+            _ => None,
+        }
+    }
+
+    /// Mutable counterpart of [`CadDocument::get_group`].
+    pub fn get_group_mut(&mut self, name: &str) -> Option<&mut crate::objects::Group> {
+        let group_dict_handle = self.header.acad_group_dict_handle;
+        let group_handle = match self.objects.get(&group_dict_handle)? {
+            ObjectType::Dictionary(dict) => dict.get(name)?,
+            _ => return None,
+        };
+        match self.objects.get_mut(&group_handle)? {
+            ObjectType::Group(group) => Some(group),
+            _ => None,
+        }
+    }
+
+    /// Return the group with the given handle.
+    pub fn get_group_by_handle(&self, handle: Handle) -> Option<&crate::objects::Group> {
+        match self.objects.get(&handle)? {
+            ObjectType::Group(group) => Some(group),
+            _ => None,
+        }
+    }
+
+    /// Mutable counterpart of [`CadDocument::get_group_by_handle`].
+    pub fn get_group_by_handle_mut(
+        &mut self,
+        handle: Handle,
+    ) -> Option<&mut crate::objects::Group> {
+        match self.objects.get_mut(&handle)? {
+            ObjectType::Group(group) => Some(group),
+            _ => None,
+        }
+    }
+
+    /// Iterate over all groups defined in the document.
+    pub fn groups(&self) -> impl Iterator<Item = &crate::objects::Group> + '_ {
+        self.objects.values().filter_map(|obj| match obj {
+            ObjectType::Group(group) => Some(group),
+            _ => None,
+        })
+    }
+
+    /// Create a named group containing the given entity handles, registering it in `ACAD_GROUP`
+    /// and adding the group reactor to each referenced entity.
+    pub fn create_group(
+        &mut self,
+        name: &str,
+        entities: &[Handle],
+    ) -> crate::error::Result<Handle> {
+        if name.is_empty() {
+            return Err(crate::error::DxfError::Custom(
+                "group name cannot be empty".into(),
+            ));
+        }
+
+        let mut group_dict_handle = self.header.acad_group_dict_handle;
+        if group_dict_handle.is_null()
+            || !matches!(
+                self.objects.get(&group_dict_handle),
+                Some(ObjectType::Dictionary(_))
+            )
+        {
+            group_dict_handle = self.ensure_subdictionary("ACAD_GROUP");
+            self.header.acad_group_dict_handle = group_dict_handle;
+        }
+
+        let group_handle = self.allocate_handle();
+        let mut group = crate::objects::Group::new(name);
+        group.handle = group_handle;
+        group.owner = group_dict_handle;
+
+        for &e in entities {
+            group.add_entity(e);
+            if let Some(entity) = self.get_entity_mut(e) {
+                if !entity.common().reactors.contains(&group_handle) {
+                    entity.common_mut().reactors.push(group_handle);
+                }
+            }
+        }
+
+        self.objects
+            .insert(group_handle, ObjectType::Group(group));
+
+        if let Some(ObjectType::Dictionary(dict)) = self.objects.get_mut(&group_dict_handle) {
+            dict.insert(name, group_handle);
+        }
+
+        Ok(group_handle)
+    }
+
+    /// Create an unnamed group containing the given entity handles.
+    /// Allocates an auto-incremented `*An` name according to AutoCAD conventions.
+    pub fn create_unnamed_group(&mut self, entities: &[Handle]) -> crate::error::Result<Handle> {
+        let mut group_dict_handle = self.header.acad_group_dict_handle;
+        if group_dict_handle.is_null()
+            || !matches!(
+                self.objects.get(&group_dict_handle),
+                Some(ObjectType::Dictionary(_))
+            )
+        {
+            group_dict_handle = self.ensure_subdictionary("ACAD_GROUP");
+            self.header.acad_group_dict_handle = group_dict_handle;
+        }
+
+        let name = {
+            let dict = match self.objects.get(&group_dict_handle) {
+                Some(ObjectType::Dictionary(d)) => d,
+                _ => {
+                    return Err(crate::error::DxfError::Custom(
+                        "ACAD_GROUP missing".into(),
+                    ))
+                }
+            };
+            let mut i = 1;
+            loop {
+                let candidate = format!("*A{}", i);
+                if !dict.contains_key(&candidate) {
+                    break candidate;
+                }
+                i += 1;
+            }
+        };
+
+        let group_handle = self.allocate_handle();
+        let mut group = crate::objects::Group::new(&name);
+        group.handle = group_handle;
+        group.owner = group_dict_handle;
+        group.unnamed = true;
+
+        for &e in entities {
+            group.add_entity(e);
+            if let Some(entity) = self.get_entity_mut(e) {
+                if !entity.common().reactors.contains(&group_handle) {
+                    entity.common_mut().reactors.push(group_handle);
+                }
+            }
+        }
+
+        self.objects
+            .insert(group_handle, ObjectType::Group(group));
+
+        if let Some(ObjectType::Dictionary(dict)) = self.objects.get_mut(&group_dict_handle) {
+            dict.insert(&name, group_handle);
+        }
+
+        Ok(group_handle)
+    }
+
+    /// Add an entity to an existing group, updating both the group's entity list and the entity's reactors.
+    pub fn add_entity_to_group(
+        &mut self,
+        group_name: &str,
+        entity: Handle,
+    ) -> crate::error::Result<()> {
+        let group_dict_handle = self.header.acad_group_dict_handle;
+        let group_handle = match self.objects.get(&group_dict_handle) {
+            Some(ObjectType::Dictionary(dict)) => dict.get(group_name).ok_or_else(|| {
+                crate::error::DxfError::Custom(format!("group not found: {}", group_name))
+            })?,
+            _ => {
+                return Err(crate::error::DxfError::Custom(
+                    "ACAD_GROUP dictionary missing".into(),
+                ))
+            }
+        };
+
+        if let Some(ObjectType::Group(group)) = self.objects.get_mut(&group_handle) {
+            group.add_entity(entity);
+        } else {
+            return Err(crate::error::DxfError::Custom(
+                "group object missing".into(),
+            ));
+        }
+
+        if let Some(e) = self.get_entity_mut(entity) {
+            if !e.common().reactors.contains(&group_handle) {
+                e.common_mut().reactors.push(group_handle);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove an entity from a group, updating both the group's entity list and detaching the group reactor.
+    pub fn remove_entity_from_group(
+        &mut self,
+        group_name: &str,
+        entity: Handle,
+    ) -> crate::error::Result<()> {
+        let group_dict_handle = self.header.acad_group_dict_handle;
+        let group_handle = match self.objects.get(&group_dict_handle) {
+            Some(ObjectType::Dictionary(dict)) => dict.get(group_name).ok_or_else(|| {
+                crate::error::DxfError::Custom(format!("group not found: {}", group_name))
+            })?,
+            _ => {
+                return Err(crate::error::DxfError::Custom(
+                    "ACAD_GROUP dictionary missing".into(),
+                ))
+            }
+        };
+
+        if let Some(ObjectType::Group(group)) = self.objects.get_mut(&group_handle) {
+            group.remove_entity(entity);
+        } else {
+            return Err(crate::error::DxfError::Custom(
+                "group object missing".into(),
+            ));
+        }
+
+        if let Some(e) = self.get_entity_mut(entity) {
+            e.common_mut().reactors.retain(|&r| r != group_handle);
+        }
+
+        Ok(())
+    }
+
+    /// Remove a group from `ACAD_GROUP`, delete the group object, and remove its reactor handle from grouped entities.
+    /// Returns the removed `Group` if found.
+    pub fn remove_group(&mut self, name: &str) -> Option<crate::objects::Group> {
+        let group_dict_handle = self.header.acad_group_dict_handle;
+        let group_handle = match self.objects.get_mut(&group_dict_handle)? {
+            ObjectType::Dictionary(dict) => dict.remove(name)?,
+            _ => return None,
+        };
+
+        let group = match self.objects.remove(&group_handle)? {
+            ObjectType::Group(g) => g,
+            other => {
+                self.objects.insert(group_handle, other);
+                return None;
+            }
+        };
+
+        for &e in &group.entities {
+            if let Some(entity) = self.get_entity_mut(e) {
+                entity.common_mut().reactors.retain(|&r| r != group_handle);
+            }
+        }
+
+        Some(group)
+    }
+
     /// Assign dictionary keys to XRecord objects after file loading.
     pub fn resolve_xrecord_names(&mut self) {
         let mut names: Vec<(Handle, String)> = self
@@ -4544,6 +4893,24 @@ impl CadDocument {
         for (handle, name) in names {
             if let Some(ObjectType::XRecord(record)) = self.objects.get_mut(&handle) {
                 record.name = name;
+            }
+        }
+    }
+
+    /// Assign dictionary keys to Group objects after file loading.
+    pub fn resolve_group_names(&mut self) {
+        let group_dict_handle = self.header.acad_group_dict_handle;
+        let group_names: Vec<(Handle, String)> = match self.objects.get(&group_dict_handle) {
+            Some(ObjectType::Dictionary(dict)) => dict
+                .entries
+                .iter()
+                .map(|(name, handle)| (*handle, name.clone()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for (handle, name) in group_names {
+            if let Some(ObjectType::Group(group)) = self.objects.get_mut(&handle) {
+                group.name = name;
             }
         }
     }
@@ -6345,7 +6712,38 @@ impl CadDocument {
         }
         self.resolve_book_colors();
         self.resolve_xrecord_names();
+        self.resolve_group_names();
         self.resolve_xrecord_backed_properties();
+        if let Some(s) = self
+            .text_styles
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(&self.header.current_text_style_name))
+        {
+            let is_default_name = self.header.current_text_style_name.eq_ignore_ascii_case("Standard");
+            let handle_is_valid_custom = !self.header.current_text_style_handle.is_null()
+                && self
+                    .text_styles
+                    .iter()
+                    .any(|t| t.handle == self.header.current_text_style_handle && !t.name.eq_ignore_ascii_case("Standard"));
+            if !is_default_name || !handle_is_valid_custom {
+                self.header.current_text_style_handle = s.handle;
+            }
+        }
+        if let Some(s) = self
+            .dim_styles
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(&self.header.current_dimstyle_name))
+        {
+            let is_default_name = self.header.current_dimstyle_name.eq_ignore_ascii_case("Standard");
+            let handle_is_valid_custom = !self.header.current_dimstyle_handle.is_null()
+                && self
+                    .dim_styles
+                    .iter()
+                    .any(|d| d.handle == self.header.current_dimstyle_handle && !d.name.eq_ignore_ascii_case("Standard"));
+            if !is_default_name || !handle_is_valid_custom {
+                self.header.current_dimstyle_handle = s.handle;
+            }
+        }
         self.header.handle_seed = self.header.handle_seed.max(self.next_handle);
     }
 
