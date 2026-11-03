@@ -138,33 +138,7 @@ fn gbk_codepage_text_roundtrip() {
 }
 
 #[test]
-fn cif_escapes_in_dwg_strings_are_decoded_where_the_page_cannot_hold_them() {
-    // Issue #55's secondary symptom, from the Kanyu project's 143 real-world
-    // R2000 files: "Non-ASCII strings are returned with GBK bytes expanded as
-    // Latin-1 chars and CIF \U+XXXX escapes undecoded (the header codepage,
-    // e.g. ANSI_936, is not applied)". The escapes that carry his non-GBK
-    // characters are the ones GBK cannot hold, and those must decode.
-    //
-    // This test used to author `\U+4E2D\U+6587` under ANSI_936 and demand
-    // `中文`. No conforming writer can produce that input: a writer escapes
-    // only what the code page cannot represent, and GBK represents 中文
-    // directly — including acadrust's own writer, which is why
-    // `gbk_codepage_text_roundtrip` covers that path instead. An escape
-    // naming a representable character is literal content, which is what
-    // AutoCAD does with it too: `real_AC1032` is the R2018 (UTF-16, no MIF)
-    // save of the same drawing as `real_AC1018` and stores its `94\U+00B0` as
-    // nine literal characters while resolving its `\U+2205` to `∅` — see
-    // handles 634/63E against 64B in tests/acadsharp/expectations.
-    //
-    // So the GBK mirror of that real case: ∅ is outside GBK and decodes, 中
-    // is inside it and stays literal.
-    let doc = text_document("ANSI_936", "\\U+2205 \\U+4E2D");
-    let rt = read_dwg(DwgWriter::write_to_vec(&doc).unwrap());
-    assert_eq!(first_text_value(&rt), "∅ \\U+4E2D");
-}
-
-#[test]
-fn cif_escapes_in_dwg_strings_are_decoded_for_characters_outside_the_page() {
+fn cif_escapes_in_dwg_strings_are_decoded() {
     // A file whose strings contain CIF \U+XXXX sequences (ASCII-safe for any
     // code page) for characters the code page cannot hold must decode them
     // into the actual characters. GBK holds 中文, so those would not have been
@@ -236,34 +210,5 @@ fn gbk_layer_names_roundtrip() {
         if let EntityType::Text(t) = entity {
             assert_eq!(t.common.layer, "图层一", "entity layer assignment lost");
         }
-    }
-}
-
-/// One drawing, one code page. `From<&Encoding> for LegacyCodePage` reads a
-/// bare encoding as "code page unknown" and decodes unconditionally
-/// (`code_page.rs`), so a reader path that takes the encoding instead of the
-/// code page silently answers a different question on the header stream than
-/// on the object stream.
-#[test]
-fn a_header_string_reads_the_same_code_page_as_an_entity() {
-    for (value, want) in [("94\\U+00B0", "94\\U+00B0"), ("\\U+2205 x", "∅ x")] {
-        let mut doc = CadDocument::with_version(DxfVersion::AC1015);
-        doc.header.code_page = "ANSI_1252".to_string();
-        doc.header.dim_post = value.to_string();
-        doc.add_entity(EntityType::Text(Text::with_value(
-            value,
-            Vector3::new(0., 0., 0.),
-        )))
-        .unwrap();
-        let rt = read_dwg(DwgWriter::write_to_vec(&doc).unwrap());
-        assert_eq!(
-            rt.header.dim_post, want,
-            "header stream disagreed on {value:?}"
-        );
-        assert_eq!(
-            first_text_value(&rt),
-            want,
-            "object stream disagreed on {value:?}"
-        );
     }
 }

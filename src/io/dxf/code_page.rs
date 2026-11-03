@@ -533,15 +533,6 @@ fn round_trips(encoding: LegacyEncoding, bytes: &[u8], ch: char) -> bool {
     !bad && back.chars().eq(std::iter::once(ch))
 }
 
-/// Whether `encoding` can represent `ch`, which is the exact condition
-/// [`encode_legacy_string`] escapes on. Every DWG code page is stateless, so
-/// asking one character at a time is safe.
-fn holds(encoding: LegacyEncoding, ch: char) -> bool {
-    let mut buf = [0u8; 4];
-    let (bytes, _, unmappable) = encoding.encode(ch.encode_utf8(&mut buf));
-    !unmappable && round_trips(encoding, &bytes, ch)
-}
-
 /// Decode ACAD CIF `\U+XXXX` escapes (exactly four hex digits) into
 /// Unicode characters, every one of them. Use [`decode_cif_escapes_in`] where
 /// the drawing's code page is known.
@@ -551,71 +542,34 @@ fn holds(encoding: LegacyEncoding, ch: char) -> bool {
 /// text, and invalid code points are dropped — matching the MTEXT
 /// formatter's behavior for the same escapes.
 pub fn decode_cif_escapes(text: &str) -> String {
-    decode_cif_escapes_inner(text, None)
+    decode_cif(text)
 }
 
 /// Decode ACAD CIF `\U+XXXX` escapes, but only where the escape is transport
 /// and not content.
 ///
-/// CIF exists solely to carry the characters a code page cannot hold:
-/// [`encode_legacy_string`] escapes a character only when the code page
-/// cannot represent it, and emits it verbatim otherwise. So an escape naming
-/// a character the code page *can* represent was never produced by that
-/// mechanism. It is literal drawing content, and the characters the file holds
-/// go back out as they are. The test is the encoder's own condition, applied
-/// to the combined scalar rather than to each UTF-16 unit, because
-/// [`encode_legacy_string`] escapes an astral character as a surrogate pair.
-///
-/// The asymmetry was observable: `real_AC1018` carries the MTEXT content
-/// `94\U+00B0` in an ANSI_1252 drawing, where `U+00B0` is representable and
-/// nothing escaped it, yet an ungated decode turned those eight characters
-/// into `94°`. `real_AC1032` is R2007+, stores text as UTF-16 and never
-/// reaches this path, so it shows the same content intact.
-///
-/// That condition may only be put to an encoding that is the code page
-/// ([`LegacyEncoding::is_faithful`]). For a bare `encoding_rs` row, which may
-/// be a stand-in, every well-formed escape decodes, as before the gate
-/// existed. A lone surrogate names no scalar, so no encoder can have escaped
-/// one: it is content under any encoding and crosses verbatim.
-pub fn decode_cif_escapes_in(text: &str, encoding: impl CodePageGate) -> String {
-    let encoding = encoding.gate();
-    // UTF-8 holds every character, so nothing in it was ever written as
-    // transport and its escapes are all text.
+/// [`encode_legacy_string`] escapes a character only when the code page cannot
+/// hold it, but AutoCAD decodes every well-formed escape in a pre-2007 drawing,
+/// DXF or DWG, held by the page or not (some writers escape every non-ASCII
+/// character to keep the file ASCII), so they all decode here (#260). UTF-8
+/// holds every character, so nothing in it was ever written as transport and
+/// its escapes are all text.
+pub fn decode_cif_escapes_in(text: &str, encoding: impl Into<LegacyEncoding>) -> String {
+    let encoding = encoding.into();
     if encoding == LegacyEncoding::Whatwg(encoding_rs::UTF_8) {
         return text.to_string();
     }
-    decode_cif_escapes_inner(text, Some(encoding))
+    decode_cif(text)
 }
 
 /// [`decode_legacy_escapes`] for text read from a drawing whose code page is
 /// `encoding`: MIF escapes decode as before, CIF escapes by
 /// [`decode_cif_escapes_in`].
-pub fn decode_legacy_escapes_in(text: &str, encoding: impl CodePageGate) -> String {
-    encoding.gate().decode_escapes(text)
+pub fn decode_legacy_escapes_in(text: &str, encoding: impl Into<LegacyEncoding>) -> String {
+    decode_cif_escapes_in(&decode_mif_escapes(text), encoding)
 }
 
-/// What [`decode_cif_escapes_in`] accepts as the code page of a drawing: a
-/// [`LegacyEncoding`] as it stands, or a bare `encoding_rs` row, which may only
-/// be a stand-in for the page the drawing declared and so asks nothing: every
-/// well-formed escape decodes. UTF-8 is the exception, it holds every
-/// character, so its escapes are text and stay as they are.
-pub trait CodePageGate {
-    fn gate(self) -> LegacyEncoding;
-}
-
-impl CodePageGate for LegacyEncoding {
-    fn gate(self) -> LegacyEncoding {
-        self
-    }
-}
-
-impl CodePageGate for &'static Encoding {
-    fn gate(self) -> LegacyEncoding {
-        LegacyEncoding::Whatwg(self)
-    }
-}
-
-fn decode_cif_escapes_inner(text: &str, gate: Option<LegacyEncoding>) -> String {
+fn decode_cif(text: &str) -> String {
     if !text.contains("\\U+") {
         return text.to_string();
     }
@@ -633,7 +587,6 @@ fn decode_cif_escapes_inner(text: &str, gate: Option<LegacyEncoding>) -> String 
     while i < len {
         if chars[i] == '\\' && i + 7 <= len && chars[i + 1] == 'U' && chars[i + 2] == '+' {
             if let Some(unit) = hex_at(i + 3) {
-                let escape_start = i;
                 i += 7;
                 let mut units = [unit, 0];
                 let mut count = 1usize;
@@ -652,19 +605,9 @@ fn decode_cif_escapes_inner(text: &str, gate: Option<LegacyEncoding>) -> String 
                         }
                     }
                 }
-                match std::char::decode_utf16(units[..count].iter().copied()).next() {
-                    // A faithful encoding that can hold `ch` says nothing
-                    // escaped it, so the escape is content: the characters
-                    // the file holds go back out, copied rather than
-                    // re-spelled (`hex_at` accepts lower-case digits).
-                    Some(Ok(ch)) if gate.is_some_and(|e| e.is_faithful() && holds(e, ch)) => {
-                        out.extend(chars[escape_start..i].iter().copied());
-                    }
-                    Some(Ok(ch)) => out.push(ch),
-                    // A lone surrogate, which the gated form keeps verbatim
-                    // and the plain form drops.
-                    _ if gate.is_some() => out.extend(chars[escape_start..i].iter().copied()),
-                    _ => {}
+                if let Some(Ok(ch)) = std::char::decode_utf16(units[..count].iter().copied()).next()
+                {
+                    out.push(ch);
                 }
                 continue;
             }
@@ -832,39 +775,33 @@ mod tests {
     }
 
     #[test]
-    fn test_gated_cif_decode_follows_the_code_page() {
+    fn test_cif_decode_in_a_legacy_page_decodes_every_escape() {
         let w1252 = encoding_from_code_page("ANSI_1252").unwrap();
-        // Held by the page: content, copied as written (hex case included).
-        assert_eq!(decode_cif_escapes_in(r"94\U+00B0", w1252), r"94\U+00B0");
-        assert_eq!(decode_cif_escapes_in(r"94\U+00b0", w1252), r"94\U+00b0");
-        assert_eq!(
-            decode_cif_escapes_in(r"\U+0041\U+0042", w1252),
-            r"\U+0041\U+0042"
-        );
-        // Not held: transport escape, decoded, surrogate pairs as one scalar.
+        // Held by the page or not, a well-formed escape decodes, as in AutoCAD.
+        assert_eq!(decode_cif_escapes_in(r"94\U+00B0", w1252), "94\u{B0}");
+        assert_eq!(decode_cif_escapes_in(r"94\U+00b0", w1252), "94\u{B0}");
+        assert_eq!(decode_cif_escapes_in(r"\U+0041\U+0042", w1252), "AB");
         assert_eq!(decode_cif_escapes_in(r"\U+2205 x", w1252), "\u{2205} x");
+        // Surrogate pairs as one scalar.
         assert_eq!(decode_cif_escapes_in(r"\U+D83D\U+DE00", w1252), "\u{1F600}");
         assert_eq!(
             decode_cif_escapes_in(r"\U+D83D\U+DE00", encoding_rs::SHIFT_JIS),
             "\u{1F600}"
         );
-        // The same character is held by one page and not by another.
-        assert_eq!(decode_cif_escapes_in(r"\U+0411", w1252), "\u{411}");
         assert_eq!(
             decode_cif_escapes_in(r"\U+0411", encoding_from_code_page("ANSI_1251").unwrap()),
-            r"\U+0411"
+            "\u{411}"
         );
-        // A bare row names no code page, so it asks nothing.
-        assert_eq!(decode_cif_escapes_in(r"94\U+00B0", encoding_rs::WINDOWS_1252), "94\u{B0}");
+        assert_eq!(
+            decode_cif_escapes_in(r"\U+00E9", LegacyEncoding::Oem(437)),
+            "\u{E9}"
+        );
+        // A malformed escape stays as written.
+        assert_eq!(decode_cif_escapes_in(r"94\U+00B", w1252), r"94\U+00B");
         // UTF-8 holds every character, so its escapes are text.
         assert_eq!(
             decode_cif_escapes_in(r"\U+0041", encoding_rs::UTF_8),
             r"\U+0041"
-        );
-        // An OEM page is asked too.
-        assert_eq!(
-            decode_cif_escapes_in(r"\U+00E9", LegacyEncoding::Oem(437)),
-            r"\U+00E9"
         );
     }
 
@@ -887,26 +824,15 @@ mod tests {
     }
 
     #[test]
-    fn a_cif_escape_is_transport_only_where_the_page_cannot_hold_it() {
+    fn a_cif_escape_decodes_whether_or_not_the_page_holds_the_character() {
+        // AutoCAD decodes every well-formed escape in a pre-2007 drawing (#260).
         let ansi_1252 = encoding_from_code_page("ANSI_1252").unwrap();
-        assert!(ansi_1252.is_faithful());
         assert_eq!(decode_cif_escapes_in("ab\\U+4E2Dcd", ansi_1252), "ab中cd");
-        // An escape naming a character the page holds was never written by CIF:
-        // it is content and stays literal, upper or lower case.
-        assert_eq!(decode_cif_escapes_in("94\\U+00B0", ansi_1252), "94\\U+00B0");
-        assert_eq!(decode_cif_escapes_in("94\\U+00b0", ansi_1252), "94\\U+00b0");
-        assert_eq!(decode_cif_escapes_in("\\U+220545,6", ansi_1252), "∅45,6");
-        // The same escape flips with the code page: Cyrillic 1251 has no ø.
-        assert_eq!(decode_cif_escapes_in("\\U+00F8", ansi_1252), "\\U+00F8");
-        assert_eq!(
-            decode_cif_escapes_in("\\U+00F8", encoding_from_code_page("ANSI_1251").unwrap()),
-            "ø"
-        );
+        assert_eq!(decode_cif_escapes_in("94\\U+00B0", ansi_1252), "94°");
+        assert_eq!(decode_cif_escapes_in("94\\U+00b0", ansi_1252), "94°");
         // Exactly four hex digits; malformed escapes stay literal.
         assert_eq!(decode_cif_escapes_in("\\U+22052", ansi_1252), "∅2");
         assert_eq!(decode_cif_escapes_in("\\U+GGGG", ansi_1252), "\\U+GGGG");
-        // A lone surrogate names no scalar, so no writer escaped one: verbatim.
-        assert_eq!(decode_cif_escapes_in("A\\U+D800B", ansi_1252), "A\\U+D800B");
         assert_eq!(decode_cif_escapes_in("\\U+D83D\\U+DE00", ansi_1252), "😀");
     }
 
