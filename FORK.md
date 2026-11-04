@@ -15,7 +15,7 @@ To see the difference at any time: `git diff upstream/main origin/main --stat`.
 
 ## Tests the fork adds
 
-`tests/insert_zero_scale.rs` with `tests/data/insert-zero-scale.dwg` (#52), `tests/polyline_normal_issue_160.rs`
+`tests/insert_zero_scale.rs` with `tests/data/insert-zero-scale.dwg` (#52), `tests/issue_60_truncated_r2004_header_trailer.rs` (#60), `tests/polyline_normal_issue_160.rs`
 (the heavy POLYLINE extrusion survives the DXF writer; upstream passes it, it stays as a regression guard).
 
 ## Fork machinery
