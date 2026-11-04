@@ -10,19 +10,19 @@ To see the difference at any time: `git diff upstream/main origin/main --stat`.
 
 | Patch | Why libviprs needs it | Upstream status |
 | --- | --- | --- |
-| `Insert::set_scale_unchecked`, used by the DWG reader for INSERT and MINSERT (#52) | the reader reports the scale the file stores, even 0.0, instead of rewriting it to 1e-12 | not proposed yet, draft written, waiting for approval |
-| R2004 header trailer is optional (#60) | DWG files written by LibreDWG (the oracle fixtures) stop the header before the trailing BitLongs and fail to read | not proposed yet, draft written, waiting for approval |
+| `Insert::set_scale_unchecked` in `src/entities/insert.rs`, used by the DWG reader for INSERT and MINSERT in `src/io/dwg/dwg_document_builder.rs` (#52) | the reader reports the scale the file stores, even 0.0, instead of rewriting it to 1e-12 | not proposed yet, draft written, waiting for approval |
+| R2004 header trailer is optional, `src/io/dwg/dwg_stream_readers/header_reader.rs` (#60, merged as #67, the rev libviprs pins) | DWG files written by LibreDWG (the oracle fixtures) stop the header before the trailing BitLongs and fail to read | not proposed yet, draft written, waiting for approval |
 
 ## Tests the fork adds
 
-`tests/insert_zero_scale.rs` with `tests/data/insert-zero-scale.dwg` (#52), `tests/polyline_normal_issue_160.rs`
+`tests/insert_zero_scale.rs` with `tests/data/insert-zero-scale.dwg` (#52), `tests/issue_60_truncated_r2004_header_trailer.rs` (#60), `tests/polyline_normal_issue_160.rs`
 (the heavy POLYLINE extrusion survives the DXF writer; upstream passes it, it stays as a regression guard).
 
-## Fork machinery waiting on a decision (#47)
+## Fork machinery
 
-`.github/workflows/ci.yml`, `Cargo.lock`, `SUITE_REV`, `tests/suite_pin_check.rs`, `tests/suite_rev_reachable.rs`,
-`tools/suite_pin_check.sh`, `tests/acadsharp/README.md`: the acadsharp-rs-tests pin. The parity suite is an
-experiment now, so these can go, but removing the suite pin is the maintainer's call.
+None. The CI workflow, `.gitignore`, `AGENTS.md`, `CONTRIBUTING.md`, `CHANGELOG.md` and the templates are upstream's, `Cargo.lock`
+is untracked like upstream, and the acadsharp-rs-tests suite pin (`SUITE_REV`, its two tests and the check script) is gone (#47).
+The fork no longer asserts a parity-suite revision; the suite pins this repo itself.
 
 ## Dropped on purpose (taken from upstream)
 
