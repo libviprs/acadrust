@@ -30,15 +30,43 @@ use crate::types::{Color, DxfVersion, Handle, Vector2, Vector3};
 use crate::xdata::XDataValue;
 use crate::Result;
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 
-/// Maps the read path fills on every record. The seed is fixed for the reason
-/// on [`CadDocument::entity_index`].
-pub(crate) type FixedMap<K, V> = HashMap<K, V, foldhash::fast::FixedState>;
+/// Maps the read path fills on every record, keyed by values from the file.
+/// See [`SeededState`].
+pub(crate) type SeededMap<K, V> = HashMap<K, V, SeededState>;
 use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
 #[path = "document/evaluated_block_tests.rs"]
 mod evaluated_block_tests;
+
+#[cfg(test)]
+#[path = "document/map_seed_tests.rs"]
+mod map_seed_tests;
+
+/// foldhash under a seed drawn for each map and kept in the map. A file cannot
+/// be crafted in advance to collide, as it can against a fixed seed, and a
+/// plugin in another binary hashes exactly as the host did, which foldhash's
+/// `RandomState` does not allow (see [`CadDocument::entity_index`]).
+#[derive(Clone, Debug)]
+pub(crate) struct SeededState(foldhash::fast::FixedState);
+
+impl Default for SeededState {
+    fn default() -> Self {
+        let seed = std::collections::hash_map::RandomState::new().hash_one(0u64);
+        Self(foldhash::fast::FixedState::with_seed(seed))
+    }
+}
+
+impl BuildHasher for SeededState {
+    type Hasher = <foldhash::fast::FixedState as BuildHasher>::Hasher;
+
+    #[inline(always)]
+    fn build_hasher(&self) -> Self::Hasher {
+        self.0.build_hasher()
+    }
+}
 
 fn material_checker_texture(entries: &[XRecordEntry]) -> Option<MaterialTexture> {
     if !entries.iter().any(|entry| {
@@ -1311,8 +1339,9 @@ pub struct CadDocument {
     /// The hasher must not depend on the process: plugins read a document the
     /// host built through a shared reference across a dynamic-library
     /// boundary, and foldhash's `RandomState` mixes in a per-process global
-    /// seed, so every lookup from the other binary missed.
-    pub(crate) entity_index: std::collections::HashMap<Handle, usize, foldhash::fast::FixedState>,
+    /// seed, so every lookup from the other binary missed. [`SeededState`]
+    /// keeps its seed in the map, where the other binary finds it.
+    pub(crate) entity_index: SeededMap<Handle, usize>,
 
     /// All objects in the document (indexed by handle)
     pub objects: HashMap<Handle, ObjectType>,
@@ -1369,22 +1398,22 @@ pub struct CadDocument {
 
     /// Raw EED blobs per handle — populated during DWG read, consumed during DWG write.
     /// Keyed by the object/table-entry handle. Not serialized.
-    pub(crate) eed_by_handle: FixedMap<Handle, Vec<(u64, Vec<u8>)>>,
+    pub(crate) eed_by_handle: SeededMap<Handle, Vec<(u64, Vec<u8>)>>,
 
     /// Structured XDATA for objects and symbol-table records, keyed by handle.
     /// Entity XDATA lives in `EntityCommon::extended_data`.
     pub object_xdata: HashMap<Handle, crate::xdata::ExtendedData>,
 
     /// Non-entity object xdictionary handles — populated during DWG read, consumed during DWG write.
-    pub(crate) xdic_by_handle: FixedMap<Handle, Handle>,
+    pub(crate) xdic_by_handle: SeededMap<Handle, Handle>,
 
     /// Non-entity object reactors — populated during DWG read, consumed during DWG write.
-    pub(crate) reactors_by_handle: FixedMap<Handle, Vec<Handle>>,
+    pub(crate) reactors_by_handle: SeededMap<Handle, Vec<Handle>>,
 
     /// Original BLOCK_HEADER entity handles from the DWG binary — includes sub-entity handles
     /// (vertices, faces, SEQENDs). Keyed by BlockRecord handle. Used by the writer to produce
     /// correct owned_object_count without re-expanding from the document model.
-    pub(crate) block_entity_handles: FixedMap<Handle, Vec<Handle>>,
+    pub(crate) block_entity_handles: SeededMap<Handle, Vec<Handle>>,
 
     /// DWG version this document was read from (set by the DWG reader).
     /// Verbatim raw blobs (Unknown objects, EED) are encoded for this version
@@ -1430,13 +1459,13 @@ pub struct CadDocument {
     /// so that a writer defect can be bisected by object type
     /// (`ACADRUST_RAW_EXCLUDE`).
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub(crate) raw_records: FixedMap<u64, (i16, Arc<crate::entities::RawRecord>)>,
+    pub(crate) raw_records: SeededMap<u64, (i16, Arc<crate::entities::RawRecord>)>,
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub(crate) original_objects: FixedMap<Handle, ObjectType>,
+    pub(crate) original_objects: SeededMap<Handle, ObjectType>,
     /// Child record -> compound entity handle, captured with `raw_records`.
     /// Exclusions must serialize each compound entity and its children together.
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub(crate) raw_record_owners: FixedMap<u64, u64>,
+    pub(crate) raw_record_owners: SeededMap<u64, u64>,
 
     /// `(handle, byte length, hash)` of SAB bodies when `raw_acds_data` was
     /// captured. Used to reject stale section passthrough after geometry edits.
@@ -1611,11 +1640,11 @@ impl CadDocument {
             source_path: None,
             dgn_ls_definitions: HashMap::new(),
             dgn_ls_components: HashMap::new(),
-            eed_by_handle: FixedMap::default(),
+            eed_by_handle: SeededMap::default(),
             object_xdata: HashMap::new(),
-            xdic_by_handle: FixedMap::default(),
-            reactors_by_handle: FixedMap::default(),
-            block_entity_handles: FixedMap::default(),
+            xdic_by_handle: SeededMap::default(),
+            reactors_by_handle: SeededMap::default(),
+            block_entity_handles: SeededMap::default(),
             dwg_source_version: None,
             preview: None,
             acis_sab_handles: Vec::new(),
@@ -1623,9 +1652,9 @@ impl CadDocument {
             r12_header_raw: None,
             r12_table_usage: HashMap::new(),
             r12_block_tags: HashMap::new(),
-            raw_records: FixedMap::default(),
-            original_objects: FixedMap::default(),
-            raw_record_owners: FixedMap::default(),
+            raw_records: SeededMap::default(),
+            original_objects: SeededMap::default(),
+            raw_record_owners: SeededMap::default(),
             raw_acds_fingerprint: Vec::new(),
             dwg_data_store_handles: HashSet::new(),
             section_view_style: None,
@@ -3623,6 +3652,26 @@ impl CadDocument {
         if let EntityType::Insert(insert) = entity {
             return self.explode_insert_with_context(insert);
         }
+        // A dimension draws its block; exploding it gives that block's
+        // contents, as a reference to the block would. Without one the
+        // geometry is rebuilt from the dimension and its style below.
+        if let EntityType::Dimension(dimension) = entity {
+            let base = dimension.base();
+            let has_block = self
+                .block_records
+                .get(&base.block_name)
+                .is_some_and(|record| !record.entity_handles.is_empty());
+            if has_block {
+                let mut insert =
+                    crate::entities::Insert::new(&base.block_name, base.insertion_point);
+                insert.common = base.common.clone();
+                insert.common.handle = Handle::NULL;
+                let parts = self.explode_insert_with_context(&insert);
+                if !parts.is_empty() {
+                    return parts;
+                }
+            }
+        }
         let mut parts = match entity {
             EntityType::MLine(mline) => self.explode_mline_with_context(mline),
             EntityType::MultiLeader(leader) => self.explode_multileader_with_context(leader),
@@ -4255,7 +4304,9 @@ impl CadDocument {
             ObjectType::PlotSettings(value) => Some(value.owner),
             ObjectType::MultiLeaderStyle(value) => Some(value.owner_handle),
             ObjectType::TableStyle(value) => Some(value.owner_handle),
-            ObjectType::TableContent(value) => Some(value.common.owner_handle),
+            ObjectType::TableContent(value) | ObjectType::TableTemplate(value) => {
+                Some(value.common.owner_handle)
+            }
             ObjectType::Scale(value) => Some(value.owner_handle),
             ObjectType::ObjectContextData(value) => Some(value.owner_handle),
             ObjectType::SortEntitiesTable(value) => Some(value.owner_handle),
@@ -4469,6 +4520,22 @@ impl CadDocument {
         match self.objects.get_mut(&record_handle)? {
             ObjectType::XRecord(record) => Some(record),
             _ => None,
+        }
+    }
+
+    /// Reactors of a non-entity object such as a block record.
+    pub fn object_reactors(&self, object: Handle) -> &[Handle] {
+        self.reactors_by_handle
+            .get(&object)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Add `reactor` to a non-entity object's reactors, once.
+    pub fn add_object_reactor(&mut self, object: Handle, reactor: Handle) {
+        let reactors = self.reactors_by_handle.entry(object).or_default();
+        if !reactors.contains(&reactor) {
+            reactors.push(reactor);
         }
     }
 
@@ -4877,6 +4944,48 @@ impl CadDocument {
         for (handle, name) in names {
             if let Some(ObjectType::XRecord(record)) = self.objects.get_mut(&handle) {
                 record.name = name;
+            }
+        }
+    }
+
+    /// A table style's name is its key in the table style dictionary; the
+    /// record's own string is its description, empty for most styles, and is
+    /// what the writers store there. Each row's text style is the one its
+    /// handle points at.
+    pub fn resolve_table_style_names(&mut self) {
+        let names: HashMap<Handle, String> = self
+            .objects
+            .values()
+            .filter_map(|object| match object {
+                ObjectType::Dictionary(dictionary) => Some(dictionary.entries.iter()),
+                _ => None,
+            })
+            .flatten()
+            .filter(|(_, handle)| {
+                matches!(self.objects.get(handle), Some(ObjectType::TableStyle(_)))
+            })
+            .map(|(name, handle)| (*handle, name.clone()))
+            .collect();
+        let text_styles: HashMap<Handle, String> = self
+            .text_styles
+            .iter()
+            .map(|style| (style.handle, style.name.clone()))
+            .collect();
+        for (handle, object) in self.objects.iter_mut() {
+            let ObjectType::TableStyle(style) = object else {
+                continue;
+            };
+            if let Some(name) = names.get(handle) {
+                style.name = name.clone();
+            }
+            for row in [
+                &mut style.data_row_style,
+                &mut style.header_row_style,
+                &mut style.title_row_style,
+            ] {
+                if let Some(name) = row.text_style_handle.and_then(|h| text_styles.get(&h)) {
+                    row.text_style_name = name.clone();
+                }
             }
         }
     }
@@ -6378,7 +6487,7 @@ impl CadDocument {
                     ObjectType::DictionaryVariable(value) => {
                         remap_object_handle(&mut value.owner_handle);
                     }
-                    ObjectType::TableContent(value) => {
+                    ObjectType::TableContent(value) | ObjectType::TableTemplate(value) => {
                         value.visit_object_handles_mut(&mut remap_object_handle);
                     }
                     ObjectType::BlockVisibilityParameter(value) => {
@@ -6392,6 +6501,14 @@ impl CadDocument {
                     }
                     ObjectType::FieldList(value) => {
                         value.visit_handles_mut(&mut remap_object_handle);
+                    }
+                    ObjectType::ImageDefinition(value) => {
+                        remap_object_handle(&mut value.owner);
+                        value.reactors.iter_mut().for_each(&mut remap_object_handle);
+                    }
+                    ObjectType::ImageDefinitionReactor(value) => {
+                        remap_object_handle(&mut value.owner);
+                        remap_object_handle(&mut value.image_handle);
                     }
                     ObjectType::ProxyObject(value) => {
                         if let Some(new_handle) = remap_map.get(&value.owner.value()) {
@@ -6696,6 +6813,7 @@ impl CadDocument {
         }
         self.resolve_book_colors();
         self.resolve_xrecord_names();
+        self.resolve_table_style_names();
         self.resolve_group_names();
         self.resolve_xrecord_backed_properties();
         if let Some(s) = self

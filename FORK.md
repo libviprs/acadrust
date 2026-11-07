@@ -10,8 +10,8 @@ To see the difference at any time: `git diff upstream/main origin/main --stat`.
 
 | Patch | Why libviprs needs it | Upstream status |
 | --- | --- | --- |
-| `Insert::set_scale_unchecked` in `src/entities/insert.rs`, used by the DWG reader for INSERT and MINSERT in `src/io/dwg/dwg_document_builder.rs` (#52) | the reader reports the scale the file stores, even 0.0, instead of rewriting it to 1e-12 | not proposed yet, draft written, waiting for approval |
-| R2004 header trailer is optional, `src/io/dwg/dwg_stream_readers/header_reader.rs` (#60, merged as #67, the rev libviprs pins) | DWG files written by LibreDWG (the oracle fixtures) stop the header before the trailing BitLongs and fail to read | not proposed yet, draft written, waiting for approval |
+| `Insert::set_scale_unchecked` in `src/entities/insert.rs`, used by the DWG reader for INSERT and MINSERT in `src/io/dwg/dwg_document_builder.rs` (#52) | the reader reports the scale the file stores, even 0.0, instead of rewriting it to 1e-12 | proposed upstream: hakanaktt/acadrust#352 (issue), hakanaktt/acadrust#354 (PR), open |
+| R2004 header trailer is optional, `src/io/dwg/dwg_stream_readers/header_reader.rs` (#60, merged as #67, the rev libviprs pins) | DWG files written by LibreDWG (the oracle fixtures) stop the header before the trailing BitLongs and fail to read | proposed upstream: hakanaktt/acadrust#353 (issue), hakanaktt/acadrust#355 (PR), open |
 
 ## Tests the fork adds
 
