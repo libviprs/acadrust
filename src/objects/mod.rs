@@ -16,12 +16,15 @@ mod image_definition;
 mod mlinestyle;
 mod multileader_style;
 mod object_context_data;
+pub(crate) mod object_data;
 mod plot_settings;
 mod scale;
 pub(crate) mod semantic_property;
 mod sort_entities_table;
 mod stub_objects;
 mod table_style;
+mod table_entity_roundtrip;
+pub(crate) use table_entity_roundtrip::{prepare_table_entity_roundtrip, restore_table_entity_roundtrip};
 mod xrecord;
 
 pub use associative::*;
@@ -96,6 +99,10 @@ pub use object_context_data::{
     HatchViewContext, LeaderContext, MTextAttributeContext, MTextColumns, MTextContext,
     ObjectContextData, ObjectContextKind,
 };
+pub use object_data::{
+    ObjectDataAttachment, ObjectDataDescriptor, ObjectDataDictionary, ObjectDataField,
+    ObjectDataRecord, ObjectDataTable, ObjectDataType, ObjectDataValue, OBJECT_DATA_DICTIONARY_KEY,
+};
 pub use plot_settings::{
     PaperMargin, PlotFlags, PlotPaperUnits, PlotRotation, PlotSettings, PlotType, PlotWindow,
     ScaledType, ShadePlotMode, ShadePlotResolutionLevel,
@@ -113,11 +120,18 @@ pub use stub_objects::{
     RasterVariables, SpatialFilter, StubObject, VisualStyle, VisualStyleProperty,
     VisualStylePropertyValue, WipeoutVariables,
 };
-pub(crate) use table_style::{restore_table_style_roundtrip, store_table_style_roundtrip};
+pub(crate) use table_style::{
+    apply_cell_style_to_row, prepare_table_style_cell_maps, prepare_table_style_templates,
+    restore_table_style_roundtrip,
+    row_cell_style,
+    store_table_style_roundtrip,
+};
 pub use table_style::{
     CellAlignment, NamedTableCellStyle, RowCellStyle, TableBorderPropertyFlags, TableBorderType,
     TableCellBorder, TableCellStyleData, TableCellStylePropertyFlags, TableContentFormat,
-    TableFlowDirection, TableGridFormat, TableStyle, TableStyleFlags,
+    TableFlowDirection, TableGridFormat, TableStyle, TableStyleFlags, is_row_cell_style,
+    CELL_CLASS_DATA, CELL_CLASS_LABEL, DATA_CELL_STYLE, HEADER_CELL_STYLE, TABLE_GRID_EDGES,
+    TITLE_CELL_STYLE,
 };
 pub use xrecord::{
     DictionaryCloningFlags, KnownXRecordKind, XRecord, XRecordEntry, XRecordSection, XRecordValue,
@@ -501,6 +515,10 @@ pub enum ObjectType {
     /// embedded by modern ACAD_TABLE entities, so it deliberately reuses the
     /// complete semantic `Table` model.
     TableContent(crate::entities::Table),
+    /// AcDbTableTemplate: a table style's starting table. Same table-data
+    /// tree as `TableContent`; owned by the style (by its extension
+    /// dictionary in DXF).
+    TableTemplate(crate::entities::Table),
     /// Scale object - named scale definition
     Scale(Scale),
     /// Annotative per-object context data (`AcDb*ObjectContextData` leaf) — one
@@ -642,7 +660,7 @@ impl ObjectType {
             ObjectType::PlotSettings(value) => value.handle,
             ObjectType::MultiLeaderStyle(value) => value.handle,
             ObjectType::TableStyle(value) => value.handle,
-            ObjectType::TableContent(value) => value.common.handle,
+            ObjectType::TableContent(value) | ObjectType::TableTemplate(value) => value.common.handle,
             ObjectType::Scale(value) => value.handle,
             ObjectType::ObjectContextData(value) => value.handle,
             ObjectType::SortEntitiesTable(value) => value.handle,
@@ -749,7 +767,9 @@ impl ObjectType {
             ObjectType::PlotSettings(value) => value.handle = handle,
             ObjectType::MultiLeaderStyle(value) => value.handle = handle,
             ObjectType::TableStyle(value) => value.handle = handle,
-            ObjectType::TableContent(value) => value.common.handle = handle,
+            ObjectType::TableContent(value) | ObjectType::TableTemplate(value) => {
+                value.common.handle = handle
+            }
             ObjectType::Scale(value) => value.handle = handle,
             ObjectType::ObjectContextData(value) => value.handle = handle,
             ObjectType::SortEntitiesTable(value) => value.handle = handle,
@@ -795,7 +815,9 @@ impl ObjectType {
             ObjectType::PlotSettings(value) => value.handle.is_null(),
             ObjectType::MultiLeaderStyle(value) => value.handle.is_null(),
             ObjectType::TableStyle(value) => value.handle.is_null(),
-            ObjectType::TableContent(value) => value.common.handle.is_null(),
+            ObjectType::TableContent(value) | ObjectType::TableTemplate(value) => {
+                value.common.handle.is_null()
+            }
             ObjectType::Scale(value) => value.handle.is_null(),
             ObjectType::ObjectContextData(value) => value.handle.is_null(),
             ObjectType::SortEntitiesTable(value) => value.handle.is_null(),

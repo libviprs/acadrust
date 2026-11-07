@@ -70,10 +70,15 @@ impl DwgWriter {
         }
         let mut prepared = crate::io::loft_parameters::prepared(document);
         prepare_surface_classes(&mut prepared);
+        prepare_unique_seqends(&mut prepared);
         prepare_database_references(&mut prepared);
         prepare_table_keys(&mut prepared);
         prepare_active_viewport_elevation(&mut prepared);
         prepare_roundtrip_records(&mut prepared);
+        // R2010+ style records own their starting table; older ones keep it
+        // in the extension dictionary.
+        let in_dictionary = prepared.version < DxfVersion::AC1024;
+        crate::objects::prepare_table_style_templates(&mut prepared, in_dictionary);
         prepare_book_colors(&mut prepared)?;
         let document = prepared.as_ref();
         let perf = std::env::var_os("PERF").is_some();
@@ -91,7 +96,7 @@ impl DwgWriter {
         let mut owned;
         let document: &CadDocument = if document.has_null_table_entries()
             || document.version < DxfVersion::AC1027
-            || has_missing_object_classes(document)
+            || has_missing_classes(document)
         {
             owned = document.clone();
             if owned.has_null_table_entries() {
@@ -105,11 +110,12 @@ impl DwgWriter {
                     prepare_legacy_classes(&mut owned);
                 }
             }
-            // Objects added after reading (an evaluated dynamic block's
+            // Entities and objects added after reading (a MULTILEADER drawn
+            // or pasted in, an evaluated dynamic block's
             // AcDbBlockRepresentationData, a drawing variable) need their
             // class whatever the version; the verbatim table only gains
             // entries at its end, so the numbers it carries stay valid.
-            add_missing_object_classes(&mut owned);
+            add_missing_classes(&mut owned);
             if owned.version < DxfVersion::AC1027 {
                 prepare_legacy_document(&mut owned);
                 crate::objects::store_table_style_roundtrip(&mut owned);
@@ -160,10 +166,15 @@ impl DwgWriter {
         validate_version(document.version)?;
         let mut prepared = crate::io::loft_parameters::prepared(document);
         prepare_surface_classes(&mut prepared);
+        prepare_unique_seqends(&mut prepared);
         prepare_database_references(&mut prepared);
         prepare_table_keys(&mut prepared);
         prepare_active_viewport_elevation(&mut prepared);
         prepare_roundtrip_records(&mut prepared);
+        // R2010+ style records own their starting table; older ones keep it
+        // in the extension dictionary.
+        let in_dictionary = prepared.version < DxfVersion::AC1024;
+        crate::objects::prepare_table_style_templates(&mut prepared, in_dictionary);
         prepare_book_colors(&mut prepared)?;
         write_ac21_impl(&mut output, prepared.as_ref(), document.version, true)
     }
@@ -249,6 +260,24 @@ fn validate_unknown_records(document: &CadDocument) -> Result<()> {
                     data,
                     document.version,
                 )?;
+            }
+        }
+        if let crate::entities::EntityType::Extended(entity) = entity {
+            // An SPDS format entity has no model: its vendor schema is not
+            // public, so only its raw bytes can be written. Without bytes of
+            // the target version the record would go out empty.
+            if let crate::entities::ExtendedEntityData::Format(data) = &entity.data {
+                if data.raw_dwg_data.is_none()
+                    || data
+                        .raw_dwg_version
+                        .is_some_and(|version| version != document.version)
+                    || document.version == DxfVersion::AC1009
+                {
+                    return Err(DxfError::NotImplemented(format!(
+                        "Cannot encode SPDS format entity at handle {} as DWG {:?}: compatible raw DWG data is required",
+                        entity.common.handle, document.version
+                    )));
+                }
             }
         }
         if let crate::entities::EntityType::Unknown(entity) = entity {
@@ -738,6 +767,72 @@ fn prepare_surface_classes(document: &mut std::borrow::Cow<'_, CadDocument>) {
     }
 }
 
+/// An INSERT's SEQEND is written under a handle no other record of the drawing has.
+/// A block reference copied within or between drawings keeps the SEQEND handle it had (the
+/// copy paths renew its ATTRIB handles only), so two records were written under one handle:
+/// another INSERT's SEQEND, or whatever entity, ATTRIB or object of the target drawing holds
+/// that handle; the reader keeps one, and an ATTRIB lost that way was gone from the saved
+/// drawing. On the output copy, a SEQEND handle already in use is cleared, so the writer
+/// allocates a fresh one; the first claimant keeps it.
+fn prepare_unique_seqends(document: &mut std::borrow::Cow<'_, CadDocument>) {
+    use crate::entities::EntityType;
+    use crate::tables::TableEntry;
+    let doc = document.as_ref();
+    let mut used = std::collections::HashSet::new();
+    macro_rules! table {
+        ($t:expr) => {
+            used.insert($t.handle().value());
+            used.extend($t.iter().map(|e| e.handle().value()));
+        };
+    }
+    table!(doc.layers);
+    table!(doc.line_types);
+    table!(doc.text_styles);
+    table!(doc.dim_styles);
+    table!(doc.app_ids);
+    table!(doc.views);
+    table!(doc.vports);
+    table!(doc.ucss);
+    table!(doc.vx_table);
+    table!(doc.block_records);
+    for record in doc.block_records.iter() {
+        used.extend([
+            record.block_entity_handle.value(),
+            record.block_end_handle.value(),
+        ]);
+    }
+    used.extend(doc.objects.keys().map(|h| h.value()));
+    for entity in doc.entities() {
+        used.insert(entity.common().handle.value());
+        match entity {
+            EntityType::Insert(i) => {
+                used.extend(i.attributes.iter().map(|a| a.common.handle.value()))
+            }
+            EntityType::Polyline3D(p) => used.extend(p.vertices.iter().map(|v| v.handle.value())),
+            _ => {}
+        }
+    }
+    let clashes: Vec<Handle> = doc
+        .entities()
+        .filter_map(|e| match e {
+            EntityType::Insert(i) => i
+                .seqend_handle
+                .filter(|h| !h.is_null() && !used.insert(h.value()))
+                .map(|_| i.common.handle),
+            _ => None,
+        })
+        .collect();
+    if clashes.is_empty() {
+        return;
+    }
+    let output = document.to_mut();
+    for handle in clashes {
+        if let Some(EntityType::Insert(i)) = output.get_entity_mut(handle) {
+            i.seqend_handle = None;
+        }
+    }
+}
+
 /// Re-key symbol-table entries that were renamed in place.
 ///
 /// Tables key entries by the name captured at insertion, so a caller that
@@ -871,7 +966,13 @@ fn objects_in_handle_order(document: &CadDocument) -> Vec<(Handle, &crate::objec
 /// class-registered record takes its type code from that number. A class the
 /// profile would drop while an entity or object still uses it leaves the
 /// record without a valid type code, so it is kept, after the profile.
+///
+/// A proxy names its class by number instead (`class_id`, DXF 91): that class
+/// is kept as well, and the proxy takes the class's new number once the table
+/// is rebuilt. Without it the number points past the table or at another
+/// class, and readers refuse the proxy (ODA: "No ClassId").
 fn prepare_legacy_classes(document: &mut CadDocument) {
+    let proxies = proxy_classes(document);
     let entity_classes = document.entities().map(entity_class_name);
     let object_classes = objects_in_handle_order(document)
         .into_iter()
@@ -894,6 +995,7 @@ fn prepare_legacy_classes(document: &mut CadDocument) {
         .chain(object_classes)
         .chain(field_classes)
         .filter_map(|name| document.classes.get_by_name(&name).cloned())
+        .chain(proxies.iter().map(|(_, class)| class.clone()))
         .filter(|class| seen.insert(class.dxf_name.to_ascii_uppercase()))
         .collect();
 
@@ -904,52 +1006,154 @@ fn prepare_legacy_classes(document: &mut CadDocument) {
             document.classes.add_or_update(class);
         }
     }
+
+    for (proxy, class) in proxies {
+        let Some(number) = document
+            .classes
+            .get_by_name(&class.dxf_name)
+            .map(|class| i32::from(class.class_number))
+        else {
+            continue;
+        };
+        match proxy {
+            ProxyRecord::Entity(handle) => {
+                if let Some(crate::entities::EntityType::Extended(entity)) =
+                    document.get_entity_mut(handle)
+                {
+                    if let crate::entities::ExtendedEntityData::Proxy(data) = &mut entity.data {
+                        data.class_id = number;
+                    }
+                }
+            }
+            ProxyRecord::Object(handle) => {
+                if let Some(crate::objects::ObjectType::ProxyObject(object)) =
+                    document.objects.get_mut(&handle)
+                {
+                    object.class_id = number;
+                }
+            }
+        }
+    }
 }
 
-/// Class names of objects whose class the table lacks.
-fn missing_object_class_names(document: &CadDocument) -> Vec<Vec<std::borrow::Cow<'_, str>>> {
-    objects_in_handle_order(document)
+/// A proxy record, by handle.
+enum ProxyRecord {
+    Entity(Handle),
+    Object(Handle),
+}
+
+/// Every proxy entity and proxy object whose `class_id` names a class of the
+/// table, with that class.
+fn proxy_classes(document: &CadDocument) -> Vec<(ProxyRecord, crate::classes::DxfClass)> {
+    let class_of = |class_id: i32| {
+        document
+            .classes
+            .iter()
+            .find(|class| i32::from(class.class_number) == class_id)
+            .cloned()
+    };
+    let entities = document.entities().filter_map(|entity| match entity {
+        crate::entities::EntityType::Extended(extended) => match &extended.data {
+            crate::entities::ExtendedEntityData::Proxy(data) => Some((
+                ProxyRecord::Entity(extended.common.handle),
+                class_of(data.class_id)?,
+            )),
+            _ => None,
+        },
+        _ => None,
+    });
+    let objects = objects_in_handle_order(document)
         .into_iter()
-        .map(|(_, object)| {
-            crate::io::dwg::dwg_stream_writers::object_writer::objects::object_class_names(object)
-        })
-        .filter(|names| !names.iter().any(|name| document.classes.contains(name)))
-        .collect()
+        .filter_map(|(handle, object)| match object {
+            crate::objects::ObjectType::ProxyObject(data) => {
+                Some((ProxyRecord::Object(handle), class_of(data.class_id)?))
+            }
+            _ => None,
+        });
+    entities.chain(objects).collect()
 }
 
-/// True when an object the defaults can declare has no class in the table.
-fn has_missing_object_classes(document: &CadDocument) -> bool {
+/// Default declarations for the classes of entities and objects that the
+/// table lacks, one per class, in first-use order.
+fn missing_classes<'a>(document: &'a CadDocument) -> Vec<crate::classes::DxfClass> {
+    use std::borrow::Cow;
+
     let defaults = crate::classes::default_classes();
-    missing_object_class_names(document).iter().any(|names| {
-        defaults.iter().any(|class| {
-            names
-                .iter()
-                .any(|name| class.dxf_name.eq_ignore_ascii_case(name))
-        })
-    })
+    // Most records share a handful of names (every LINE is "LINE"): settle
+    // each name once instead of once per record.
+    let mut seen: std::collections::HashSet<Cow<'a, str>> = std::collections::HashSet::new();
+    let mut missing: Vec<crate::classes::DxfClass> = Vec::new();
+    // `own`: the declaration a registered-class record carries itself (its
+    // DXF and C++ class names), used when the defaults don't know the class.
+    let mut check = |names: &[Cow<'a, str>], own: Option<crate::classes::DxfClass>| {
+        if names.iter().all(|name| seen.contains(name.as_ref())) {
+            return;
+        }
+        seen.extend(names.iter().cloned());
+        if names.iter().any(|name| document.classes.contains(name)) {
+            return;
+        }
+        let Some(class) = defaults
+            .iter()
+            .find(|class| {
+                names
+                    .iter()
+                    .any(|name| class.dxf_name.eq_ignore_ascii_case(name))
+            })
+            .cloned()
+            .or(own)
+        else {
+            return;
+        };
+        if !missing
+            .iter()
+            .any(|added| added.dxf_name.eq_ignore_ascii_case(&class.dxf_name))
+        {
+            missing.push(class);
+        }
+    };
+    for entity in document.entities() {
+        let own = match entity {
+            crate::entities::EntityType::Extended(extended) => match &extended.data {
+                crate::entities::ExtendedEntityData::RegisteredClass(data) => Some(
+                    crate::classes::DxfClass::new_entity(&data.dxf_name, &data.cpp_class_name),
+                ),
+                _ => None,
+            },
+            _ => None,
+        };
+        check(&[Cow::Borrowed(entity_class_name(entity))], own);
+    }
+    for (_, object) in objects_in_handle_order(document) {
+        let own = match object {
+            crate::objects::ObjectType::RegisteredClass(data) => Some(
+                crate::classes::DxfClass::new(&data.dxf_name, &data.cpp_class_name),
+            ),
+            _ => None,
+        };
+        check(
+            &crate::io::dwg::dwg_stream_writers::object_writer::objects::object_class_names(object),
+            own,
+        );
+    }
+    missing
 }
 
-/// Declare the class of every object whose source file never used that
-/// class. Such records take their type code from the class table; without an
-/// entry they fall back to a fixed or placeholder code (500 for dynamic block
-/// records), which readers resolve to another class or drop: an evaluated
-/// dynamic block reference then loses its link to the definition.
-fn add_missing_object_classes(document: &mut CadDocument) {
-    let defaults = crate::classes::default_classes();
-    let missing: Vec<_> = missing_object_class_names(document)
-        .into_iter()
-        .filter_map(|names| {
-            defaults
-                .iter()
-                .find(|class| {
-                    names
-                        .iter()
-                        .any(|name| class.dxf_name.eq_ignore_ascii_case(name))
-                })
-                .cloned()
-        })
-        .collect();
-    for mut class in missing {
+/// True when an entity or object the defaults can declare has no class in
+/// the table.
+fn has_missing_classes(document: &CadDocument) -> bool {
+    !missing_classes(document).is_empty()
+}
+
+/// Declare the class of every entity and object whose source file never used
+/// that class. Such records take their type code from the class table; without
+/// an entry they fall back to a fixed or placeholder code (500 for dynamic
+/// block records), which readers resolve to another class or drop: an
+/// evaluated dynamic block reference then loses its link to the definition,
+/// and a MULTILEADER or WIPEOUT drawn into a file that never held one makes
+/// AutoCAD refuse to open the drawing.
+fn add_missing_classes(document: &mut CadDocument) {
+    for mut class in missing_classes(document) {
         class.class_number = 0;
         document.classes.add_or_update(class);
     }
@@ -2840,6 +3044,77 @@ mod tests {
             ObjectType::ClassObject(o)
                 if matches!(&o.data, ClassObjectData::LayerFilter(f) if f.names == ["WALLS"])
         )));
+    }
+
+    #[test]
+    fn entity_without_its_class_gets_it_declared() {
+        use crate::entities::{EntityType, MultiLeader, Wipeout};
+        use crate::types::Vector3;
+
+        // A drawing whose source file never held a MULTILEADER or a WIPEOUT,
+        // so its class table lacks both, then gains one of each. Readers
+        // resolve classes by position, so the source table is numbered
+        // without gaps, as a file written by AutoCAD would be.
+        let mut document = CadDocument::new();
+        let mut classes = crate::classes::DxfClassCollection::new();
+        for class in document.classes.iter() {
+            if !["MULTILEADER", "WIPEOUT"]
+                .iter()
+                .any(|name| class.dxf_name.eq_ignore_ascii_case(name))
+            {
+                let mut class = class.clone();
+                class.class_number = 500 + classes.len() as i16;
+                classes.push_preserving(class);
+            }
+        }
+        let numbers: Vec<_> = classes
+            .iter()
+            .map(|class| (class.dxf_name.clone(), class.class_number))
+            .collect();
+        document.classes = classes;
+        document
+            .add_entity(EntityType::MultiLeader(Box::new(MultiLeader::with_text(
+                "note",
+                Vector3::new(10.0, 5.0, 0.0),
+                vec![Vector3::ZERO, Vector3::new(10.0, 5.0, 0.0)],
+            ))))
+            .unwrap();
+        document
+            .add_entity(EntityType::Wipeout(Wipeout::rectangular(
+                Vector3::ZERO,
+                10.0,
+                5.0,
+            )))
+            .unwrap();
+
+        let bytes = DwgWriter::write_to_vec(&document).unwrap();
+        let decoded = crate::io::dwg::DwgReader::from_stream(Cursor::new(bytes))
+            .read()
+            .unwrap();
+
+        assert!(decoded.classes.contains("MULTILEADER"));
+        assert!(decoded.classes.contains("WIPEOUT"));
+        // The source classes keep their places and numbers; the new ones go
+        // at the end, and every number still matches its position.
+        let decoded_classes: Vec<_> = decoded.classes.iter().collect();
+        for (index, class) in decoded_classes.iter().enumerate() {
+            assert_eq!(class.class_number, 500 + index as i16, "{}", class.dxf_name);
+        }
+        for (class, (name, number)) in decoded_classes.iter().zip(&numbers) {
+            assert_eq!((&class.dxf_name, class.class_number), (name, *number));
+        }
+        let mut added: Vec<_> = decoded_classes[numbers.len()..]
+            .iter()
+            .map(|class| class.dxf_name.to_uppercase())
+            .collect();
+        added.sort();
+        assert_eq!(added, ["MULTILEADER", "WIPEOUT"]);
+        let types: Vec<_> = decoded
+            .model_space_entities()
+            .map(|entity| entity.as_entity().entity_type())
+            .collect();
+        assert!(types.contains(&"MULTILEADER"), "{types:?}");
+        assert!(types.contains(&"WIPEOUT"), "{types:?}");
     }
 
     #[test]
