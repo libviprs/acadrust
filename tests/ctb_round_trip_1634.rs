@@ -29,7 +29,10 @@ fn le32(file: &[u8], at: usize) -> u32 {
 #[test]
 fn ctb_sample_text_rewrite_is_byte_identical() {
     let table = PlotStyleTable::from_bytes(NAME, FIXTURE).unwrap();
-    assert!(table.to_text() == text_of(FIXTURE), "text differs from the file");
+    assert!(
+        table.to_text() == text_of(FIXTURE),
+        "text differs from the file"
+    );
 }
 
 #[test]
@@ -107,4 +110,14 @@ fn adler32(bytes: &[u8]) -> u32 {
         b = (b + a) % 65_521;
     }
     (b << 16) | a
+}
+
+#[test]
+fn ctb_announced_length_over_cap_is_refused_before_inflating() {
+    let mut file = FIXTURE.to_vec();
+    file[52..56].copy_from_slice(&(5u32 * 1024 * 1024).to_le_bytes());
+    // the stream is damaged too: the refusal has to come from the header
+    file.truncate(70);
+    let error = PlotStyleTable::from_bytes(NAME, &file).unwrap_err().to_string();
+    assert!(error.contains("announces"), "{error}");
 }
