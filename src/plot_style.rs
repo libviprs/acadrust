@@ -88,6 +88,22 @@ pub struct PlotStyleTable {
     /// that did not add up, descriptions in a Windows code page): the file
     /// loaded, but the user deserves to know it was not quite as written.
     pub load_warnings: Vec<String>,
+    /// What the table was read from, kept so that saving it writes the file
+    /// back the way it was: the same lines in the same order, with only the
+    /// values that were edited replaced. `None` for a table built in memory,
+    /// which is written in numeric order.
+    source: Option<Box<CtbSource>>,
+}
+
+/// The file a table was read from.
+#[derive(Debug, Clone)]
+struct CtbSource {
+    /// The file's bytes, returned as they are when nothing was edited.
+    bytes: Vec<u8>,
+    /// The stored text as read (trailing NULs dropped).
+    text: String,
+    /// The table as parsed from `text`, to tell which values were edited.
+    baseline: PlotStyleTable,
 }
 
 impl PlotStyleTable {
@@ -104,6 +120,7 @@ impl PlotStyleTable {
             aci_entries: (0..=255).map(|_| PlotStyleEntry::default()).collect(),
             named_entries: HashMap::default(),
             load_warnings: Vec::new(),
+            source: None,
         }
     }
 
@@ -113,12 +130,26 @@ impl PlotStyleTable {
         let (text, warnings) = decompress_ctb(raw)?;
         let mut table = parse_plot_style_text(&text, name, is_stb)?;
         table.load_warnings = warnings;
+        if !text.lines().any(|line| line.trim() == "begin_plot_style") {
+            table.source = Some(Box::new(CtbSource {
+                bytes: raw.to_vec(),
+                baseline: table.clone(),
+                text,
+            }));
+        }
         Ok(table)
     }
 
-    /// Encode this table as CTB/STB file bytes.
+    /// Encode this table as CTB/STB file bytes. A table read from a file and
+    /// not edited comes back as the bytes it was read from; an edited one is
+    /// recompressed at level 9 with the header's checksum and lengths
+    /// computed from the new stream.
     pub fn to_bytes(&self) -> crate::error::Result<Vec<u8>> {
-        compress_ctb(self.to_text().as_bytes())
+        let text = self.to_text();
+        match &self.source {
+            Some(source) if text == source.text => Ok(source.bytes.clone()),
+            _ => compress_ctb(text.as_bytes()),
+        }
     }
 
     /// Resolve the effective print RGB color for the given ACI index.
@@ -175,6 +206,9 @@ impl PlotStyleTable {
 
     /// The table's text body, as stored compressed in the file.
     pub fn to_text(&self) -> String {
+        if let Some(source) = &self.source {
+            return self.replay_source(source);
+        }
         let mut s = String::new();
         let description = self.description.replace(['\r', '\n'], " ");
         s.push_str(&format!("description=\"{description}\n"));
@@ -248,6 +282,143 @@ impl PlotStyleTable {
     }
 }
 
+impl PlotStyleTable {
+    /// The source text with only the edited values replaced: every line the
+    /// model does not name, the order of the entries and the line endings are
+    /// the file's own. A value is edited when it differs from what the file
+    /// parsed to, so putting a value back restores the original line.
+    fn replay_source(&self, source: &CtbSource) -> String {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Part {
+            Root,
+            Styles,
+            Weights,
+            Other,
+        }
+        let base = &source.baseline;
+        let mut out = String::with_capacity(source.text.len());
+        let mut part = Part::Root;
+        let mut style: Option<(usize, String)> = None;
+        for raw in source.text.split_inclusive('\n') {
+            let line = raw.trim();
+            let mut replacement: Option<String> = None;
+            if line == "plot_style{" {
+                part = Part::Styles;
+            } else if line == "custom_lineweight_table{" {
+                part = Part::Weights;
+            } else if line.ends_with('{') {
+                match line.trim_end_matches('{').trim().parse::<usize>() {
+                    Ok(index) if part == Part::Styles && style.is_none() => {
+                        style = Some((index, format!("Color_{}", index + 1)));
+                    }
+                    _ => part = Part::Other,
+                }
+            } else if line == "}" {
+                if style.take().is_none() {
+                    part = Part::Root;
+                }
+            } else if let Some((key, value)) = line.split_once('=') {
+                let (key, value) = (key.trim(), value.trim().trim_start_matches('"'));
+                replacement = match (&mut style, part) {
+                    (Some((index, name)), _) => {
+                        if key == "name" {
+                            *name = value.to_string();
+                        }
+                        fn pick<'a>(
+                            t: &'a PlotStyleTable,
+                            index: usize,
+                            name: &str,
+                        ) -> Option<&'a PlotStyleEntry> {
+                            if t.is_stb {
+                                t.named_entries.get(name)
+                            } else {
+                                t.aci_entries.get(index + 1)
+                            }
+                        }
+                        match (pick(self, *index, name), pick(base, *index, name)) {
+                            (Some(now), Some(then)) => entry_value(key, now, then),
+                            _ => None,
+                        }
+                    }
+                    (None, Part::Root) => self.root_value(base, key),
+                    (None, Part::Weights) => key.parse::<usize>().ok().and_then(|index| {
+                        let now = self.lineweights.get(index)?;
+                        (base.lineweights.get(index) != Some(now)).then(|| full_real(*now))
+                    }),
+                    _ => None,
+                };
+            }
+            match replacement {
+                Some(new) => {
+                    let (key, _) = raw.split_once('=').expect("a replaced line has a key");
+                    let quote = if raw.split_once('=').is_some_and(|(_, v)| v.starts_with('"')) {
+                        "\""
+                    } else {
+                        ""
+                    };
+                    let ending = &raw[raw.trim_end_matches(['\r', '\n']).len()..];
+                    out.push_str(&format!("{key}={quote}{new}{ending}"));
+                }
+                None => out.push_str(raw),
+            }
+        }
+        out
+    }
+
+    fn root_value(&self, base: &PlotStyleTable, key: &str) -> Option<String> {
+        match key {
+            "description" if self.description != base.description => {
+                Some(self.description.replace(['\r', '\n'], " "))
+            }
+            "scale_factor" if self.scale_factor != base.scale_factor => {
+                Some(full_real(self.scale_factor))
+            }
+            "apply_factor" if self.apply_factor != base.apply_factor => {
+                Some(bool_text(self.apply_factor))
+            }
+            "custom_lineweight_display_units"
+                if self.custom_lineweight_display_units != base.custom_lineweight_display_units =>
+            {
+                Some(self.custom_lineweight_display_units.to_string())
+            }
+            _ => None,
+        }
+    }
+}
+
+fn bool_text(value: bool) -> String {
+    if value { "TRUE" } else { "FALSE" }.to_string()
+}
+
+/// The new text of one `key=value` line of a style entry, when that value
+/// was edited.
+fn entry_value(key: &str, now: &PlotStyleEntry, then: &PlotStyleEntry) -> Option<String> {
+    fn changed<T: PartialEq + ToString>(now: &T, then: &T) -> Option<String> {
+        (now != then).then(|| now.to_string())
+    }
+    match key {
+        "name" => changed(&now.name, &then.name),
+        "localized_name" => changed(&now.localized_name, &then.localized_name),
+        "description" => changed(&now.description, &then.description),
+        "screen" => changed(&now.screening, &then.screening),
+        "lineweight" => changed(&now.lineweight, &then.lineweight),
+        "color_policy" => changed(&now.color_policy, &then.color_policy),
+        "physical_pen_number" => changed(&now.physical_pen_number, &then.physical_pen_number),
+        "virtual_pen_number" => changed(&now.virtual_pen_number, &then.virtual_pen_number),
+        "linepattern_size" => changed(&now.linepattern_size, &then.linepattern_size),
+        "linetype" => changed(&now.linetype, &then.linetype),
+        "fill_style" => changed(&now.fill_style, &then.fill_style),
+        "end_style" => changed(&now.end_style, &then.end_style),
+        "join_style" => changed(&now.join_style, &then.join_style),
+        "adaptive_linetype" => (now.adaptive_linetype != then.adaptive_linetype)
+            .then(|| bool_text(now.adaptive_linetype)),
+        // object colour is stored as a packed value the file chose
+        "color" | "mode_color" => (now.color != then.color)
+            .then(|| now.color.map_or(-1_006_632_961, packed_rgb).to_string()),
+        _ => None,
+    }
+}
+
 // ── Deflate helpers ───────────────────────────────────────────────────────────
 
 /// Decompress a CTB/STB file's raw bytes into the text content, with the
@@ -261,6 +432,9 @@ impl PlotStyleTable {
 /// code page those applications write descriptions in.
 fn decompress_ctb(data: &[u8]) -> crate::error::Result<(String, Vec<String>)> {
     const PREFIX: &[u8] = b"PIAFILEVERSION_2.0,CTBVER1,compress\r\npmzlibcodec";
+    // A real table is about 90 KB (255 entries), so a header that announces
+    // more than this is refused before anything is inflated.
+    const MAX_ANNOUNCED_TEXT_BYTES: usize = 4 * 1024 * 1024;
     let mut warnings = Vec::new();
     let mut decoded;
     if data.starts_with(PREFIX) {
@@ -270,6 +444,13 @@ fn decompress_ctb(data: &[u8]) -> crate::error::Result<(String, Vec<String>)> {
         let checksum = u32::from_le_bytes(data[48..52].try_into().unwrap());
         let text_len = u32::from_le_bytes(data[52..56].try_into().unwrap()) as usize;
         let compressed_len = u32::from_le_bytes(data[56..60].try_into().unwrap()) as usize;
+        if text_len > MAX_ANNOUNCED_TEXT_BYTES {
+            return Err(format!(
+                "CTB header announces {text_len} bytes of text, over the \
+                 {MAX_ANNOUNCED_TEXT_BYTES}-byte limit"
+            )
+            .into());
+        }
         let available = data.len() - 60;
         let payload = if compressed_len > available {
             warnings.push(format!(
@@ -418,7 +599,7 @@ fn compress_ctb(text: &[u8]) -> crate::error::Result<Vec<u8>> {
     const PREFIX: &[u8] = b"PIAFILEVERSION_2.0,CTBVER1,compress\r\npmzlibcodec";
     let mut body = text.to_vec();
     body.push(0);
-    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::best());
     enc.write_all(&body).map_err(|e| e.to_string())?;
     let compressed = enc.finish().map_err(|e| e.to_string())?;
     let mut out = PREFIX.to_vec();
@@ -628,6 +809,7 @@ fn parse_plot_style_text(
         aci_entries,
         named_entries,
         load_warnings: Vec::new(),
+        source: None,
     })
 }
 
@@ -844,8 +1026,7 @@ mod inflate_limit_tests {
     /// to be allowed one byte past the limit.
     #[test]
     fn an_inflate_of_exactly_the_cap_is_accepted() {
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
         encoder
             .write_all(&vec![b' '; MAX_INFLATED_BYTES as usize])
             .expect("compress");
@@ -860,8 +1041,7 @@ mod inflate_limit_tests {
     /// oversized bombs produce.
     #[test]
     fn an_inflate_one_byte_over_the_cap_is_refused() {
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
         encoder
             .write_all(&vec![b' '; (MAX_INFLATED_BYTES + 1) as usize])
             .expect("compress");
@@ -885,8 +1065,7 @@ mod inflate_limit_tests {
     /// must stop at the cap instead.
     #[test]
     fn a_zlib_bomb_is_refused_at_the_inflate_limit() {
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
         encoder.write_all(&bomb_plaintext()).expect("compress");
         let payload = encoder.finish().expect("finish");
         assert_eq!(payload[0], 0x78, "zlib header for the inflate_lenient path");
@@ -900,7 +1079,7 @@ mod inflate_limit_tests {
     #[test]
     fn a_legacy_deflate_bomb_is_refused_at_the_inflate_limit() {
         let mut encoder =
-            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
         encoder.write_all(&bomb_plaintext()).expect("compress");
         let payload = encoder.finish().expect("finish");
         assert_ne!(
