@@ -106,10 +106,6 @@ struct CtbSource {
     baseline: PlotStyleTable,
 }
 
-/// A CTB's header announces its text length. A real table is about 90 KB
-/// (255 entries), so anything past this is refused before it is inflated.
-const MAX_ANNOUNCED_TEXT_BYTES: usize = 4 * 1024 * 1024;
-
 impl PlotStyleTable {
     /// Create an identity CTB table (no overrides for any color).
     pub fn identity(name: impl Into<String>) -> Self {
@@ -436,6 +432,9 @@ fn entry_value(key: &str, now: &PlotStyleEntry, then: &PlotStyleEntry) -> Option
 /// code page those applications write descriptions in.
 fn decompress_ctb(data: &[u8]) -> crate::error::Result<(String, Vec<String>)> {
     const PREFIX: &[u8] = b"PIAFILEVERSION_2.0,CTBVER1,compress\r\npmzlibcodec";
+    // A real table is about 90 KB (255 entries), so a header that announces
+    // more than this is refused before anything is inflated.
+    const MAX_ANNOUNCED_TEXT_BYTES: usize = 4 * 1024 * 1024;
     let mut warnings = Vec::new();
     let mut decoded;
     if data.starts_with(PREFIX) {
