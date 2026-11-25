@@ -335,9 +335,14 @@ impl<'a> CompoundDecoder<'a> {
             .collect();
         let mut difat_sector = read_u32(data, 68)?;
         let difat_count = read_u32(data, 72)? as usize;
+        let mut seen_difat = std::collections::HashSet::new();
         for _ in 0..difat_count.min(data.len() / sector_size) {
             if difat_sector >= DIFAT_SECTOR {
                 break;
+            }
+            // A DIFAT chain that revisits a sector is a loop, not a file.
+            if !seen_difat.insert(difat_sector) {
+                return None;
             }
             let bytes = sector(difat_sector)?;
             let entries = sector_size / 4;
@@ -350,8 +355,16 @@ impl<'a> CompoundDecoder<'a> {
             difat_sector = read_u32(bytes, (entries - 1) * 4)?;
         }
         let fat_sector_count = read_u32(data, 44)? as usize;
+        // No more FAT sectors than the blob holds sectors, and none twice.
+        if fat_sector_count > data.len() / sector_size {
+            return None;
+        }
         let mut fat = Vec::new();
+        let mut seen_fat = std::collections::HashSet::new();
         for sector_index in difat.into_iter().take(fat_sector_count) {
+            if !seen_fat.insert(sector_index) {
+                return None;
+            }
             let bytes = sector(sector_index)?;
             fat.extend(bytes.chunks_exact(4).filter_map(|chunk| read_u32(chunk, 0)));
         }

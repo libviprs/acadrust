@@ -44,6 +44,9 @@ impl crate::entities::Ole2Frame {
 /// allocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum OleError {
+    /// The bytes are not a compound file (too short, bad sector shift, no FAT).
+    #[error("not a compound file")]
+    NotCompoundFile,
     /// A header count (FAT sectors, DIFAT sectors, mini-FAT sectors) is larger
     /// than the number of sectors the blob can hold.
     #[error("a compound file header count is larger than the blob can hold")]
@@ -63,52 +66,60 @@ pub enum OleError {
 }
 
 /// Like [`extract_presentation`], but a malformed or hostile compound file is
-/// an error instead of a silent fallback.
+/// an error instead of a silent fallback. A blob with no compound file at all
+/// still gets the legacy scan for a bare BMP.
 pub fn try_extract_presentation(data: &[u8]) -> Result<Option<OlePresentation>, OleError> {
-    Ok(extract_presentation(data))
-}
-
-/// Extract the picture from a raw OLE2FRAME data blob (frame header + CFB).
-pub fn extract_presentation(data: &[u8]) -> Option<OlePresentation> {
-    if let Some(cfb) = find_cfb(data).and_then(Cfb::parse) {
-        // Native raster first — it's the full-quality object; the
+    let cfb = match find_cfb(data).map(Cfb::parse) {
+        Some(Ok(cfb)) => Some(cfb),
+        Some(Err(OleError::NotCompoundFile)) | None => None,
+        Some(Err(e)) => return Err(e),
+    };
+    if let Some(cfb) = cfb {
+        // Native raster first: it's the full-quality object; the
         // presentation stream is only a preview of it.
         for name in ["\u{1}Ole10Native", "CONTENTS", "Package"] {
-            if let Some(stream) = cfb.stream(name) {
+            if let Some(stream) = cfb.stream(name)? {
                 let body = native_body(name, &stream);
                 if is_raster(body) {
-                    return Some(OlePresentation::Raster(body.to_vec()));
+                    return Ok(Some(OlePresentation::Raster(body.to_vec())));
                 }
             }
         }
         // Cached presentation streams.
         for name in ["\u{2}OlePres000", "\u{2}OlePres001", "\u{2}OlePres002"] {
-            if let Some(stream) = cfb.stream(name) {
+            if let Some(stream) = cfb.stream(name)? {
                 if let Some(p) = decode_olepres(&stream) {
-                    return Some(p);
+                    return Ok(Some(p));
                 }
             }
         }
         // Native metafile content (static metafile objects).
         for name in ["CONTENTS", "\u{1}Ole10Native"] {
-            if let Some(stream) = cfb.stream(name) {
+            if let Some(stream) = cfb.stream(name)? {
                 if let Some(p) = classify_metafile(native_body(name, &stream)) {
-                    return Some(p);
+                    return Ok(Some(p));
                 }
             }
         }
     }
     // Legacy fallback: scan the raw blob for a self-consistent BMP file.
     // Catches R14-era blobs that store the DIB outside a compound file.
-    scan_bmp(data).map(OlePresentation::Raster)
+    Ok(scan_bmp(data).map(OlePresentation::Raster))
+}
+
+/// Extract the picture from a raw OLE2FRAME data blob (frame header + CFB).
+/// A hostile compound file gives the bare-BMP scan's answer, never a huge
+/// allocation; use [`try_extract_presentation`] to see why it was refused.
+pub fn extract_presentation(data: &[u8]) -> Option<OlePresentation> {
+    try_extract_presentation(data).unwrap_or_else(|_| scan_bmp(data).map(OlePresentation::Raster))
 }
 
 /// The object's user type ("Adobe Photoshop Image", "Paintbrush Picture"),
 /// read from the `\x01CompObj` stream of a raw OLE2FRAME data blob: the
 /// first length-prefixed ANSI string after the 28-byte stream header.
 pub fn ole_user_type(data: &[u8]) -> Option<String> {
-    let cfb = find_cfb(data).and_then(Cfb::parse)?;
-    let stream = cfb.stream("\u{1}CompObj")?;
+    let cfb = find_cfb(data).and_then(|b| Cfb::parse(b).ok())?;
+    let stream = cfb.stream("\u{1}CompObj").ok()??;
     let len = u32::from_le_bytes(stream.get(28..32)?.try_into().ok()?) as usize;
     let text = stream.get(32..32 + len)?;
     let text = text.split(|b| *b == 0).next().unwrap_or_default();
@@ -358,6 +369,11 @@ fn extract_embedded_emf(data: &[u8]) -> Option<Vec<u8>> {
 }
 
 // ── Compound file (CFB) reader ──────────────────────────────────────────────
+//
+// Every count and chain is bounded by the blob length: a header count larger
+// than the blob can hold is refused, a sector chain may not visit a sector
+// twice, a stream never reserves more than the blob holds, and a stream chain
+// stops once it has the declared number of bytes.
 
 const END_OF_CHAIN: u32 = 0xFFFF_FFFE;
 const FREE_SECT: u32 = 0xFFFF_FFFF;
@@ -381,25 +397,30 @@ struct Cfb<'a> {
 }
 
 impl<'a> Cfb<'a> {
-    fn parse(data: &'a [u8]) -> Option<Cfb<'a>> {
+    fn parse(data: &'a [u8]) -> Result<Cfb<'a>, OleError> {
         if data.len() < 512 {
-            return None;
+            return Err(OleError::NotCompoundFile);
         }
         let u16f = |o: usize| u16::from_le_bytes(data[o..o + 2].try_into().unwrap());
         let u32f = |o: usize| u32::from_le_bytes(data[o..o + 4].try_into().unwrap());
         let sector_shift = u16f(30);
         let mini_shift = u16f(32);
         if !(7..=15).contains(&sector_shift) || mini_shift as usize >= sector_shift as usize {
-            return None;
+            return Err(OleError::NotCompoundFile);
         }
         let sector_size = 1usize << sector_shift;
         let mini_size = 1usize << mini_shift;
+        // How many sectors the blob can hold at all: no count may exceed it.
+        let total = (data.len() - 512) / sector_size;
         let dir_start = u32f(48);
         let mini_cutoff = u32f(56) as u64;
         let minifat_start = u32f(60);
         let num_minifat = u32f(64) as usize;
         let difat_start = u32f(68);
         let num_difat = u32f(72) as usize;
+        if u32f(44) as usize > total || num_minifat > total {
+            return Err(OleError::CountExceedsBlob);
+        }
 
         // DIFAT: 109 header entries plus chained DIFAT sectors.
         let mut difat: Vec<u32> = (0..109).map(|i| u32f(76 + i * 4)).collect();
@@ -407,12 +428,16 @@ impl<'a> Cfb<'a> {
             let off = 512usize.checked_add((n as usize).checked_mul(sector_size)?)?;
             // A truncated blob may cut the final sectors; treat a partial
             // sector as absent.
-            data.get(off..off + sector_size)
+            data.get(off..off.checked_add(sector_size)?)
         };
         let mut s = difat_start;
-        for _ in 0..num_difat.min(4096) {
+        let mut seen_difat = std::collections::HashSet::new();
+        for _ in 0..num_difat.min(total) {
             if s == END_OF_CHAIN || s == FREE_SECT {
                 break;
+            }
+            if !seen_difat.insert(s) {
+                return Err(OleError::DifatLoop);
             }
             let Some(sec) = sector(s) else { break };
             let n = sector_size / 4;
@@ -423,12 +448,19 @@ impl<'a> Cfb<'a> {
             }
             s = u32::from_le_bytes(sec[(n - 1) * 4..n * 4].try_into().unwrap());
         }
+        if num_difat > total {
+            return Err(OleError::CountExceedsBlob);
+        }
 
         // FAT.
         let mut fat: Vec<u32> = Vec::new();
+        let mut seen_fat = std::collections::HashSet::new();
         for &fs in &difat {
             if fs == END_OF_CHAIN || fs == FREE_SECT {
                 continue;
+            }
+            if !seen_fat.insert(fs) {
+                return Err(OleError::FatSectorRepeated);
             }
             let Some(sec) = sector(fs) else { continue };
             for c in sec.chunks_exact(4) {
@@ -436,17 +468,16 @@ impl<'a> Cfb<'a> {
             }
         }
         if fat.is_empty() {
-            return None;
+            return Err(OleError::NotCompoundFile);
         }
 
-        let chain = |start: u32| -> Vec<u8> {
+        let chain = |start: u32| -> Result<Vec<u8>, OleError> {
             let mut out = Vec::new();
             let mut n = start;
-            let mut seen = 0usize;
+            let mut seen = std::collections::HashSet::new();
             while n != END_OF_CHAIN && n != FREE_SECT && (n as usize) < fat.len() {
-                seen += 1;
-                if seen > fat.len() + 1 {
-                    break; // cycle guard
+                if !seen.insert(n) {
+                    return Err(OleError::ChainLoop);
                 }
                 match sector(n) {
                     Some(sec) => out.extend_from_slice(sec),
@@ -454,11 +485,11 @@ impl<'a> Cfb<'a> {
                 }
                 n = fat[n as usize];
             }
-            out
+            Ok(out)
         };
 
         // Directory.
-        let dirdata = chain(dir_start);
+        let dirdata = chain(dir_start)?;
         let mut dir = Vec::new();
         for e in dirdata.chunks_exact(128) {
             let name_len = u16::from_le_bytes(e[64..66].try_into().unwrap()) as usize;
@@ -481,7 +512,11 @@ impl<'a> Cfb<'a> {
         let mut minifat: Vec<u32> = Vec::new();
         let mut n = minifat_start;
         let mut count = 0usize;
+        let mut seen_mini = std::collections::HashSet::new();
         while n != END_OF_CHAIN && n != FREE_SECT && count < num_minifat.max(1) {
+            if !seen_mini.insert(n) {
+                return Err(OleError::ChainLoop);
+            }
             let Some(sec) = sector(n) else { break };
             for c in sec.chunks_exact(4) {
                 minifat.push(u32::from_le_bytes(c.try_into().unwrap()));
@@ -489,13 +524,12 @@ impl<'a> Cfb<'a> {
             n = *fat.get(n as usize).unwrap_or(&END_OF_CHAIN);
             count += 1;
         }
-        let ministream = dir
-            .iter()
-            .find(|e| e.kind == 5)
-            .map(|root| chain(root.start))
-            .unwrap_or_default();
+        let ministream = match dir.iter().find(|e| e.kind == 5) {
+            Some(root) => chain(root.start)?,
+            None => Vec::new(),
+        };
 
-        Some(Cfb {
+        Ok(Cfb {
             data,
             sector_size,
             mini_size,
@@ -507,49 +541,58 @@ impl<'a> Cfb<'a> {
         })
     }
 
-    fn stream(&self, name: &str) -> Option<Vec<u8>> {
-        let e = self.dir.iter().find(|e| e.kind == 2 && e.name == name)?;
-        let size = e.size as usize;
-        let mut out = if size < self.mini_cutoff as usize {
-            let mut out = Vec::with_capacity(size);
-            let mut n = e.start;
-            let mut seen = 0usize;
-            while n != END_OF_CHAIN && n != FREE_SECT && (n as usize) < self.minifat.len() {
-                seen += 1;
-                if seen > self.minifat.len() + 1 {
-                    break;
-                }
-                let off = n as usize * self.mini_size;
-                match self.ministream.get(off..off + self.mini_size) {
-                    Some(chunk) => out.extend_from_slice(chunk),
-                    None => break,
-                }
-                n = self.minifat[n as usize];
-            }
-            out
-        } else {
-            let mut out = Vec::with_capacity(size);
-            let mut n = e.start;
-            let mut seen = 0usize;
-            while n != END_OF_CHAIN && n != FREE_SECT && (n as usize) < self.fat.len() {
-                seen += 1;
-                if seen > self.fat.len() + 1 {
-                    break;
-                }
-                let off = 512 + n as usize * self.sector_size;
-                match self.data.get(off..off + self.sector_size) {
-                    Some(sec) => out.extend_from_slice(sec),
-                    None => break,
-                }
-                n = self.fat[n as usize];
-            }
-            out
+    /// The bytes of the named stream. A stream that declares more bytes than
+    /// the whole blob holds, or whose chain loops, is an error.
+    fn stream(&self, name: &str) -> Result<Option<Vec<u8>>, OleError> {
+        let Some(e) = self.dir.iter().find(|e| e.kind == 2 && e.name == name) else {
+            return Ok(None);
         };
+        if e.size > self.data.len() as u64 {
+            return Err(OleError::SizeExceedsData);
+        }
+        let size = e.size as usize;
+        if size == 0 {
+            return Ok(None);
+        }
+        let mini = e.size < self.mini_cutoff;
+        let table = if mini { &self.minifat } else { &self.fat };
+        let unit = if mini {
+            self.mini_size
+        } else {
+            self.sector_size
+        };
+        // Never reserve more than the bytes that could be read.
+        let held = if mini {
+            self.ministream.len()
+        } else {
+            self.data.len() - 512
+        };
+        let mut out = Vec::with_capacity(size.min(held));
+        let mut n = e.start;
+        let mut seen = std::collections::HashSet::new();
+        while n != END_OF_CHAIN && n != FREE_SECT && (n as usize) < table.len() && out.len() < size
+        {
+            if !seen.insert(n) {
+                return Err(OleError::ChainLoop);
+            }
+            let chunk = if mini {
+                let off = n as usize * unit;
+                self.ministream.get(off..off + unit)
+            } else {
+                let off = 512 + n as usize * unit;
+                self.data.get(off..off + unit)
+            };
+            match chunk {
+                Some(c) => out.extend_from_slice(c),
+                None => break,
+            }
+            n = table[n as usize];
+        }
         if out.is_empty() {
-            return None;
+            return Ok(None);
         }
         out.truncate(size);
-        Some(out)
+        Ok(Some(out))
     }
 }
 
