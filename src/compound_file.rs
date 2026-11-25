@@ -4,6 +4,7 @@ const END_OF_CHAIN: u32 = 0xFFFF_FFFE;
 const FREE_SECTOR: u32 = 0xFFFF_FFFF;
 const FAT_SECTOR: u32 = 0xFFFF_FFFD;
 const DIFAT_SECTOR: u32 = 0xFFFF_FFFC;
+const MAX_STORAGE_DEPTH: usize = 64;
 const CFB_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -276,13 +277,17 @@ struct CompoundDecoder<'a> {
     mini_fat: Vec<u32>,
     mini_stream: Vec<u8>,
     directory: Vec<DirectoryEntry>,
+    /// Bytes of stream data this blob may still hand out, across all streams.
+    /// It starts at the blob length, so entries sharing one chain cannot each
+    /// keep their own copy.
+    budget: std::cell::Cell<usize>,
 }
 
 impl CompoundFile {
     fn decode(data: &[u8]) -> Option<(Self, usize)> {
         let decoder = CompoundDecoder::new(data)?;
         let root_index = decoder.directory.iter().position(|entry| entry.kind == 5)?;
-        let root = decoder.storage(root_index, true, &mut std::collections::HashSet::new())?;
+        let root = decoder.storage(root_index, true, 0, &mut std::collections::HashSet::new())?;
         let sector_count = decoder
             .fat
             .iter()
@@ -335,9 +340,14 @@ impl<'a> CompoundDecoder<'a> {
             .collect();
         let mut difat_sector = read_u32(data, 68)?;
         let difat_count = read_u32(data, 72)? as usize;
+        let mut seen_difat = std::collections::HashSet::new();
         for _ in 0..difat_count.min(data.len() / sector_size) {
             if difat_sector >= DIFAT_SECTOR {
                 break;
+            }
+            // A DIFAT chain that revisits a sector is a loop, not a file.
+            if !seen_difat.insert(difat_sector) {
+                return None;
             }
             let bytes = sector(difat_sector)?;
             let entries = sector_size / 4;
@@ -350,8 +360,16 @@ impl<'a> CompoundDecoder<'a> {
             difat_sector = read_u32(bytes, (entries - 1) * 4)?;
         }
         let fat_sector_count = read_u32(data, 44)? as usize;
+        // No more FAT sectors than the blob holds sectors, and none twice.
+        if fat_sector_count > data.len() / sector_size {
+            return None;
+        }
         let mut fat = Vec::new();
+        let mut seen_fat = std::collections::HashSet::new();
         for sector_index in difat.into_iter().take(fat_sector_count) {
+            if !seen_fat.insert(sector_index) {
+                return None;
+            }
             let bytes = sector(sector_index)?;
             fat.extend(bytes.chunks_exact(4).filter_map(|chunk| read_u32(chunk, 0)));
         }
@@ -359,7 +377,7 @@ impl<'a> CompoundDecoder<'a> {
             return None;
         }
         let regular_chain = |start: u32| {
-            read_chain(start, &fat, fat.len() + 1, |index| {
+            read_chain(start, &fat, fat.len() + 1, usize::MAX, |index| {
                 sector(index).map(|bytes| bytes.to_vec())
             })
         };
@@ -418,6 +436,7 @@ impl<'a> CompoundDecoder<'a> {
             mini_fat,
             mini_stream,
             directory,
+            budget: std::cell::Cell::new(data.len()),
         })
     }
 
@@ -425,9 +444,12 @@ impl<'a> CompoundDecoder<'a> {
         &self,
         index: usize,
         root: bool,
+        depth: usize,
         visited: &mut std::collections::HashSet<usize>,
     ) -> Option<CompoundStorage> {
-        if !visited.insert(index) {
+        // Storages nested deeper than any real file are dropped, so the
+        // recursion (and the tree it builds) stays shallow.
+        if depth > MAX_STORAGE_DEPTH || !visited.insert(index) {
             return None;
         }
         let entry = self.directory.get(index)?;
@@ -452,7 +474,7 @@ impl<'a> CompoundDecoder<'a> {
             };
             match child.kind {
                 1 => {
-                    if let Some(storage) = self.storage(child_index, false, visited) {
+                    if let Some(storage) = self.storage(child_index, false, depth + 1, visited) {
                         entries.push(CompoundEntry::Storage(storage));
                     }
                 }
@@ -503,36 +525,34 @@ impl<'a> CompoundDecoder<'a> {
         })
     }
 
+    /// In-order walk of a sibling tree with an explicit stack, so a chain of
+    /// tens of thousands of entries cannot overflow the call stack. Each entry
+    /// is visited at most once.
     fn sibling_tree(&self, root: u32) -> Vec<usize> {
-        fn visit(
-            directory: &[DirectoryEntry],
-            index: u32,
-            output: &mut Vec<usize>,
-            visited: &mut std::collections::HashSet<u32>,
-        ) {
-            if index == FREE_SECTOR || !visited.insert(index) {
-                return;
-            }
-            let Some(entry) = directory.get(index as usize) else {
-                return;
-            };
-            visit(directory, entry.left, output, visited);
-            output.push(index as usize);
-            visit(directory, entry.right, output, visited);
-        }
         let mut output = Vec::new();
-        visit(
-            &self.directory,
-            root,
-            &mut output,
-            &mut std::collections::HashSet::new(),
-        );
+        let mut visited = std::collections::HashSet::new();
+        let mut stack: Vec<usize> = Vec::new();
+        let mut current = root;
+        loop {
+            while current != FREE_SECTOR && visited.insert(current) {
+                let Some(entry) = self.directory.get(current as usize) else {
+                    break;
+                };
+                stack.push(current as usize);
+                current = entry.left;
+            }
+            let Some(index) = stack.pop() else {
+                break;
+            };
+            output.push(index);
+            current = self.directory[index].right;
+        }
         output
     }
 
     fn stream_data(&self, entry: &DirectoryEntry) -> Vec<u8> {
         let size = entry.size as usize;
-        if size == 0 {
+        if size == 0 || size > self.budget.get() {
             return Vec::new();
         }
         let mut output = if entry.size < self.mini_cutoff {
@@ -540,6 +560,7 @@ impl<'a> CompoundDecoder<'a> {
                 entry.start,
                 &self.mini_fat,
                 self.mini_fat.len() + 1,
+                size,
                 |index| {
                     let offset = index as usize * self.mini_sector_size;
                     self.mini_stream
@@ -548,7 +569,7 @@ impl<'a> CompoundDecoder<'a> {
                 },
             )
         } else {
-            read_chain(entry.start, &self.fat, self.fat.len() + 1, |index| {
+            read_chain(entry.start, &self.fat, self.fat.len() + 1, size, |index| {
                 let offset = (index as usize + 1) * self.sector_size;
                 self.data
                     .get(offset..offset + self.sector_size)
@@ -556,18 +577,31 @@ impl<'a> CompoundDecoder<'a> {
             })
         };
         output.truncate(size);
+        self.budget.set(self.budget.get() - output.len());
         output
     }
 }
 
-fn read_chain<F>(start: u32, allocation: &[u32], limit: usize, mut read: F) -> Vec<u8>
+/// Follow a sector chain, stopping at a loop, at `limit` sectors or once
+/// `max_bytes` bytes are collected.
+fn read_chain<F>(
+    start: u32,
+    allocation: &[u32],
+    limit: usize,
+    max_bytes: usize,
+    mut read: F,
+) -> Vec<u8>
 where
     F: FnMut(u32) -> Option<Vec<u8>>,
 {
     let mut output = Vec::new();
     let mut current = start;
     let mut visited = std::collections::HashSet::new();
-    while current < DIFAT_SECTOR && visited.len() < limit && visited.insert(current) {
+    while current < DIFAT_SECTOR
+        && output.len() < max_bytes
+        && visited.len() < limit
+        && visited.insert(current)
+    {
         let Some(bytes) = read(current) else {
             break;
         };

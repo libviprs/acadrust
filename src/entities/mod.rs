@@ -108,7 +108,9 @@ pub use multileader::{
     TextAttachmentDirectionType, TextAttachmentPointType, TextAttachmentType,
 };
 pub use ole2frame::{Ole2Frame, OleFrameEnvelope, OleObjectType};
-pub use ole_presentation::{extract_presentation, ole_user_type, OlePresentation};
+pub use ole_presentation::{
+    extract_presentation, ole_user_type, try_extract_presentation, OleError, OlePresentation,
+};
 pub use point::Point;
 pub use polyface_mesh::{
     PolyfaceFace, PolyfaceMesh, PolyfaceMeshFlags, PolyfaceSmoothType, PolyfaceVertex,

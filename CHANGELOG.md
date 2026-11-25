@@ -2,6 +2,8 @@
 
 ### Unreleased
 
+- **Fix: the OLE compound file readers are bounded by the blob length** - a crafted blob (a DIFAT sector pointing at itself, a looping FAT or mini-FAT chain, header counts or a stream size past the blob, thousands of entries sharing one chain, tens of thousands of chained directory entries) could allocate gigabytes or overflow the stack. Header counts past the blob, looping chains and a FAT sector listed twice are now refused, a stream never reserves more than the blob holds, the total stream data handed out is capped at the blob length, and the directory tree is walked without recursion (nested storages stop at 64 levels). `entities::try_extract_presentation` returns the typed `OleError`; `extract_presentation` and `ole_user_type` keep their signatures. (#75)
+
 - **Fix: a plot style's lineweight number picks the table entry before it** - `PlotStyleTable::resolve_lineweight` read entry N of the lineweight list for a style numbered N. The plot style editor lists "Use object lineweight" first and the table's widths after it, so style N now reads entry N - 1: style 1 gives the first width, the last width is reachable, and 0, 255 and a number past the list still keep the object's lineweight.
 - **Civil 3D classes** - `classes::civil` names the `AECC_*` classes:
   `kind_of` / `ArchEntityData::civil_kind` give alignments, profiles, profile
