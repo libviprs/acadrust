@@ -577,11 +577,19 @@ fn big_blob(entries: &[Vec<u8>], data_sectors: usize) -> Vec<u8> {
     }
     let mut fat = vec![FATS; k];
     for j in 0..dir_sectors {
-        fat.push(if j + 1 == dir_sectors { END } else { (k + j) as u32 + 1 });
+        fat.push(if j + 1 == dir_sectors {
+            END
+        } else {
+            (k + j) as u32 + 1
+        });
     }
     let chain_start = fat.len();
     for j in 0..data_sectors {
-        fat.push(if j + 1 == data_sectors { END } else { (chain_start + j) as u32 + 1 });
+        fat.push(if j + 1 == data_sectors {
+            END
+        } else {
+            (chain_start + j) as u32 + 1
+        });
     }
     let mut h = header();
     put32(&mut h, 44, k as u32);
@@ -642,7 +650,11 @@ fn issue_75_40000_nested_storages_do_not_overflow_the_stack() {
     let blob = big_blob(&chained_entries(76, 1), 0);
     let out = bounded(move || StructuredStoragePayload::decode(&blob)).expect("bounded run");
     if let Some(cf) = out.compound_file {
-        assert!(storage_depth(&cf.root) <= 64, "depth {}", storage_depth(&cf.root));
+        assert!(
+            storage_depth(&cf.root) <= 65, // the root plus 64 nested levels
+            "depth {}",
+            storage_depth(&cf.root)
+        );
     }
 }
 
@@ -684,5 +696,8 @@ fn issue_75_entries_sharing_one_chain_do_not_each_keep_a_copy() {
             })
             .sum()
     });
-    assert!(kept <= n, "kept {kept} bytes of stream data from a {n} byte blob");
+    assert!(
+        kept <= n,
+        "kept {kept} bytes of stream data from a {n} byte blob"
+    );
 }
