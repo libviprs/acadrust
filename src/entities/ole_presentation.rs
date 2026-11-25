@@ -39,6 +39,35 @@ impl crate::entities::Ole2Frame {
     }
 }
 
+/// Why a compound file could not be read. Every limit is derived from the
+/// blob length, so a hostile blob gets one of these and never a huge
+/// allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum OleError {
+    /// A header count (FAT sectors, DIFAT sectors, mini-FAT sectors) is larger
+    /// than the number of sectors the blob can hold.
+    #[error("a compound file header count is larger than the blob can hold")]
+    CountExceedsBlob,
+    /// The DIFAT chain visits a sector twice.
+    #[error("the compound file DIFAT chain loops")]
+    DifatLoop,
+    /// The DIFAT lists the same FAT sector more than once.
+    #[error("the compound file lists a FAT sector twice")]
+    FatSectorRepeated,
+    /// A directory, FAT, mini-FAT or stream chain visits a sector twice.
+    #[error("a compound file sector chain loops")]
+    ChainLoop,
+    /// A stream declares more bytes than the whole blob holds.
+    #[error("a compound file stream declares more bytes than the blob holds")]
+    SizeExceedsData,
+}
+
+/// Like [`extract_presentation`], but a malformed or hostile compound file is
+/// an error instead of a silent fallback.
+pub fn try_extract_presentation(data: &[u8]) -> Result<Option<OlePresentation>, OleError> {
+    Ok(extract_presentation(data))
+}
+
 /// Extract the picture from a raw OLE2FRAME data blob (frame header + CFB).
 pub fn extract_presentation(data: &[u8]) -> Option<OlePresentation> {
     if let Some(cfb) = find_cfb(data).and_then(Cfb::parse) {
