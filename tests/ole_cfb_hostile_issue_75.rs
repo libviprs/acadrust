@@ -563,3 +563,126 @@ fn issue_75_structured_storage_decode_bounds_a_self_pointing_difat() {
     assert!(peak <= few_mb(n), "peak {peak} bytes");
     assert!(block <= few_mb(n), "block {block} bytes");
 }
+
+// ── Directory trees and shared chains (review of the first fix) ─────────────
+
+/// A blob with a flat run of directory entries and the given data sectors.
+/// `entries` is the whole directory (entry 0 is the root); `data_sectors` are
+/// appended after the directory chain and listed in the FAT as one chain.
+fn big_blob(entries: &[Vec<u8>], data_sectors: usize) -> Vec<u8> {
+    let dir_sectors = entries.len().div_ceil(4);
+    let mut k = 1;
+    while k * 128 < k + dir_sectors + data_sectors {
+        k += 1;
+    }
+    let mut fat = vec![FATS; k];
+    for j in 0..dir_sectors {
+        fat.push(if j + 1 == dir_sectors { END } else { (k + j) as u32 + 1 });
+    }
+    let chain_start = fat.len();
+    for j in 0..data_sectors {
+        fat.push(if j + 1 == data_sectors { END } else { (chain_start + j) as u32 + 1 });
+    }
+    let mut h = header();
+    put32(&mut h, 44, k as u32);
+    put32(&mut h, 48, k as u32);
+    for i in 0..k {
+        put32(&mut h, 76 + i * 4, i as u32);
+    }
+    let mut sectors: Vec<Vec<u8>> = fat.chunks(128).map(sector_of).collect();
+    for c in entries.chunks(4) {
+        sectors.push(dir_sector(c));
+    }
+    for _ in 0..data_sectors {
+        sectors.push(vec![7u8; 512]);
+    }
+    assemble(h, &sectors)
+}
+
+/// 40000 entries below the root, each linked to the next through `link`
+/// (left sibling or child), `kind` 2 for streams and 1 for storages.
+fn chained_entries(link: usize, kind: u8) -> Vec<Vec<u8>> {
+    let n = 40_000usize;
+    let mut v = vec![dir_entry("Root Entry", 5, END, 0)];
+    put32(&mut v[0], 76, 1);
+    for i in 1..=n {
+        let mut e = dir_entry("e", kind, END, 0);
+        if i < n {
+            put32(&mut e, link, i as u32 + 1);
+        }
+        v.push(e);
+    }
+    v
+}
+
+fn storage_depth(s: &acadrust::compound_file::CompoundStorage) -> usize {
+    1 + s
+        .entries
+        .iter()
+        .map(|e| match e {
+            acadrust::compound_file::CompoundEntry::Storage(c) => storage_depth(c),
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+#[test]
+fn issue_75_40000_entries_chained_through_left_siblings_do_not_overflow_the_stack() {
+    let blob = big_blob(&chained_entries(68, 2), 0);
+    assert!(blob.len() > 5_000_000);
+    let out = bounded(move || StructuredStoragePayload::decode(&blob)).expect("bounded run");
+    if let Some(cf) = out.compound_file {
+        assert!(cf.root.entries.len() <= 40_000);
+    }
+}
+
+#[test]
+fn issue_75_40000_nested_storages_do_not_overflow_the_stack() {
+    let blob = big_blob(&chained_entries(76, 1), 0);
+    let out = bounded(move || StructuredStoragePayload::decode(&blob)).expect("bounded run");
+    if let Some(cf) = out.compound_file {
+        assert!(storage_depth(&cf.root) <= 64, "depth {}", storage_depth(&cf.root));
+    }
+}
+
+#[test]
+fn issue_75_entries_sharing_one_chain_do_not_each_keep_a_copy() {
+    // 3000 stream entries, all pointing at one 1 MiB chain.
+    let mut entries = vec![dir_entry("Root Entry", 5, END, 0)];
+    put32(&mut entries[0], 76, 1);
+    for i in 1..=3000usize {
+        let mut e = dir_entry("s", 2, 0, 1 << 20);
+        if i < 3000 {
+            put32(&mut e, 68, i as u32 + 1);
+        }
+        entries.push(e);
+    }
+    let dir_sectors = entries.len().div_ceil(4);
+    let mut k = 1;
+    while k * 128 < k + dir_sectors + 2048 {
+        k += 1;
+    }
+    let start = (k + dir_sectors) as u32;
+    for e in entries.iter_mut().skip(1) {
+        put32(e, 116, start);
+    }
+    let blob = big_blob(&entries, 2048);
+    let n = blob.len();
+    assert!(n < 1_500_000);
+    let (out, peak, block) =
+        bounded(move || lap(|| StructuredStoragePayload::decode(&blob))).expect("bounded run");
+    assert!(peak <= few_mb(n), "peak {peak} bytes");
+    assert!(block <= few_mb(n), "block {block} bytes");
+    let kept: usize = out.compound_file.map_or(0, |cf| {
+        cf.root
+            .entries
+            .iter()
+            .map(|e| match e {
+                acadrust::compound_file::CompoundEntry::Stream(s) => s.content.encode().len(),
+                _ => 0,
+            })
+            .sum()
+    });
+    assert!(kept <= n, "kept {kept} bytes of stream data from a {n} byte blob");
+}
